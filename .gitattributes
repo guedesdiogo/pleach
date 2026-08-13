@@ -1,0 +1,5 @@
+# Shell scripts must keep LF endings on every platform. Git for Windows checks out
+# CRLF by default, and a CR at the end of a shebang line makes the interpreter
+# unfindable: `bash\r: no such file or directory`. This is not a style preference,
+# it is what keeps the tool runnable under Git Bash and WSL.
+* text=auto eol=lf
