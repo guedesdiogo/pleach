@@ -1,0 +1,29 @@
+# .pleach.conf - commented example (copy to the canonical's root as .pleach.conf)
+# A bash file, sourced by pleach. Everything is optional - see the README.
+
+# If THIS checkout is not the canonical (a replica/mirror), point at the real one:
+# PLEACH_CANONICAL="$HOME/Repos/my-workspace"
+
+# Sub-repos to mount per session. Default: auto-detect first-level dirs with .git.
+# PLEACH_SUBS=(backend frontend infra)
+
+# Base branch for sessions (default: main)
+# PLEACH_BASE=main
+
+# Where sessions live (default: <parent of canonical>/.sessions)
+# PLEACH_DIR="$HOME/Repos/.sessions"
+
+# Start of the port blocks: session N gets START + N*100 (default: 10000)
+# PLEACH_PORT_START=10000
+
+# Extra files (paths relative to the canonical) to copy into every session, on
+# top of the defaults (.env, .env.*, .dev.vars*, .claude/settings.local.json):
+# PLEACH_SECRETS_EXTRA=(config/local.yaml)
+
+# Post-creation bootstrap (cwd = the session folder). Default: bun install
+# wherever a package.json is found, 4-way parallel. Examples:
+# pleach_bootstrap() {
+#   (cd backend && npm ci)
+#   (cd frontend && pnpm install)
+#   (cd worker-go && go mod download)
+# }

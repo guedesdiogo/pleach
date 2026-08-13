@@ -1,0 +1,22 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          command -v shellcheck >/dev/null || brew install shellcheck
+          shellcheck pleach install.sh tests/run.sh tests/no-leaks.sh examples/*.sh
+      - name: no internal references
+        run: tests/no-leaks.sh
+      - name: tests
+        run: tests/run.sh

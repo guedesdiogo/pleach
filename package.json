@@ -1,0 +1,48 @@
+{
+  "name": "pleach",
+  "version": "1.0.0",
+  "description": "Parallel, isolated work sessions for multi-repo workspaces: one git worktree per repo, with ports, secrets and lifecycle resolved",
+  "keywords": [
+    "git",
+    "worktree",
+    "monorepo",
+    "multi-repo",
+    "workspace",
+    "parallel",
+    "isolation",
+    "session",
+    "cli",
+    "developer-tools",
+    "ai-agents"
+  ],
+  "bin": {
+    "pleach": "pleach"
+  },
+  "files": [
+    "pleach",
+    "install.sh",
+    "pleach.conf.example",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "tests/run.sh && tests/no-leaks.sh"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/guedesdiogo/pleach.git"
+  },
+  "homepage": "https://github.com/guedesdiogo/pleach#readme",
+  "bugs": {
+    "url": "https://github.com/guedesdiogo/pleach/issues"
+  },
+  "author": "Diogo Guedes",
+  "license": "MIT",
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

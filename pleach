@@ -1,0 +1,1451 @@
+#!/usr/bin/env bash
+# pleach — parallel, isolated work sessions for multi-repo workspaces
+# ("pleached worktrees"). Runs N LLM/editor sessions on the same project at the
+# same time without directory replicas: each session is a folder mounted with one
+# git worktree PER REPO (root + nested sub-repos), all on branch session/<name>.
+# Git guarantees a branch is checked out in at most one worktree at a time — two
+# sessions can never step on each other.
+#
+# Command reference: `pleach help` and `pleach help <command>`.
+# Config file reference: `pleach help config`.
+# Full docs: https://github.com/guedesdiogo/pleach
+# shellcheck disable=SC2015  # deliberate idiom: [ -z "$x" ] && x=… || err (err never runs after an assignment)
+set -euo pipefail
+
+PLEACH_VERSION="1.0.0"
+
+CONF_NAME=".pleach.conf"
+USER_CONF="$HOME/.config/pleach/config"
+PLEACH_REPO="${PLEACH_REPO:-guedesdiogo/pleach}"
+
+err()  { echo "pleach: error: $*" >&2; exit 1; }
+info() { echo "→ $*"; }
+warn() { echo "  ⚠ $*" >&2; }
+
+in_list() { # in_list <needle> [item...]
+  local needle="$1" x
+  shift
+  for x in "$@"; do [ "$x" = "$needle" ] && return 0; done
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# Canonical resolution + config loading
+# ---------------------------------------------------------------------------
+resolve_canonical() {
+  if [ -n "${PLEACH_CANONICAL:-}" ]; then
+    CANONICAL="$PLEACH_CANONICAL"
+    return 0
+  fi
+  local d="$PWD" c
+  while [ "$d" != "/" ]; do
+    if [ -f "$d/$CONF_NAME" ]; then
+      c=$(bash -c "PLEACH_CANONICAL=''; source '$d/$CONF_NAME' 2>/dev/null; printf '%s' \"\${PLEACH_CANONICAL:-}\"") || c=""
+      CANONICAL="${c:-$d}"
+      return 0
+    fi
+    if [ -f "$d/.session-env" ]; then
+      c=$(grep -m1 '^export PLEACH_CANONICAL=' "$d/.session-env" 2>/dev/null | cut -d= -f2- | tr -d '"') || c=""
+      [ -n "$c" ] && { CANONICAL="$c"; return 0; }
+    fi
+    d=$(dirname "$d")
+  done
+  if [ -f "$USER_CONF" ]; then
+    # shellcheck disable=SC1090
+    source "$USER_CONF"
+    if [ -n "${PLEACH_DEFAULT_CANONICAL:-}" ]; then
+      CANONICAL="$PLEACH_DEFAULT_CANONICAL"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+detect_subs() { # echoes the names of first-level dirs of the canonical that are git repos
+  local d
+  for d in "$CANONICAL"/*/; do
+    [ -e "${d%/}/.git" ] && basename "${d%/}"
+  done
+  # Without this, a trailing non-repo dir (docs/, scripts/…) leaves status 1 and,
+  # under `set -e` + pipefail, kills any caller capturing the output with $( … ).
+  return 0
+}
+
+load_config() {
+  resolve_canonical || err "cannot tell which workspace is canonical. Options:
+  - run inside a project that has a $CONF_NAME (create one with: pleach init)
+  - set PLEACH_CANONICAL=/path
+  - record a machine-wide default: echo 'PLEACH_DEFAULT_CANONICAL=/path' >> $USER_CONF"
+  CANONICAL="${CANONICAL%/}"
+  # Guard rail for harnesses/automation: if the caller declares the canonical it
+  # EXPECTS, any divergent resolution aborts before touching real worktrees.
+  if [ -n "${PLEACH_EXPECT_CANONICAL:-}" ] && [ "$CANONICAL" != "${PLEACH_EXPECT_CANONICAL%/}" ]; then
+    err "resolved canonical ($CANONICAL) differs from the expected one (PLEACH_EXPECT_CANONICAL=${PLEACH_EXPECT_CANONICAL%/}) — aborted before any write"
+  fi
+  [ -e "$CANONICAL/.git" ] || err "canonical '$CANONICAL' is not a git repo"
+
+  SUBS=()
+  CONF_DECLARES_SUBS=0
+  SECRETS_EXTRA=(".claude/settings.local.json")
+  if [ -f "$CANONICAL/$CONF_NAME" ]; then
+    # shellcheck disable=SC1090
+    source "$CANONICAL/$CONF_NAME"
+    [ -n "${PLEACH_SUBS+x}" ] && { SUBS=(${PLEACH_SUBS[@]+"${PLEACH_SUBS[@]}"}); CONF_DECLARES_SUBS=1; }
+    [ -n "${PLEACH_SECRETS_EXTRA+x}" ] && SECRETS_EXTRA+=(${PLEACH_SECRETS_EXTRA[@]+"${PLEACH_SECRETS_EXTRA[@]}"})
+  fi
+  BASE="${PLEACH_BASE:-main}"
+  PORT_START="${PLEACH_PORT_START:-10000}"
+  SESSIONS="${PLEACH_DIR:-$(dirname "$CANONICAL")/.sessions}"
+  if [ ${#SUBS[@]} -eq 0 ]; then
+    local s
+    while IFS= read -r s; do [ -n "$s" ] && SUBS+=("$s"); done < <(detect_subs)
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Simple lock (mkdir is atomic; flock is absent from a base macOS) — serializes
+# worktree creation/removal across concurrent invocations.
+# ---------------------------------------------------------------------------
+LOCK_DIR=""
+lock() {
+  LOCK_DIR="$SESSIONS/.pleach.lock"
+  local tries=0
+  until mkdir "$LOCK_DIR" 2>/dev/null; do
+    tries=$((tries + 1))
+    [ "$tries" -gt 120 ] && err "could not acquire the lock at $LOCK_DIR (an earlier creation wedged? remove the dir by hand)"
+    sleep 1
+  done
+  trap 'unlock' EXIT
+}
+unlock() {
+  [ -n "$LOCK_DIR" ] && rmdir "$LOCK_DIR" 2>/dev/null || true
+  LOCK_DIR=""
+  trap - EXIT
+}
+
+session_branch() { echo "session/$1"; }
+
+json_escape() { # escapes \ and " for embedding in JSON
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '%s' "$s"
+}
+
+write_panorama_workspace() {
+  # Generates $SESSIONS/panorama.code-workspace (once; it is static): ONE VS Code
+  # window with ALL sessions — scanMaxDepth 2 lets Source Control discover each
+  # session's repos (root at one level, subs at two).
+  [ -f "$SESSIONS/panorama.code-workspace" ] && return 0
+  cat > "$SESSIONS/panorama.code-workspace" <<'EOF'
+{
+  "folders": [{ "path": "." }],
+  "settings": {
+    "git.repositoryScanMaxDepth": 2,
+    "scm.repositories.sortOrder": "path",
+    "scm.repositories.visible": 20
+  }
+}
+EOF
+}
+
+write_vscode_workspace() { # $1 name, $2 session dir, rest = subs
+  # Generates <dir>.code-workspace (outside the worktrees — keeps git status
+  # clean): multi-root with the root + each sub, so VS Code's Source Control
+  # shows every repo in the session.
+  local name="$1" dir="$2" s folders
+  shift 2
+  folders="    { \"path\": \"$(json_escape "$name")\" }"
+  for s in "$@"; do
+    folders="$folders,
+    { \"path\": \"$(json_escape "$name/$s")\" }"
+  done
+  cat > "$dir.code-workspace" <<EOF
+{
+  "folders": [
+$folders
+  ]
+}
+EOF
+}
+
+refresh_vscode_workspace() { # $1 name, $2 dir — regenerates with the subs present
+  local -a present=()
+  local s
+  while IFS= read -r s; do [ -n "$s" ] && present+=("$s"); done < <(session_subs "$2")
+  write_vscode_workspace "$1" "$2" ${present[@]+"${present[@]}"}
+}
+
+session_subs() { # subs present in an existing session
+  local dir="$1" d
+  for d in "$dir"/*/; do
+    [ -e "${d%/}/.git" ] && basename "${d%/}"
+  done
+  return 0   # see the note in detect_subs
+}
+
+session_names() { # names of the existing sessions
+  local d
+  for d in "$SESSIONS"/*/; do
+    [ -d "$d" ] && [ -e "${d%/}/.git" ] && basename "${d%/}"
+  done
+  return 0   # see the note in detect_subs
+}
+
+session_env_get() { # $1 dir, $2 key
+  grep -m1 "^export $2=" "$1/.session-env" 2>/dev/null | cut -d= -f2- | tr -d '"' || true
+}
+
+detect_session_name() { # echoes the name of the session containing $PWD (if any)
+  local d="$PWD" n
+  while [ "$d" != "/" ]; do
+    if [ -f "$d/.session-env" ]; then
+      n=$(session_env_get "$d" PLEACH_NAME)
+      [ -n "$n" ] && { printf '%s' "$n"; return 0; }
+    fi
+    d=$(dirname "$d")
+  done
+  return 1
+}
+
+repo_path() { # $1 = "" (root) or a sub name
+  if [ -z "$1" ]; then echo "$CANONICAL"; else echo "$CANONICAL/$1"; fi
+}
+
+warn_if_behind() { # $1 repo, $2 label
+  local behind
+  behind=$(git -C "$1" rev-list --count "$BASE..origin/$BASE" 2>/dev/null || echo 0)
+  if [ "${behind:-0}" -gt 0 ]; then
+    warn "$2: local $BASE is $behind commit(s) behind origin/$BASE (create with --fetch to update)"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Blocks shared by new/add/repos
+# ---------------------------------------------------------------------------
+add_wt() { # $1 repo, $2 target, $3 branch — new or resumed worktree
+  if git -C "$1" show-ref --verify --quiet "refs/heads/$3"; then
+    info "resuming existing branch $3 in $(basename "$1")"
+    git -C "$1" worktree add --quiet "$2" "$3"
+  else
+    git -C "$1" worktree add --quiet -b "$3" "$2" "$BASE"
+  fi
+}
+
+copy_secrets() { # $1 session dir, $2 include root (0|1), rest: target subs
+  # Untracked secrets/env: copy from the canonical, preserving paths. Files
+  # inside a sub-repo are only included if that sub is part of the target.
+  local dir="$1" include_root="$2"
+  shift 2
+  local copied=0 f top
+  while IFS= read -r -d '' f; do
+    f="${f#./}"
+    top="${f%%/*}"
+    if [ "$top" != "$f" ] && [ -e "$CANONICAL/$top/.git" ]; then
+      in_list "$top" "$@" || continue
+    else
+      [ "$include_root" -eq 1 ] || continue
+    fi
+    mkdir -p "$dir/$(dirname "$f")"
+    cp "$CANONICAL/$f" "$dir/$f"
+    copied=$((copied + 1))
+  done < <(cd "$CANONICAL" && find . -maxdepth 4 \
+      \( -name node_modules -o -name .git -o -name .next -o -name .open-next \
+         -o -name .wrangler -o -name dist -o -name build -o -name target \
+         -o -name .venv -o -name vendor \) -prune -o \
+      -type f \( -name '.env' -o -name '.env.*' -o -name '.dev.vars' -o -name '.dev.vars.*' \) \
+      ! -name '*.example' -print0)
+  for f in ${SECRETS_EXTRA[@]+"${SECRETS_EXTRA[@]}"}; do
+    top="${f%%/*}"
+    if [ "$top" != "$f" ] && [ -e "$CANONICAL/$top/.git" ]; then
+      in_list "$top" "$@" || continue
+    else
+      [ "$include_root" -eq 1 ] || continue
+    fi
+    if [ -f "$CANONICAL/$f" ]; then
+      mkdir -p "$dir/$(dirname "$f")"
+      cp "$CANONICAL/$f" "$dir/$f"
+      copied=$((copied + 1))
+    fi
+  done
+  info "$copied env file(s) copied"
+}
+
+run_bootstrap() { # $1 session dir, $2 sub ("" = whole session)
+  local dir="$1" sub="${2:-}" target depth
+  if [ -n "$sub" ]; then target="$dir/$sub"; depth=2; else target="$dir"; depth=3; fi
+  if [ -f "$CANONICAL/$CONF_NAME" ] && bash -c "source '$CANONICAL/$CONF_NAME' 2>/dev/null; declare -f pleach_bootstrap >/dev/null"; then
+    info "project bootstrap (pleach_bootstrap from $CONF_NAME)…"
+    ( cd "$dir" && bash -c "source '$CANONICAL/$CONF_NAME'; pleach_bootstrap '$dir' '$sub'" ) \
+      || warn "pleach_bootstrap returned an error — check by hand"
+  elif command -v bun >/dev/null 2>&1; then
+    info "default bootstrap: bun install wherever there is a package.json (4-way parallel)…"
+    # sh -c '…' _ <path>: the path arrives as "$1". Avoids `xargs -I{}`, whose
+    # substitution is capped at 255 bytes in BSD xargs (macOS) and blows up with
+    # "command line cannot be assembled" on long paths.
+    # shellcheck disable=SC2016  # single quotes deliberate: $1 expands in the child sh
+    find "$target" -maxdepth "$depth" -name package.json -not -path '*/node_modules/*' -print0 \
+      | xargs -0 -n1 -P 4 sh -c 'd=$(dirname "$1"); cd "$d" && bun install --silent >/dev/null 2>&1 || echo "  ⚠ bun install failed in $d"' _ \
+      || warn "there were bootstrap failures — check by hand"
+  else
+    info "no bootstrap (define pleach_bootstrap in $CONF_NAME if the project needs one)"
+  fi
+}
+
+mount_sub() { # $1 session name, $2 dir, $3 sub, $4 bootstrap (0|1)
+  # The lock belongs to the CALLER (taken once around the batch): taking it here,
+  # per iteration, would orphan the lock if an add_wt failed mid-loop.
+  local name="$1" dir="$2" s="$3" bs="$4" branch
+  branch=$(session_branch "$name")
+  [ -e "$CANONICAL/$s/.git" ] || { warn "$name: sub-repo '$s' does not exist at $CANONICAL/$s — skipped"; return 1; }
+  if [ -e "$dir/$s/.git" ]; then
+    info "$name: '$s' is already mounted"
+    return 0
+  fi
+  warn_if_behind "$CANONICAL/$s" "$s"
+  add_wt "$CANONICAL/$s" "$dir/$s" "$branch"
+  copy_secrets "$dir" 0 "$s"
+  [ "$bs" -eq 1 ] && run_bootstrap "$dir" "$s"
+  refresh_vscode_workspace "$name" "$dir"
+  info "$name: '$s' mounted (branch $branch)"
+}
+
+# ---------------------------------------------------------------------------
+cmd_init() {
+  local defaultize=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --default) defaultize=1 ;;
+      *) err "unknown flag: $1 (usage: pleach init [--default])" ;;
+    esac
+    shift
+  done
+  [ -e "$PWD/.git" ] || err "run this at the root of the workspace's canonical repo (no .git found in $PWD)"
+  [ -f "$PWD/$CONF_NAME" ] && err "$CONF_NAME already exists here"
+  CANONICAL="$PWD"
+  local -a detected=()
+  local subs_line="" s
+  while IFS= read -r s; do
+    [ -n "$s" ] && detected+=("$s") && subs_line="$subs_line $(printf '%q' "$s")"
+  done < <(detect_subs)
+  if [ ${#detected[@]} -gt 0 ]; then
+    subs_line="PLEACH_SUBS=(${subs_line# })"
+  else
+    subs_line="# PLEACH_SUBS=()   # no sub-repos detected — single-repo project, works all the same"
+  fi
+  cat > "$PWD/$CONF_NAME" <<EOF
+# pleach — project config (bash, sourced). Docs: pleach help config.
+# This file at the root marks the workspace; in replicas/mirrors, point at the
+# real canonical with PLEACH_CANONICAL=/path.
+
+# Sub-repos to mount per session (default: auto-detect first-level dirs with .git).
+# When a new repo joins the workspace: pleach repos --sync
+$subs_line
+
+# PLEACH_BASE=main
+# PLEACH_DIR=$(dirname "$PWD")/.sessions
+# PLEACH_PORT_START=10000
+# PLEACH_SECRETS_EXTRA=()
+
+# Post-creation bootstrap (\$1 = session folder, \$2 = sub being mounted, or empty
+# for the whole session). Default: bun install wherever there is a package.json.
+# pleach_bootstrap() {
+#   (cd app && npm install)
+# }
+EOF
+  info "created $PWD/$CONF_NAME (subs detected: ${detected[*]:-none})"
+  if [ "$defaultize" -eq 1 ]; then
+    mkdir -p "$(dirname "$USER_CONF")"
+    if [ -f "$USER_CONF" ] && grep -q '^PLEACH_DEFAULT_CANONICAL=' "$USER_CONF"; then
+      local tmp
+      tmp=$(mktemp)
+      grep -v '^PLEACH_DEFAULT_CANONICAL=' "$USER_CONF" > "$tmp" || true
+      mv "$tmp" "$USER_CONF"
+    fi
+    echo "PLEACH_DEFAULT_CANONICAL=\"$PWD\"" >> "$USER_CONF"
+    info "recorded as this machine's default project in $USER_CONF"
+  fi
+  echo "Next: review the $CONF_NAME, then 'pleach new <name>' or 'pleach open <name>'."
+}
+
+# ---------------------------------------------------------------------------
+cmd_new() {
+  local name="" do_bootstrap=1 do_fetch=0
+  local -a subs=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-bootstrap|--no-install) do_bootstrap=0 ;;
+      --fetch)      do_fetch=1 ;;
+      -*)           err "unknown flag: $1" ;;
+      *)            if [ -z "$name" ]; then name="$1"; else subs+=("$1"); fi ;;
+    esac
+    shift
+  done
+  [ -n "$name" ] || err "usage: pleach new <name> [sub ...] [--no-bootstrap] [--fetch]"
+  [[ "$name" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || err "invalid name '$name' (use [a-z0-9_-], starting with a letter or digit)"
+  load_config
+  [ ${#subs[@]} -eq 0 ] && subs=(${SUBS[@]+"${SUBS[@]}"})
+  local s
+  for s in ${subs[@]+"${subs[@]}"}; do
+    [ -e "$CANONICAL/$s/.git" ] || err "sub-repo '$s' not found at $CANONICAL/$s"
+  done
+
+  local dir="$SESSIONS/$name" branch
+  branch=$(session_branch "$name")
+  [ -e "$dir" ] && err "session '$name' already exists at $dir"
+
+  mkdir -p "$SESSIONS"
+  touch "$SESSIONS/.metadata_never_index" # macOS: keep Spotlight out of sessions
+
+  if [ "$do_fetch" -eq 1 ]; then
+    info "fetching origin/$BASE in every repo…"
+    local repo
+    for repo in "$CANONICAL" ${subs[@]+"${subs[@]/#/$CANONICAL/}"}; do
+      # Fast-forward the local ref without touching the working tree; if $BASE is
+      # checked out in that repo, fall back to a plain fetch (updates origin/$BASE).
+      git -C "$repo" fetch --quiet origin "$BASE:$BASE" 2>/dev/null \
+        || git -C "$repo" fetch --quiet origin "$BASE" \
+        || warn "fetch failed in $repo (offline?) — using the local $BASE"
+    done
+  fi
+
+  lock
+
+  # Session index → a deterministic, collision-free block of 100 ports.
+  local idx=1 used d
+  while :; do
+    used=0
+    for d in "$SESSIONS"/*/.session-env; do
+      [ -f "$d" ] || continue
+      grep -q "^export PLEACH_INDEX=$idx\$" "$d" && { used=1; break; }
+    done
+    [ "$used" -eq 0 ] && break
+    idx=$((idx + 1))
+    [ "$idx" -gt 98 ] && err "no free index left (98 sessions?!)"
+  done
+  local port_base=$((PORT_START + idx * 100))
+
+  info "creating session '$name' (index $idx, ports ${port_base}-$((port_base + 99))) at $dir"
+  warn_if_behind "$CANONICAL" "root"
+  add_wt "$CANONICAL" "$dir" "$branch"
+  for s in ${subs[@]+"${subs[@]}"}; do
+    warn_if_behind "$CANONICAL/$s" "$s"
+    add_wt "$CANONICAL/$s" "$dir/$s" "$branch"
+  done
+
+  unlock
+
+  info "copying secrets (.env*, .dev.vars*, extras from the conf)…"
+  copy_secrets "$dir" 1 ${subs[@]+"${subs[@]}"}
+
+  # Per-session ports (next dev and friends honour PORT; the rest use the vars).
+  cat > "$dir/.session-env" <<EOF
+# Generated by pleach — 'source .session-env' before starting dev servers.
+# This session's exclusive port block: ${port_base}-$((port_base + 99)).
+export PLEACH_NAME=$name
+export PLEACH_CANONICAL="$CANONICAL"
+export PLEACH_INDEX=$idx
+export PLEACH_PORT_BASE=$port_base
+export PORT=$port_base
+export WRANGLER_PORT=$((port_base + 87))
+export WRANGLER_INSPECTOR_PORT=$((port_base + 29))
+export PLAYWRIGHT_PORT=$((port_base + 90))
+EOF
+
+  write_vscode_workspace "$name" "$dir" ${subs[@]+"${subs[@]}"}
+  write_panorama_workspace
+
+  if [ "$do_bootstrap" -eq 1 ]; then
+    run_bootstrap "$dir" ""
+  else
+    info "bootstrap skipped (--no-bootstrap)"
+  fi
+
+  echo ""
+  echo "✅ Session '$name' ready:"
+  echo "   cd $dir"
+  echo "   branch $branch in: root ${subs[*]+${subs[*]}}"
+  echo "   ports: source .session-env  (PORT=$port_base)"
+  echo "   VS Code: pleach open $name code  (or: code '$dir.code-workspace')"
+  echo "   ⚠ deploys/shared state: from the canonical only — never from here."
+}
+
+# ---------------------------------------------------------------------------
+cmd_open() {
+  local name="${1:-}"
+  [ -n "$name" ] || err "usage: pleach open <name> [command ...] (default: claude)"
+  shift
+  load_config
+  local dir="$SESSIONS/$name"
+  if [ ! -d "$dir" ]; then
+    info "session '$name' does not exist — creating it with every sub-repo…"
+    cmd_new "$name"
+  fi
+  cd "$dir"
+  # Backfill: sessions created by older versions have no .code-workspace.
+  [ -f "$dir.code-workspace" ] || refresh_vscode_workspace "$name" "$dir"
+  write_panorama_workspace
+  # Export the session's ports/identity to the process we are about to launch.
+  # shellcheck disable=SC1091
+  [ -f .session-env ] && . ./.session-env
+  [ $# -eq 0 ] && set -- claude
+  # 'pleach open x code' → VS Code on the session's multi-root workspace (SCM for
+  # every repo); with extra args, the literal command is honoured.
+  [ "$1" = "code" ] && [ $# -eq 1 ] && set -- code "$dir.code-workspace"
+  info "opening in $dir: $*"
+  exec "$@"
+}
+
+# ---------------------------------------------------------------------------
+cmd_add() {
+  local do_bootstrap=1 all=0
+  local -a args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all)                    all=1 ;;
+      --no-bootstrap|--no-install) do_bootstrap=0 ;;
+      -*)                       err "unknown flag: $1 (usage: pleach add [<session>] <sub ...|--all>)" ;;
+      *)                        args+=("$1") ;;
+    esac
+    shift
+  done
+  load_config
+
+  # Session: the first argument if it names an existing session; otherwise the
+  # session containing the cwd (handy for 'pleach add payments' from inside it).
+  local name="" i
+  local -a want=()
+  if [ ${#args[@]} -gt 0 ] && [ -d "$SESSIONS/${args[0]}" ]; then
+    name="${args[0]}"
+    for ((i = 1; i < ${#args[@]}; i++)); do want+=("${args[$i]}"); done
+  elif name=$(detect_session_name 2>/dev/null); then
+    want=(${args[@]+"${args[@]}"})
+  else
+    err "cannot tell which session to add to. Usage: pleach add <session> <sub ...>
+  (inside a session the name is inferred: pleach add <sub ...>)"
+  fi
+
+  local dir="$SESSIONS/$name"
+  [ -d "$dir" ] || err "session '$name' does not exist at $dir"
+
+  local -a present=()
+  local s
+  while IFS= read -r s; do [ -n "$s" ] && present+=("$s"); done < <(session_subs "$dir")
+
+  if [ "$all" -eq 1 ]; then
+    want=()
+    for s in ${SUBS[@]+"${SUBS[@]}"}; do
+      in_list "$s" ${present[@]+"${present[@]}"} || want+=("$s")
+    done
+    [ ${#want[@]} -eq 0 ] && { info "session '$name' already has every sub-repo in the workspace"; return 0; }
+  fi
+  [ ${#want[@]} -gt 0 ] || err "usage: pleach add [<session>] <sub ...|--all>"
+
+  for s in "${want[@]}"; do
+    [ -e "$CANONICAL/$s/.git" ] || err "sub-repo '$s' not found at $CANONICAL/$s"
+    in_list "$s" ${SUBS[@]+"${SUBS[@]}"} \
+      || warn "'$s' is not declared in PLEACH_SUBS (mounting anyway; align the conf with: pleach repos --sync)"
+  done
+
+  info "session '$name': mounting ${want[*]}"
+  lock
+  for s in "${want[@]}"; do
+    mount_sub "$name" "$dir" "$s" "$do_bootstrap" || true
+  done
+  unlock
+  echo "✅ '$name' updated. See: pleach ls -l"
+}
+
+# ---------------------------------------------------------------------------
+FETCHED=""   # repos already updated in this invocation (avoids N fetches on --all)
+fetch_base() { # $1 repo, $2 label — advances the LOCAL base ref from origin
+  local repo="$1" label="$2" cur
+  # shellcheck disable=SC2086  # deliberate split: FETCHED is a space-separated list
+  in_list "$repo" $FETCHED && return 0
+  FETCHED="$FETCHED $repo"
+  # Normal path: base is not checked out here → update the ref directly.
+  git -C "$repo" fetch --quiet origin "$BASE:$BASE" 2>/dev/null && return 0
+  git -C "$repo" fetch --quiet origin "$BASE" 2>/dev/null \
+    || { warn "$label: fetch failed (offline?) — using the local $BASE"; return 1; }
+  # Base is checked out (the canonical usually sits on main): fast-forward it.
+  cur=$(git -C "$repo" branch --show-current 2>/dev/null || echo "")
+  if [ "$cur" = "$BASE" ] && [ -z "$(git -C "$repo" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+    git -C "$repo" merge --ff-only --quiet "origin/$BASE" 2>/dev/null && return 0
+  fi
+  warn "$label: origin/$BASE moved, but the local $BASE did not — run: git -C $repo pull --ff-only"
+  return 1
+}
+
+sync_session() { # $1 name, $2 do_fetch, $3 mode (merge|rebase), $4 any_branch, $5 dry — 0 ok, 1 conflicts
+  local name="$1" do_fetch="$2" mode="$3" any_branch="$4" dry="${5:-0}"
+  local dir="$SESSIONS/$name" branch
+  branch=$(session_branch "$name")
+  [ -d "$dir" ] || err "session '$name' does not exist at $dir"
+
+  local -a present=()
+  local s
+  while IFS= read -r s; do [ -n "$s" ] && present+=("$s"); done < <(session_subs "$dir")
+
+  if [ "$dry" -eq 1 ]; then
+    echo "● $name  (dry run — $mode from the local $BASE; nothing is changed)"
+  else
+    echo "● $name  ($mode from the local $BASE)"
+  fi
+  local wt repo label cur behind conflicts=0 updated=0
+  for s in "" ${present[@]+"${present[@]}"}; do
+    wt="$dir${s:+/$s}"
+    label="${s:-root}"
+    [ -e "$wt/.git" ] || continue
+    repo=$(repo_path "$s")
+
+    # The target is always the LOCAL base ref (the canonical's main). --fetch only
+    # tries to advance it from origin before integrating. In a dry run nothing is
+    # touched — not even the base ref.
+    [ "$do_fetch" -eq 1 ] && [ "$dry" -eq 0 ] && { fetch_base "$repo" "$label" || true; }
+
+    # Guard rail: we only integrate into the SESSION's branch. A worktree sitting
+    # on feat/x (the user switched branches in there) is none of our business.
+    cur=$(git -C "$wt" branch --show-current 2>/dev/null || echo "")
+    if [ "$cur" != "$branch" ] && [ "$any_branch" -eq 0 ]; then
+      warn "$label: on '${cur:-detached HEAD}', not on $branch — SKIPPED (force with: --any-branch)"
+      continue
+    fi
+
+    behind=$(git -C "$wt" rev-list --count "HEAD..$BASE" 2>/dev/null || echo 0)
+    if [ "${behind:-0}" -eq 0 ]; then
+      echo "    $label: already up to date"
+      continue
+    fi
+    if [ -n "$(git -C "$wt" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+      warn "$label: $behind commit(s) behind $BASE — SKIPPED (uncommitted changes)"
+      continue
+    fi
+
+    if [ "$dry" -eq 1 ]; then
+      echo "    $label: would $mode +$behind commit(s)"
+      updated=$((updated + 1))
+      continue
+    fi
+
+    if [ "$mode" = "rebase" ]; then
+      if git -C "$wt" rebase --quiet "$BASE" >/dev/null 2>&1; then
+        echo "    $label: rebased onto $BASE (+$behind)"
+        updated=$((updated + 1))
+      else
+        git -C "$wt" rebase --abort >/dev/null 2>&1 || true
+        warn "$label: rebase CONFLICT (reverted) — resolve with: cd $wt && git rebase $BASE"
+        conflicts=$((conflicts + 1))
+      fi
+    else
+      if git -C "$wt" merge --no-edit --quiet "$BASE" >/dev/null 2>&1; then
+        echo "    $label: merged $BASE (+$behind)"
+        updated=$((updated + 1))
+      else
+        git -C "$wt" merge --abort >/dev/null 2>&1 || true
+        warn "$label: merge CONFLICT (reverted) — resolve with: cd $wt && git merge $BASE"
+        conflicts=$((conflicts + 1))
+      fi
+    fi
+  done
+
+  # Repos that exist in the canonical but not in this session (e.g. added later).
+  local -a missing=()
+  for s in ${SUBS[@]+"${SUBS[@]}"}; do
+    in_list "$s" ${present[@]+"${present[@]}"} || missing+=("$s")
+  done
+  if [ ${#missing[@]} -gt 0 ]; then
+    warn "workspace sub-repos missing from this session: ${missing[*]} (mount with: pleach add $name ${missing[*]})"
+  fi
+
+  if [ "$dry" -eq 1 ]; then
+    echo "    ($updated would be updated — run without --dry-run to integrate)"
+  else
+    echo "    ($updated updated, $conflicts conflict(s))"
+  fi
+  [ "$conflicts" -eq 0 ]
+}
+
+cmd_sync() {
+  local name="" do_fetch=0 mode="merge" all=0 any_branch=0 dry=0 yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --rebase)     mode="rebase" ;;
+      --merge)      mode="merge" ;;
+      --fetch)      do_fetch=1 ;;
+      --any-branch) any_branch=1 ;;
+      --all)        all=1 ;;
+      --dry-run|-n) dry=1 ;;
+      --yes|-y)     yes=1 ;;
+      -*)           err "unknown flag: $1 (usage: pleach sync [<session>|--all] [--rebase] [--fetch] [--any-branch] [--dry-run] [--yes])" ;;
+      *)            [ -z "$name" ] && name="$1" || err "too many arguments" ;;
+    esac
+    shift
+  done
+  load_config
+  [ "$dry" -eq 1 ] && [ "$do_fetch" -eq 1 ] && warn "--fetch is ignored in a dry run (the $BASE ref is never touched)"
+
+  if [ "$all" -eq 1 ]; then
+    [ -z "$name" ] || err "--all does not take a session name"
+    local -a names=()
+    local n rc=0
+    while IFS= read -r n; do [ -n "$n" ] && names+=("$n"); done < <(session_names)
+    [ ${#names[@]} -eq 0 ] && { echo "(no sessions in $SESSIONS)"; return 0; }
+
+    # `--all` integrates into MANY worktrees at once — confirm the blast radius
+    # first. Non-interactive callers (scripts/agents) must pass --yes; --dry-run
+    # is exempt.
+    if [ "$dry" -eq 0 ] && [ "$yes" -eq 0 ]; then
+      local total=0
+      for n in "${names[@]}"; do
+        total=$((total + $(session_subs "$SESSIONS/$n" | wc -l | tr -d ' ') + 1))
+      done
+      if [ -t 0 ]; then
+        printf 'Integrate the local %s into %d worktree(s) across %d session(s)? [y/N] ' "$BASE" "$total" "${#names[@]}"
+        local reply=""
+        read -r reply || true
+        case "$reply" in y|Y|yes) ;; *) echo "cancelled."; return 1 ;; esac
+      else
+        err "sync --all in non-interactive mode requires --yes (check the blast radius first: pleach sync --all --dry-run)"
+      fi
+    fi
+
+    for n in "${names[@]}"; do
+      sync_session "$n" "$do_fetch" "$mode" "$any_branch" "$dry" || rc=1
+    done
+    return "$rc"
+  fi
+
+  if [ -z "$name" ]; then
+    name=$(detect_session_name 2>/dev/null) \
+      || err "usage: pleach sync <session> [--rebase] [--fetch] [--dry-run]  (or --all)"
+  fi
+  sync_session "$name" "$do_fetch" "$mode" "$any_branch" "$dry"
+}
+
+# ---------------------------------------------------------------------------
+conf_subs_line() { # line number of the active PLEACH_SUBS in the conf (empty if none)
+  grep -n '^[[:space:]]*PLEACH_SUBS=' "$CANONICAL/$CONF_NAME" 2>/dev/null | head -1 | cut -d: -f1
+}
+
+rewrite_conf_subs() { # $@ = subs — surgical edit of the PLEACH_SUBS line
+  local ln
+  ln=$(conf_subs_line)
+  [ -n "$ln" ] || return 1
+  local raw
+  raw=$(sed -n "${ln}p" "$CANONICAL/$CONF_NAME")
+  case "$raw" in
+    *')'*) ;;
+    *) warn "PLEACH_SUBS spans several lines in $CONF_NAME — leaving it alone; edit by hand"; return 1 ;;
+  esac
+  local quoted="" s
+  for s in "$@"; do quoted="$quoted $(printf '%q' "$s")"; done
+  local tmp
+  tmp=$(mktemp)
+  awk -v ln="$ln" -v new="PLEACH_SUBS=(${quoted# })" 'NR==ln { print new; next } { print }' \
+    "$CANONICAL/$CONF_NAME" > "$tmp"
+  mv "$tmp" "$CANONICAL/$CONF_NAME"
+}
+
+cmd_repos() {
+  local do_sync=0 do_bootstrap=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --sync)                      do_sync=1 ;;
+      --no-bootstrap|--no-install) do_bootstrap=0 ;;
+      -*)                          err "unknown flag: $1 (usage: pleach repos [--sync] [--no-bootstrap])" ;;
+      *)                           err "unexpected argument: $1" ;;
+    esac
+    shift
+  done
+  load_config
+
+  local -a detected=() new_subs=() gone=()
+  local s
+  while IFS= read -r s; do [ -n "$s" ] && detected+=("$s"); done < <(detect_subs)
+  for s in ${detected[@]+"${detected[@]}"}; do
+    in_list "$s" ${SUBS[@]+"${SUBS[@]}"} || new_subs+=("$s")
+  done
+  for s in ${SUBS[@]+"${SUBS[@]}"}; do
+    in_list "$s" ${detected[@]+"${detected[@]}"} || gone+=("$s")
+  done
+
+  echo "canonical: $CANONICAL"
+  echo "  repos on disk: ${detected[*]:-(none)}"
+  if [ "$CONF_DECLARES_SUBS" -eq 1 ]; then
+    echo "  PLEACH_SUBS:   ${SUBS[*]:-(empty)}"
+  else
+    echo "  PLEACH_SUBS:   (not declared — auto-detection)"
+  fi
+  [ ${#new_subs[@]} -gt 0 ] && echo "  ↑ new on disk, absent from the conf: ${new_subs[*]}"
+  [ ${#gone[@]} -gt 0 ] && warn "declared in the conf but missing from disk: ${gone[*]}"
+
+  # Effective list after a --sync: conf + new ones (order preserved).
+  local -a effective=(${SUBS[@]+"${SUBS[@]}"} ${new_subs[@]+"${new_subs[@]}"})
+
+  # Conf sync (only if it declares PLEACH_SUBS; with no declaration the
+  # auto-detection already picks new repos up and there is nothing to align).
+  if [ "$do_sync" -eq 1 ]; then
+    if [ ${#new_subs[@]} -eq 0 ]; then
+      info "$CONF_NAME is already in sync with disk"
+    elif [ "$CONF_DECLARES_SUBS" -eq 0 ]; then
+      info "$CONF_NAME does not declare PLEACH_SUBS (auto-detection) — nothing to align"
+    elif rewrite_conf_subs "${effective[@]}"; then
+      info "$CONF_NAME: PLEACH_SUBS += ${new_subs[*]}"
+    fi
+  fi
+
+  # Sessions: which effective subs are they missing?
+  echo ""
+  echo "sessions ($SESSIONS):"
+  # One lock for the whole batch (not per worktree) — serializes this --sync
+  # against any concurrent new/rm/add.
+  [ "$do_sync" -eq 1 ] && [ -d "$SESSIONS" ] && lock
+  local n dir found=0 pending=0
+  local -a present=() missing=()
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    found=1
+    dir="$SESSIONS/$n"
+    present=(); missing=()
+    while IFS= read -r s; do [ -n "$s" ] && present+=("$s"); done < <(session_subs "$dir")
+    for s in ${effective[@]+"${effective[@]}"}; do
+      in_list "$s" ${present[@]+"${present[@]}"} || missing+=("$s")
+    done
+    if [ ${#missing[@]} -eq 0 ]; then
+      echo "  ✓ $n — complete (${#present[@]} sub-repos)"
+      continue
+    fi
+    pending=$((pending + 1))
+    echo "  ← $n — missing: ${missing[*]}"
+    if [ "$do_sync" -eq 1 ]; then
+      for s in "${missing[@]}"; do
+        mount_sub "$n" "$dir" "$s" "$do_bootstrap" || true
+      done
+    fi
+  done < <(session_names)
+  [ "$found" -eq 0 ] && echo "  (no sessions)"
+  [ "$do_sync" -eq 1 ] && [ -n "$LOCK_DIR" ] && unlock
+
+  echo ""
+  if [ "$do_sync" -eq 1 ]; then
+    echo "✅ workspace aligned."
+  elif [ "$pending" -gt 0 ] || [ ${#new_subs[@]} -gt 0 ]; then
+    echo "Align everything (conf + sessions): pleach repos --sync"
+  else
+    echo "Everything is in sync."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+session_problems() { # $1 name — echoes pending work (one per line); rc 0 if none
+  # Criterion shared by rm and prune: uncommitted changes in any worktree, or
+  # commits on session/<name> not yet integrated into the local BASE.
+  local name="$1" dir="$SESSIONS/$1" branch
+  branch=$(session_branch "$name")
+  local -a present=()
+  local s wt repo label ahead count=0
+  while IFS= read -r s; do [ -n "$s" ] && present+=("$s"); done < <(session_subs "$dir")
+  for s in "" ${present[@]+"${present[@]}"}; do
+    repo=$(repo_path "$s"); label="${s:-root}"
+    wt="$dir${s:+/$s}"
+    [ -e "$wt/.git" ] || continue
+    if [ -n "$(git -C "$wt" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+      echo "$label: uncommitted changes"
+      count=$((count + 1))
+    fi
+    ahead=$(git -C "$repo" rev-list --count "$BASE..$branch" 2>/dev/null || echo 0)
+    if [ "${ahead:-0}" -gt 0 ]; then
+      echo "$label: $ahead commit(s) on $branch not integrated into $BASE"
+      count=$((count + 1))
+    fi
+  done
+  [ "$count" -eq 0 ]
+}
+
+cmd_rm() {
+  local name="" force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force) force=1 ;;
+      -*)      err "unknown flag: $1" ;;
+      *)       [ -z "$name" ] && name="$1" || err "too many arguments" ;;
+    esac
+    shift
+  done
+  [ -n "$name" ] || err "usage: pleach rm <name> [--force]"
+  load_config
+  local dir="$SESSIONS/$name" branch
+  branch=$(session_branch "$name")
+  [ -d "$dir" ] || err "session '$name' does not exist at $dir"
+
+  local -a present=()
+  local s repo label
+  while IFS= read -r s; do [ -n "$s" ] && present+=("$s"); done < <(session_subs "$dir")
+
+  # Safety: refuse if there is unsaved / unintegrated work.
+  local problems=""
+  if ! problems=$(session_problems "$name") && [ "$force" -eq 0 ]; then
+    echo "pleach: session '$name' has pending work:" >&2
+    printf '%s\n' "$problems" | sed 's/^/  - /' >&2
+    err "use --force to remove anyway (the worktrees go; branches with unintegrated commits are preserved)"
+  fi
+
+  lock
+  # Subs first, root last (the root worktree contains the subs').
+  for s in ${present[@]+"${present[@]}"}; do
+    git -C "$CANONICAL/$s" worktree remove --force "$dir/$s" 2>/dev/null \
+      || warn "worktree remove failed in $s (cleaned up via prune)"
+    git -C "$CANONICAL/$s" worktree prune
+  done
+  if [ -e "$dir/.git" ]; then
+    git -C "$CANONICAL" worktree remove --force "$dir" 2>/dev/null || true
+  fi
+  git -C "$CANONICAL" worktree prune
+  rm -rf "$dir"
+  rm -f "$dir.code-workspace"
+  unlock
+
+  # Branches: delete only the ones fully integrated into $BASE; keep the rest.
+  # (merge-base rather than `branch -d`: -d compares against the canonical repo's
+  #  current HEAD, which may sit on some unrelated working branch.)
+  for s in "" ${present[@]+"${present[@]}"}; do
+    repo=$(repo_path "$s"); label="${s:-root}"
+    git -C "$repo" show-ref --verify --quiet "refs/heads/$branch" || continue
+    if git -C "$repo" merge-base --is-ancestor "$branch" "$BASE" 2>/dev/null; then
+      git -C "$repo" branch -D "$branch" >/dev/null 2>&1 || true
+      info "$label: branch $branch deleted (integrated into $BASE)"
+    else
+      warn "$label: branch $branch preserved (unintegrated commits — delete with: git -C $repo branch -D $branch)"
+    fi
+  done
+
+  echo "✅ Session '$name' removed."
+}
+
+# ---------------------------------------------------------------------------
+cmd_prune() { # hygiene: remove sessions whose work is fully integrated (dry run by default)
+  local apply=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --apply|--yes|-y) apply=1 ;;
+      -*) err "unknown flag: $1 (usage: pleach prune [--apply])" ;;
+      *)  err "unexpected argument: $1 (usage: pleach prune [--apply])" ;;
+    esac
+    shift
+  done
+  load_config
+  local n problems found=0
+  local -a removable=()
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    found=1
+    if problems=$(session_problems "$n"); then
+      removable+=("$n")
+      echo "  ✓ $n — fully integrated (removable)"
+    else
+      echo "  ● $n — pending work:"
+      printf '%s\n' "$problems" | sed 's/^/      - /'
+    fi
+  done < <(session_names)
+  [ "$found" -eq 0 ] && { echo "(no sessions in $SESSIONS)"; return 0; }
+  echo ""
+  if [ ${#removable[@]} -eq 0 ]; then
+    echo "Nothing to remove — every session has pending work."
+    echo "(\"integrated\" is judged against the LOCAL $BASE — merges that only landed on the remote need a git fetch first)"
+    return 0
+  fi
+  if [ "$apply" -eq 0 ]; then
+    echo "Dry run — remove ${#removable[@]} session(s): pleach prune --apply"
+    return 0
+  fi
+  for n in "${removable[@]}"; do
+    cmd_rm "$n"
+  done
+}
+
+# ---------------------------------------------------------------------------
+cmd_clean() { # purge rematerialized build/dependency artifacts (dry run by default)
+  local name="" apply=0 do_bootstrap=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --apply|--yes|-y) apply=1 ;;
+      --bootstrap)      do_bootstrap=1; apply=1 ;;
+      -*) err "unknown flag: $1 (usage: pleach clean [<session>] [--apply] [--bootstrap])" ;;
+      *)  [ -z "$name" ] && name="$1" || err "too many arguments" ;;
+    esac
+    shift
+  done
+  load_config
+  if [ -z "$name" ]; then
+    name=$(detect_session_name 2>/dev/null) \
+      || err "usage: pleach clean <session> [--apply] [--bootstrap]  (inside a session the name is inferred)"
+  fi
+  local dir="$SESSIONS/$name"
+  [ -d "$dir" ] || err "session '$name' does not exist at $dir"
+
+  local -a targets=() skipped=()
+  local d
+  while IFS= read -r -d '' d; do
+    # We only delete what git IGNORES — a tracked dist/ is never touched.
+    if git -C "$(dirname "$d")" check-ignore -q "$d" 2>/dev/null; then
+      targets+=("$d")
+    else
+      skipped+=("$d")
+    fi
+  done < <(find "$dir" -type d \( -name node_modules -o -name .next -o -name .open-next \
+      -o -name .wrangler -o -name dist -o -name build -o -name target \
+      -o -name .venv -o -name vendor -o -name .turbo \) -prune -print0)
+
+  if [ ${#targets[@]} -eq 0 ]; then
+    echo "Nothing to clean in '$name'."
+  else
+    du -sh "${targets[@]}" 2>/dev/null | sed "s|$dir/|  |"
+    echo "  total: $(du -sk "${targets[@]}" 2>/dev/null | awk '{s+=$1} END {printf "%.0f MB", s/1024}')"
+  fi
+  [ ${#skipped[@]} -gt 0 ] && warn "not ignored by git (preserved): ${skipped[*]}"
+
+  if [ "$apply" -eq 0 ]; then
+    [ ${#targets[@]} -gt 0 ] && echo "Dry run — delete with: pleach clean $name --apply  (--bootstrap reinstalls afterwards)"
+    return 0
+  fi
+  local t
+  for t in ${targets[@]+"${targets[@]}"}; do rm -rf "$t"; done
+  [ ${#targets[@]} -gt 0 ] && info "${#targets[@]} directory(ies) removed"
+  [ "$do_bootstrap" -eq 1 ] && run_bootstrap "$dir" ""
+  echo "✅ '$name' cleaned."
+}
+
+# ---------------------------------------------------------------------------
+run_in_dir() { # $1 dir; rest = command (1 arg → bash -c; N args → literal)
+  local d="$1"
+  shift
+  if [ $# -eq 1 ]; then ( cd "$d" && bash -c "$1" ); else ( cd "$d" && "$@" ); fi
+}
+
+cmd_each() { # runs a command in the canonical and in the root of every session
+  [ $# -ge 1 ] || err "usage: pleach each '<command>'  (or: pleach each cmd arg …)"
+  load_config
+  local rc=0 n
+  local -a names=()
+  while IFS= read -r n; do [ -n "$n" ] && names+=("$n"); done < <(session_names)
+  echo "● canonical  ($CANONICAL)"
+  run_in_dir "$CANONICAL" "$@" || { rc=1; warn "canonical: the command returned an error"; }
+  for n in ${names[@]+"${names[@]}"}; do
+    echo "● $n  ($SESSIONS/$n)"
+    run_in_dir "$SESSIONS/$n" "$@" || { rc=1; warn "$n: the command returned an error"; }
+  done
+  return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+ls_short() {
+  local n dir idx port count found=0
+  printf '  %-24s %4s  %-10s %6s\n' "NAME" "IDX" "PORTS" "REPOS"
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    found=1
+    dir="$SESSIONS/$n"
+    idx=$(session_env_get "$dir" PLEACH_INDEX)
+    port=$(session_env_get "$dir" PLEACH_PORT_BASE)
+    count=$(session_subs "$dir" | wc -l | tr -d ' ')
+    printf '● %-24s %4s  %-10s %6s\n' "$n" "${idx:-?}" "${port:-?}+" "$((count + 1))"
+  done < <(session_names)
+  if [ "$found" -eq 0 ]; then
+    echo "(no sessions in $SESSIONS)"
+    return 0
+  fi
+  echo ""
+  echo "($SESSIONS — 'pleach ls -l' for branches, commits and changes per repo)"
+}
+
+ls_long() {
+  local found=0 n dir idx port s wt ahead behind dirty last marks clean last_activity
+  local -a present=()
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    found=1
+    dir="$SESSIONS/$n"
+    idx=$(session_env_get "$dir" PLEACH_INDEX)
+    port=$(session_env_get "$dir" PLEACH_PORT_BASE)
+    echo "● $n  (index ${idx:-?}, ports ${port:-?}+)  $dir/"
+    present=()
+    while IFS= read -r s; do [ -n "$s" ] && present+=("$s"); done < <(session_subs "$dir")
+    clean=1
+    last_activity=""
+    for s in "" ${present[@]+"${present[@]}"}; do
+      wt="$dir${s:+/$s}"
+      [ -e "$wt/.git" ] || continue
+      ahead=$(git -C "$wt" rev-list --count "$BASE..HEAD" 2>/dev/null || echo "?")
+      behind=$(git -C "$wt" rev-list --count "HEAD..$BASE" 2>/dev/null || echo "?")
+      dirty=$(git -C "$wt" status --porcelain --untracked-files=no 2>/dev/null | wc -l | tr -d ' ')
+      last=$(git -C "$wt" log -1 --format='%ad' --date=short 2>/dev/null || echo "")
+      if [ -n "$last" ] && [[ "$last" > "$last_activity" ]]; then last_activity="$last"; fi
+      marks=""
+      [ "${ahead:-0}" != "0" ] && marks+=" +$ahead commits"
+      [ "${dirty:-0}" != "0" ] && marks+=" ✎$dirty changes"
+      [ "${behind:-0}" != "0" ] && marks+=" ↓$behind behind"
+      if [ "${ahead:-0}" != "0" ] || [ "${dirty:-0}" != "0" ]; then clean=0; fi
+      echo "    ${s:-root}: $(git -C "$wt" branch --show-current 2>/dev/null)${marks}"
+    done
+    if [ "$clean" -eq 1 ]; then
+      echo "    ✓ fully integrated — removable (pleach prune)${last_activity:+ · last activity: $last_activity}"
+    elif [ -n "$last_activity" ]; then
+      echo "    (last activity: $last_activity)"
+    fi
+  done < <(session_names)
+  if [ "$found" -eq 0 ]; then echo "(no sessions in $SESSIONS)"; fi
+}
+
+cmd_ls() {
+  local long=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -l|--long|--repos) long=1 ;;
+      -s|--short)        long=0 ;;
+      *)                 err "unknown flag: $1 (usage: pleach ls [-l])" ;;
+    esac
+    shift
+  done
+  load_config
+  if [ "$long" -eq 1 ]; then ls_long; else ls_short; fi
+}
+
+# ---------------------------------------------------------------------------
+cmd_install() {
+  local target="$HOME/.local/bin/pleach" src
+  src=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+  [ "$src" = "$target" ] && err "you are running the installed copy — run install from the source checkout (the pleach repo)"
+  mkdir -p "$HOME/.local/bin"
+  cp "$src" "$target"
+  chmod +x "$target"
+  info "installed at $target"
+  # shellcheck disable=SC2088  # literal ~ is deliberate: this is message text, not a path
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *) warn "~/.local/bin is not on your PATH — add to ~/.zshrc: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+cmd_update() {
+  # Installs managed by npm/bun update through the package manager.
+  local self="$0"
+  [ -L "$self" ] && self=$(readlink "$self")
+  case "$self" in
+    *node_modules*|*/.bun/*)
+      err "this install is managed by npm/bun — update with: bun update -g pleach (or npm update -g pleach)"
+      ;;
+  esac
+  command -v curl >/dev/null 2>&1 \
+    || err "update needs curl — alternative: clone https://github.com/$PLEACH_REPO and run ./pleach install"
+  local target tmp newver
+  target="$HOME/.local/bin/pleach"
+  tmp=$(mktemp)
+  curl -fsSL "https://raw.githubusercontent.com/$PLEACH_REPO/main/pleach" -o "$tmp" \
+    || { rm -f "$tmp"; err "download failed (offline, or $PLEACH_REPO unreachable?)"; }
+  bash -n "$tmp" 2>/dev/null \
+    || { rm -f "$tmp"; err "the downloaded script fails its syntax check — aborted (nothing was changed)"; }
+  if [ -f "$target" ] && cmp -s "$tmp" "$target"; then
+    rm -f "$tmp"
+    info "already on the latest version ($target)"
+    return 0
+  fi
+  chmod +x "$tmp"
+  mkdir -p "$(dirname "$target")"
+  mv "$tmp" "$target"
+  newver=$("$target" version 2>/dev/null || echo "pleach ?")
+  info "updated $target ($newver)"
+}
+
+# ---------------------------------------------------------------------------
+# Help — the single source of truth for command documentation.
+# ---------------------------------------------------------------------------
+usage() {
+  cat <<'EOF'
+pleach — parallel, isolated work sessions for multi-repo workspaces.
+
+Usage: pleach <command> [arguments]
+
+Sessions
+  new <name> [sub …]        Create a session: one git worktree per repo on branch session/<name>.
+  open <name> [command …]   Open the session (creating it if needed). Default command: claude.
+  ls [-l]                   List sessions. With -l, detail each one's repos.
+  add [<session>] <sub …>   Mount sub-repos into an existing session.
+  sync [<session>|--all]    Bring the canonical's local main into the session's branches.
+  rm <name> [--force]       Remove the session. Refuses when work is pending.
+  prune [--apply]           List (and with --apply remove) fully integrated sessions.
+  clean [<session>]         Delete git-ignored artifacts (node_modules, builds…).
+  each '<command>'          Run a command in the canonical and in each session root.
+
+Workspace
+  init [--default]          Adopt pleach in the current repo (writes .pleach.conf).
+  repos [--sync]            Compare repos on disk x conf x sessions; --sync aligns everything.
+
+Tool
+  install                   Copy this script to ~/.local/bin/pleach.
+  update                    Self-update from the repo's main branch.
+  version                   Print the installed version.
+  help [command]            Detailed help for a command (and `help config`).
+
+e.g. pleach open fix-login          create/open and get to work
+     pleach repos --sync            adopt a new workspace repo (e.g. payments)
+     pleach sync fix-login          bring the session up to date with main
+EOF
+}
+
+help_topic() {
+  case "$1" in
+    new) cat <<'EOF'
+pleach new <name> [sub …] [--fetch] [--no-bootstrap]
+
+Creates the session at <PLEACH_DIR>/<name>: one git worktree per repo (root +
+subs), all on branch session/<name>, cut from the base (default: main). Copies
+untracked secrets (.env*, .dev.vars*, PLEACH_SECRETS_EXTRA), assigns an exclusive
+block of 100 ports (.session-env) and runs the dependency bootstrap.
+
+  sub ...          Only these sub-repos (default: everything in PLEACH_SUBS).
+  --fetch          Update the base from origin before creating.
+  --no-bootstrap   Skip dependency installation.
+
+If branch session/<name> already exists in a repo, it is resumed, not recreated.
+EOF
+    ;;
+    open) cat <<'EOF'
+pleach open <name> [command ...]
+
+Enters the session (creating it with every sub-repo if it does not exist), loads
+.session-env (ports, identity) and runs the command in there. Default: claude.
+
+  pleach open fix-x             claude inside the session
+  pleach open fix-x claude -r   resume that session's previous conversation
+  pleach open fix-x codex       any other LLM/command
+  pleach open fix-x code        VS Code on the session's multi-root workspace
+EOF
+    ;;
+    ls) cat <<'EOF'
+pleach ls [-l]
+
+With no flags, lists just the sessions — name, index, port block and repo count.
+It is instant (runs no git).
+
+  -l, --long   Per-repo detail: branch, commits ahead of base (+N), uncommitted
+               changes and commits behind the local base. Per session: last
+               activity (date of the most recent commit) and the "fully
+               integrated - removable" mark when nothing is ahead and nothing is
+               uncommitted. Slower (several git calls per repo).
+EOF
+    ;;
+    add) cat <<'EOF'
+pleach add [<session>] <sub ...|--all> [--no-bootstrap]
+
+Mounts sub-repos into an existing session — the typical case is a new repo in the
+workspace (e.g. payments) that older sessions do not have. Creates the worktree on
+branch session/<name>, copies THAT sub's secrets and runs ITS bootstrap.
+
+  --all            Mount every workspace sub-repo the session is missing.
+  --no-bootstrap   Skip dependency installation.
+
+The session name is optional when the command runs inside it:
+
+  pleach add fix-x payments       from outside
+  pleach add payments             from inside session fix-x
+  pleach repos --sync             to do it across ALL sessions at once
+EOF
+    ;;
+    sync) cat <<'EOF'
+pleach sync [<session>|--all] [--rebase] [--fetch] [--any-branch] [--dry-run] [--yes]
+
+Brings a session up to date with the canonical: in each repo it integrates the
+LOCAL <base> (the canonical's main) into branch session/<name>. It never reaches
+for origin — the local main is the source. Update it as usual (git pull in the
+canonical) or pass --fetch.
+
+  --all          Every session. Asks for confirmation (shows the blast radius);
+                 non-interactive callers (scripts/agents) must pass --yes.
+  --dry-run, -n  Show what would be integrated/skipped, changing NOTHING (not
+                 even the base ref — --fetch is ignored).
+  --yes, -y      Skip the --all confirmation (for deliberate automation).
+  --fetch        Before integrating, try to advance the local <base> from origin.
+  --rebase       Rebase instead of merge (rewrites history — force-push if a PR exists).
+  --any-branch   Integrate even into worktrees not on the session's branch.
+
+Safety rules (a skipped repo never blocks the others):
+  - A worktree not on session/<name> is SKIPPED. If you switched to feat/x in
+    there, sync leaves it alone — unrequested merges into feature branches are
+    exactly what this guard rail exists to prevent.
+  - A repo with uncommitted changes is SKIPPED (never an automatic stash).
+  - A conflict aborts that repo and leaves it untouched; the command tells you
+    where to resolve it by hand.
+  - Workspace sub-repos missing from the session are reported, not mounted
+    (mounting is `pleach add`'s explicit job).
+
+With no name and outside a session it is an error. Inside a session, the name is
+inferred.
+EOF
+    ;;
+    rm) cat <<'EOF'
+pleach rm <name> [--force]
+
+Removes the session's worktrees and its folder. Refuses if any repo has
+uncommitted changes or commits on session/<name> not yet integrated into the base.
+
+  --force   Remove anyway. Branches with unintegrated commits are ALWAYS
+            preserved (delete by hand: git -C <repo> branch -D session/<name>).
+
+"Integrated" is judged against the LOCAL base — if the merge only happened on the
+remote, run git fetch in the repo before rm.
+EOF
+    ;;
+    prune) cat <<'EOF'
+pleach prune [--apply]
+
+Post-merge hygiene: finds the sessions whose work is fully integrated into the
+base (same criterion as rm — no uncommitted changes, no session/<name> commits
+outside the base) and, with --apply, removes them through rm's safe path.
+
+With no flags it is a dry run: it only lists. "Integrated" is judged against the
+LOCAL base — merges that only landed on the remote need a git fetch first.
+EOF
+    ;;
+    clean) cat <<'EOF'
+pleach clean [<session>] [--apply] [--bootstrap]
+
+Long-lived sessions rematerialize disk (node_modules, .next, dist, ...). clean
+finds those directories INSIDE the session and deletes them — but ONLY the ones
+git ignores: a tracked dist/ is preserved and reported. Dry run by default, with
+sizes.
+
+  --apply       Actually delete.
+  --bootstrap   Implies --apply; re-runs the bootstrap afterwards (reinstalls deps).
+
+Inside a session the name is inferred. Targets: node_modules .next .open-next
+.wrangler dist build target .venv vendor .turbo
+EOF
+    ;;
+    each) cat <<'EOF'
+pleach each '<command>'
+pleach each <cmd> <arg> ...
+
+Runs the command in the CANONICAL and in the root of EVERY session, with a header
+per target. A single argument goes through bash -c (pipes and globs work); several
+arguments are executed literally. The exit code aggregates (non-zero if any
+failed).
+
+Typical use: cross-session visibility — parallel work in other sessions is
+invisible to your worktree until it merges. e.g.:
+
+  pleach each 'ls docs/rfcs'                RFC numbers taken EVERYWHERE
+  pleach each 'git log --oneline -1'        last commit in each root
+EOF
+    ;;
+    version) cat <<'EOF'
+pleach version
+
+Prints the installed version (aliases: --version, -V). Handy for confirming which
+install path (npm/bun global, or ~/.local/bin) is active on your PATH.
+EOF
+    ;;
+    init) cat <<'EOF'
+pleach init [--default]
+
+Adopts pleach in the current repo: detects first-level sub-repos and writes
+.pleach.conf at the root.
+
+  --default   Also record this project as the machine default in
+              ~/.config/pleach/config (PLEACH_DEFAULT_CANONICAL), which makes
+              `pleach ls`/`new` work from any directory.
+EOF
+    ;;
+    repos) cat <<'EOF'
+pleach repos [--sync] [--no-bootstrap]
+
+Shows the workspace's repos in three views — what is on the canonical's disk, what
+.pleach.conf declares in PLEACH_SUBS, and what each session is missing. This is
+the command for adopting a new workspace repo.
+
+With no flags it is read-only. With --sync:
+  1. appends the new repos to PLEACH_SUBS in .pleach.conf (a surgical edit of the
+     line — comments and your pleach_bootstrap hook stay intact; if the conf does
+     not declare PLEACH_SUBS, auto-detection already covers them);
+  2. mounts the missing worktrees in ALL existing sessions, copying secrets and
+     running each new sub's bootstrap.
+
+  --no-bootstrap   Mount without installing dependencies.
+
+Repos declared in the conf but absent from disk are reported, never removed.
+EOF
+    ;;
+    install) cat <<'EOF'
+pleach install
+
+Copies this script to ~/.local/bin/pleach (run it from a clone of the repo).
+Installs via npm/bun do not need this.
+EOF
+    ;;
+    update) cat <<'EOF'
+pleach update
+
+Self-updates the copy at ~/.local/bin/pleach from the repo's main branch over
+plain https (curl, no auth needed). Validates the downloaded script's syntax
+before installing it. Installs managed by npm/bun are detected and redirected to
+the package manager.
+EOF
+    ;;
+    config) cat <<'EOF'
+.pleach.conf — a bash file (sourced) at the canonical's root. Everything optional.
+
+  PLEACH_CANONICAL=/path      If this checkout is NOT the canonical (replicas).
+  PLEACH_SUBS=(subA subB)     Sub-repos per session. Default: auto-detect
+                              first-level dirs with .git. Align with disk:
+                              pleach repos --sync
+  PLEACH_BASE=main            Base branch for sessions.
+  PLEACH_DIR=/path/.sessions  Where sessions live.
+  PLEACH_PORT_START=10000     Start of the port blocks (session N gets +N*100).
+  PLEACH_SECRETS_EXTRA=(...)  Extra relative paths to copy into each session.
+  pleach_bootstrap() { ... }  Post-creation hook. $1 = session folder,
+                              $2 = sub being mounted (empty = whole session, in
+                              `new`). Default: bun install where a package.json
+                              is found.
+
+Canonical resolution, in order:
+  1. env PLEACH_CANONICAL
+  2. .pleach.conf walking up from the cwd (may redirect via PLEACH_CANONICAL)
+  3. .session-env walking up (we are inside a session)
+  4. ~/.config/pleach/config -> PLEACH_DEFAULT_CANONICAL
+
+Guard rail for automation/harnesses (env, not conf):
+  PLEACH_EXPECT_CANONICAL=/path   If the RESOLVED canonical differs from this
+                                  path, pleach aborts before any write. Mandatory
+                                  in test scripts — it stops a wrong cwd from
+                                  resolving to your real workspace.
+EOF
+    ;;
+    *) err "no help for '$1' (commands: init new open ls add sync rm prune clean each repos install update version; topics: config)" ;;
+  esac
+}
+
+cmd_help() {
+  if [ $# -eq 0 ]; then usage; else help_topic "$1"; fi
+}
+
+# ---------------------------------------------------------------------------
+[ $# -ge 1 ] || { usage; exit 0; }
+cmd="$1"; shift
+case "$cmd" in
+  init)    cmd_init "$@" ;;
+  new)     cmd_new "$@" ;;
+  open)    cmd_open "$@" ;;
+  add)     cmd_add "$@" ;;
+  sync)    cmd_sync "$@" ;;
+  repos)   cmd_repos "$@" ;;
+  rm)      cmd_rm "$@" ;;
+  prune)   cmd_prune "$@" ;;
+  clean)   cmd_clean "$@" ;;
+  each)    cmd_each "$@" ;;
+  ls)      cmd_ls "$@" ;;
+  install) cmd_install "$@" ;;
+  update)  cmd_update "$@" ;;
+  version|--version|-V) echo "pleach $PLEACH_VERSION" ;;
+  help|-h|--help) cmd_help "$@" ;;
+  *) err "unknown command: $cmd (init|new|open|add|sync|repos|rm|prune|clean|each|ls|install|update|version|help)" ;;
+esac

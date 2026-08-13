@@ -1,0 +1,403 @@
+#!/usr/bin/env bash
+# pleach test harness - runs entirely inside an isolated temporary sandbox.
+#
+# It NEVER points PLEACH_CANONICAL at a real workspace, and it pins
+# PLEACH_EXPECT_CANONICAL to the sandbox so that a wrong cwd cannot resolve
+# somewhere else. That guard rail exists because of a real incident: an early
+# unpinned harness ran `sync --all` against a live workspace.
+#
+# This script never modifies the `pleach` under test and never runs git in the
+# pleach repo itself - git only ever touches throwaway repos in the sandbox.
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+PLEACH="$ROOT/pleach"
+SANDBOX=$(mktemp -d "${TMPDIR:-/tmp}/pleach-test.XXXXXX")
+trap 'rm -rf "$SANDBOX"' EXIT
+
+export PLEACH_CANONICAL="$SANDBOX/canon"
+export PLEACH_EXPECT_CANONICAL="$SANDBOX/canon"
+
+# Belt and braces: bail out immediately if the canonical is not inside the
+# sandbox - no test should be able to escape the temporary directory.
+case "$PLEACH_CANONICAL" in
+  "$SANDBOX"/*) ;;
+  *) echo "guard: canonical outside the sandbox"; exit 1 ;;
+esac
+
+CANON="$PLEACH_CANONICAL"
+SESSIONS="$SANDBOX/.sessions"
+
+# ---------------------------------------------------------------------------
+# Minimal test framework
+# ---------------------------------------------------------------------------
+TESTS=0
+FAILS=0
+
+ok() {
+  TESTS=$((TESTS + 1))
+  echo "  ok - $1"
+}
+
+fail() {
+  TESTS=$((TESTS + 1))
+  FAILS=$((FAILS + 1))
+  echo "  FAIL - $1" >&2
+}
+
+assert_contains() { # <description> <output> <substring>
+  local desc="$1" out="$2" needle="$3"
+  if [ "${out#*"$needle"}" != "$out" ]; then
+    ok "$desc"
+  else
+    fail "$desc - expected it to contain: [$needle]"
+    printf '    captured output:\n%s\n' "$out" | sed 's/^/    | /' >&2
+  fi
+}
+
+assert_rc() { # <description> <actual-rc> <expected-rc>
+  local desc="$1" rc="$2" want="$3"
+  if [ "$rc" -eq "$want" ]; then
+    ok "$desc"
+  else
+    fail "$desc - rc=$rc, expected $want"
+  fi
+}
+
+assert_true() { # <description> <command...> - ok when the command exits 0
+  local desc="$1"
+  shift
+  if "$@" >/dev/null 2>&1; then ok "$desc"; else fail "$desc"; fi
+}
+
+assert_eq() { # <description> <actual> <expected>
+  local desc="$1" got="$2" want="$3"
+  if [ "$got" = "$want" ]; then
+    ok "$desc"
+  else
+    fail "$desc - got [$got], expected [$want]"
+  fi
+}
+
+header() {
+  echo ""
+  echo "--- $1 ---"
+}
+
+# Runs a pleach command, capturing combined output in OUT and the exit code in
+# RC. `set -e` safe: the if keeps a non-zero rc from aborting the script.
+run() {
+  if OUT=$("$@" 2>&1); then RC=0; else RC=$?; fi
+}
+
+# Like run(), but with stdin on /dev/null - simulates a non-TTY invocation
+# (scripts/agents), used by the `sync --all` tests.
+run_noninteractive() {
+  if OUT=$("$@" </dev/null 2>&1); then RC=0; else RC=$?; fi
+}
+
+# ---------------------------------------------------------------------------
+# Fixture: canonical + subA + subB, each a git repo with one commit.
+# ---------------------------------------------------------------------------
+setup_repo() { # $1 = directory to initialise as a fresh git repo
+  mkdir -p "$1"
+  git init -q -b main "$1"
+  git -C "$1" config user.email "test@test"
+  git -C "$1" config user.name "test"
+}
+
+setup_fixture() {
+  setup_repo "$CANON"
+  echo "# canon" > "$CANON/README.md"
+  git -C "$CANON" add README.md
+  git -C "$CANON" commit -q -m "initial commit in the canonical"
+
+  setup_repo "$CANON/subA"
+  printf 'node_modules\n' > "$CANON/subA/.gitignore"
+  echo "initial content" > "$CANON/subA/f.txt"
+  git -C "$CANON/subA" add .gitignore f.txt
+  git -C "$CANON/subA" commit -q -m "initial commit in subA"
+
+  setup_repo "$CANON/subB"
+  echo "initial content" > "$CANON/subB/file.txt"
+  git -C "$CANON/subB" add file.txt
+  git -C "$CANON/subB" commit -q -m "initial commit in subB"
+}
+
+echo "sandbox: $SANDBOX"
+setup_fixture
+
+# ---------------------------------------------------------------------------
+header "Test 1: version"
+# ---------------------------------------------------------------------------
+run "$PLEACH" version
+PKG_VERSION=$(sed -nE 's/.*"version": *"([^"]+)".*/\1/p' "$ROOT/package.json" | head -1)
+assert_rc "version: rc 0" "$RC" 0
+assert_eq "version: output matches package.json" "$OUT" "pleach $PKG_VERSION"
+
+# ---------------------------------------------------------------------------
+header "Test 2: unexpected-canonical guard rail"
+# ---------------------------------------------------------------------------
+run env PLEACH_EXPECT_CANONICAL=/nope "$PLEACH" ls
+assert_rc "guard: non-zero rc when the canonical differs from the expected one" "$RC" 1
+assert_contains "guard: error message" "$OUT" "differs from the expected one"
+
+# ---------------------------------------------------------------------------
+header "Test 3: init"
+# ---------------------------------------------------------------------------
+run bash -c "cd '$CANON' || exit 1; '$PLEACH' init"
+assert_rc "init: rc 0" "$RC" 0
+assert_true "init: .pleach.conf created" [ -f "$CANON/.pleach.conf" ]
+assert_true "init: PLEACH_SUBS detects subA and subB" \
+  grep -qF 'PLEACH_SUBS=(subA subB)' "$CANON/.pleach.conf"
+
+# ---------------------------------------------------------------------------
+header "Test 4: new s1 --no-bootstrap"
+# ---------------------------------------------------------------------------
+run "$PLEACH" new s1 --no-bootstrap
+assert_rc "new s1: rc 0" "$RC" 0
+assert_true "new s1: session lives in the sandbox .sessions dir" \
+  [ -d "$SESSIONS/s1" ]
+assert_true "new s1: root worktree mounted" [ -e "$SESSIONS/s1/.git" ]
+assert_true "new s1: subA worktree mounted" [ -e "$SESSIONS/s1/subA/.git" ]
+assert_true "new s1: subB worktree mounted" [ -e "$SESSIONS/s1/subB/.git" ]
+assert_eq "new s1: root branch is session/s1" \
+  "$(git -C "$SESSIONS/s1" branch --show-current)" "session/s1"
+assert_eq "new s1: subA branch is session/s1" \
+  "$(git -C "$SESSIONS/s1/subA" branch --show-current)" "session/s1"
+assert_eq "new s1: subB branch is session/s1" \
+  "$(git -C "$SESSIONS/s1/subB" branch --show-current)" "session/s1"
+assert_true "new s1: .session-env exports PORT" \
+  grep -q '^export PORT=' "$SESSIONS/s1/.session-env"
+assert_true "new s1: VS Code workspace written beside the folder" \
+  [ -f "$SESSIONS/s1.code-workspace" ]
+
+# ---------------------------------------------------------------------------
+header "Test 5: new s1 a second time fails"
+# ---------------------------------------------------------------------------
+run "$PLEACH" new s1 --no-bootstrap
+assert_rc "new s1 (repeat): non-zero rc" "$RC" 1
+assert_contains "new s1 (repeat): says it already exists" "$OUT" "already exists"
+
+# ---------------------------------------------------------------------------
+header "Test 6: ls and ls -l"
+# ---------------------------------------------------------------------------
+run "$PLEACH" ls
+assert_rc "ls: rc 0" "$RC" 0
+assert_contains "ls: lists s1" "$OUT" "s1"
+
+run "$PLEACH" ls -l
+assert_rc "ls -l: rc 0" "$RC" 0
+assert_contains "ls -l: shows the root branch" "$OUT" "root: session/s1"
+assert_contains "ls -l: marks the session as fully integrated" "$OUT" "fully integrated"
+
+# ---------------------------------------------------------------------------
+header "Test 7: sync --dry-run changes nothing"
+# ---------------------------------------------------------------------------
+git -C "$CANON" commit -q --allow-empty -m "empty commit in the canonical root"
+HEAD_BEFORE=$(git -C "$SESSIONS/s1" rev-parse HEAD)
+
+run "$PLEACH" sync s1 --dry-run
+assert_rc "sync --dry-run: rc 0" "$RC" 0
+assert_contains "sync --dry-run: reports +1 commit to integrate" "$OUT" "would merge +1 commit(s)"
+assert_contains "sync --dry-run: reports the pending count" "$OUT" "would be updated"
+
+HEAD_AFTER=$(git -C "$SESSIONS/s1" rev-parse HEAD)
+assert_eq "sync --dry-run: root worktree HEAD unchanged" "$HEAD_AFTER" "$HEAD_BEFORE"
+
+# ---------------------------------------------------------------------------
+header "Test 8: sync actually integrates"
+# ---------------------------------------------------------------------------
+run "$PLEACH" sync s1
+assert_rc "sync s1: rc 0" "$RC" 0
+assert_contains "sync s1: integrates the root" "$OUT" "merged main (+1)"
+
+run "$PLEACH" sync s1
+assert_rc "sync s1 (second time): rc 0" "$RC" 0
+assert_contains "sync s1 (second time): already up to date" "$OUT" "already up to date"
+
+# ---------------------------------------------------------------------------
+header "Test 9: sync skips uncommitted changes"
+# ---------------------------------------------------------------------------
+printf 'local-change\n' > "$SESSIONS/s1/subA/f.txt"
+git -C "$CANON/subA" commit -q --allow-empty -m "empty commit in subA"
+
+run "$PLEACH" sync s1
+assert_rc "sync s1 (subA dirty): rc 0" "$RC" 0
+assert_contains "sync s1: skips subA over uncommitted changes" "$OUT" "SKIPPED (uncommitted changes)"
+assert_eq "sync s1: the local change to f.txt survives" \
+  "$(cat "$SESSIONS/s1/subA/f.txt")" "local-change"
+
+git -C "$SESSIONS/s1/subA" checkout -- f.txt
+
+# ---------------------------------------------------------------------------
+header "Test 10: sync skips a worktree on another branch"
+# ---------------------------------------------------------------------------
+git -C "$SESSIONS/s1/subB" checkout -q -b feat/x
+git -C "$CANON/subB" commit -q --allow-empty -m "empty commit in subB"
+
+run "$PLEACH" sync s1
+assert_rc "sync s1 (subB on another branch): rc 0" "$RC" 0
+assert_contains "sync s1: skips subB over the branch mismatch" "$OUT" "SKIPPED (force with: --any-branch)"
+
+run "$PLEACH" sync s1 --any-branch
+assert_rc "sync s1 --any-branch: rc 0" "$RC" 0
+assert_contains "sync s1 --any-branch: integrates subB on feat/x" "$OUT" "subB: merged main (+1)"
+
+git -C "$SESSIONS/s1/subB" checkout -q session/s1
+
+# ---------------------------------------------------------------------------
+header "Test 11: sync --all requires --yes outside a TTY"
+# ---------------------------------------------------------------------------
+run_noninteractive "$PLEACH" sync --all
+assert_rc "sync --all without --yes: non-zero rc" "$RC" 1
+assert_contains "sync --all without --yes: demands --yes" "$OUT" "requires --yes"
+
+run_noninteractive "$PLEACH" sync --all --yes
+assert_rc "sync --all --yes: rc 0" "$RC" 0
+
+# ---------------------------------------------------------------------------
+header "Test 12: rm blocks on pending work; --force removes and keeps the branch"
+# ---------------------------------------------------------------------------
+echo "work" > "$SESSIONS/s1/g.txt"
+git -C "$SESSIONS/s1" add g.txt
+git -C "$SESSIONS/s1" commit -q -m "work in progress in the root"
+
+run "$PLEACH" rm s1
+assert_rc "rm s1 (no --force): non-zero rc" "$RC" 1
+assert_contains "rm s1 (no --force): reports pending work" "$OUT" "pending work"
+
+run "$PLEACH" rm s1 --force
+assert_rc "rm s1 --force: rc 0" "$RC" 0
+assert_true "rm s1 --force: session folder removed" [ ! -e "$SESSIONS/s1" ]
+assert_true "rm s1 --force: session/s1 branch preserved in the canonical" \
+  git -C "$CANON" show-ref --verify --quiet refs/heads/session/s1
+
+# ---------------------------------------------------------------------------
+header "Test 13: prune (dry run and --apply)"
+# ---------------------------------------------------------------------------
+run "$PLEACH" new s2 --no-bootstrap
+assert_rc "new s2: rc 0" "$RC" 0
+run "$PLEACH" new s3 --no-bootstrap
+assert_rc "new s3: rc 0" "$RC" 0
+
+echo "work" > "$SESSIONS/s3/h.txt"
+git -C "$SESSIONS/s3" add h.txt
+git -C "$SESSIONS/s3" commit -q -m "work in progress in s3"
+
+run "$PLEACH" prune
+assert_rc "prune (dry run): rc 0" "$RC" 0
+assert_contains "prune: s2 is fully integrated" "$OUT" "fully integrated (removable)"
+assert_contains "prune: s3 has pending work" "$OUT" "pending work:"
+assert_contains "prune: flags itself as a dry run" "$OUT" "Dry run"
+assert_true "prune (dry run): s2 still there" [ -d "$SESSIONS/s2" ]
+assert_true "prune (dry run): s3 still there" [ -d "$SESSIONS/s3" ]
+
+run "$PLEACH" prune --apply
+assert_rc "prune --apply: rc 0" "$RC" 0
+assert_true "prune --apply: s2 removed" [ ! -e "$SESSIONS/s2" ]
+assert_true "prune --apply: s3 kept" [ -d "$SESSIONS/s3" ]
+
+# ---------------------------------------------------------------------------
+header "Test 14: clean (dry run and --apply)"
+# ---------------------------------------------------------------------------
+mkdir -p "$SESSIONS/s3/subA/node_modules" "$SESSIONS/s3/subA/dist"
+echo "junk" > "$SESSIONS/s3/subA/node_modules/junk.txt"
+echo "junk" > "$SESSIONS/s3/subA/dist/junk.txt"
+
+run "$PLEACH" clean s3
+assert_rc "clean s3 (dry run): rc 0" "$RC" 0
+assert_contains "clean: reports node_modules" "$OUT" "node_modules"
+assert_contains "clean: preserves a dist that git does not ignore" "$OUT" "not ignored by git (preserved)"
+assert_true "clean (dry run): node_modules still there" \
+  [ -e "$SESSIONS/s3/subA/node_modules/junk.txt" ]
+assert_true "clean (dry run): dist still there" \
+  [ -e "$SESSIONS/s3/subA/dist/junk.txt" ]
+
+run "$PLEACH" clean s3 --apply
+assert_rc "clean s3 --apply: rc 0" "$RC" 0
+assert_true "clean --apply: node_modules removed" \
+  [ ! -e "$SESSIONS/s3/subA/node_modules" ]
+assert_true "clean --apply: dist preserved" \
+  [ -e "$SESSIONS/s3/subA/dist/junk.txt" ]
+
+# ---------------------------------------------------------------------------
+header "Test 15: each runs in the canonical and in every session"
+# ---------------------------------------------------------------------------
+# shellcheck disable=SC2016  # single quotes deliberate: this expands inside the
+# `bash -c` pleach runs in each target directory, not here.
+run "$PLEACH" each 'echo ping-$(basename "$PWD")'
+assert_rc "each: rc 0" "$RC" 0
+assert_contains "each: canonical header" "$OUT" "canonical  ("
+assert_contains "each: ran inside session s3" "$OUT" "ping-s3"
+
+# ---------------------------------------------------------------------------
+header "Test 16: add mounts a new sub-repo into an existing session"
+# ---------------------------------------------------------------------------
+setup_repo "$CANON/subC"
+echo "initial content" > "$CANON/subC/file.txt"
+git -C "$CANON/subC" add file.txt
+git -C "$CANON/subC" commit -q -m "initial commit in subC"
+
+run "$PLEACH" add s3 subC
+assert_rc "add s3 subC: rc 0" "$RC" 0
+assert_true "add: subC worktree mounted" [ -e "$SESSIONS/s3/subC/.git" ]
+assert_eq "add: subC branch is session/s3" \
+  "$(git -C "$SESSIONS/s3/subC" branch --show-current)" "session/s3"
+
+# ---------------------------------------------------------------------------
+header "Test 17: repos reports drift, --sync aligns the conf"
+# ---------------------------------------------------------------------------
+run "$PLEACH" repos
+assert_rc "repos: rc 0" "$RC" 0
+assert_contains "repos: sees subC on disk but not in the conf" "$OUT" "new on disk, absent from the conf: subC"
+assert_true "repos: read-only, the conf is untouched" \
+  grep -qF 'PLEACH_SUBS=(subA subB)' "$CANON/.pleach.conf"
+
+run "$PLEACH" repos --sync --no-bootstrap
+assert_rc "repos --sync: rc 0" "$RC" 0
+assert_contains "repos --sync: appends subC to the conf" "$OUT" "PLEACH_SUBS += subC"
+assert_true "repos --sync: the conf now lists all three subs" \
+  grep -qF 'PLEACH_SUBS=(subA subB subC)' "$CANON/.pleach.conf"
+assert_contains "repos --sync: reports the workspace aligned" "$OUT" "workspace aligned"
+
+# ---------------------------------------------------------------------------
+header "Test 18: every command is documented"
+# ---------------------------------------------------------------------------
+# The help text is the only user-facing documentation inside the tool, so a
+# command with no help topic is a real defect, not a nicety.
+for c in init new open ls add sync rm prune clean each repos install update version; do
+  run "$PLEACH" help "$c"
+  if [ "$RC" -eq 0 ] && [ -n "$OUT" ]; then
+    ok "help $c: documented"
+  else
+    fail "help $c: missing or errored (rc=$RC)"
+  fi
+done
+run "$PLEACH" help config
+assert_rc "help config: rc 0" "$RC" 0
+assert_contains "help config: documents PLEACH_EXPECT_CANONICAL" "$OUT" "PLEACH_EXPECT_CANONICAL"
+
+run "$PLEACH" help nonsense
+assert_rc "help nonsense: non-zero rc" "$RC" 1
+
+run "$PLEACH" nonsense
+assert_rc "unknown command: non-zero rc" "$RC" 1
+assert_contains "unknown command: says so" "$OUT" "unknown command"
+
+# ---------------------------------------------------------------------------
+header "Test 19: open runs the command inside the session"
+# ---------------------------------------------------------------------------
+run "$PLEACH" open s3 pwd
+assert_rc "open s3 pwd: rc 0" "$RC" 0
+assert_contains "open s3 pwd: the command runs in the session folder" "$OUT" "$SESSIONS/s3"
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+echo ""
+echo "===================================="
+echo "Tests: $TESTS   Failures: $FAILS"
+echo "===================================="
+
+[ "$FAILS" -eq 0 ]
