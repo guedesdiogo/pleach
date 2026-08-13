@@ -107,6 +107,7 @@ load_config() {
 # worktree creation/removal across concurrent invocations.
 # ---------------------------------------------------------------------------
 LOCK_DIR=""
+TMPFILE=""   # see cmd_conflicts: an EXIT trap outlives any local it might reference
 lock() {
   LOCK_DIR="$SESSIONS/.pleach.lock"
   local tries=0
@@ -1301,7 +1302,7 @@ cmd_completions() {
     bash) cat <<'EOF'
 # pleach bash completion. Add to ~/.bashrc:
 #   eval "$(pleach completions bash)"
-_pleach_commands="init new open ls add sync rm prune clean each repos path cd doctor completions shell-init install update version help"
+_pleach_commands="init new open ls add sync rm prune clean each conflicts repos path cd doctor completions shell-init install update version help"
 _pleach_sessions() { pleach ls --json 2>/dev/null | sed -nE 's/.*"name": "([^"]+)".*/\1/p'; }
 _pleach() {
   local cur="${COMP_WORDS[COMP_CWORD]}"
@@ -1324,7 +1325,7 @@ EOF
 #   eval "$(pleach completions zsh)"
 _pleach() {
   local -a cmds
-  cmds=(init new open ls add sync rm prune clean each repos path cd doctor completions shell-init install update version help)
+  cmds=(init new open ls add sync rm prune clean each conflicts repos path cd doctor completions shell-init install update version help)
   if (( CURRENT == 2 )); then
     _describe 'pleach command' cmds
     return
@@ -1341,6 +1342,68 @@ EOF
       ;;
     *) err "unknown shell: $shell (supported: bash, zsh)" ;;
   esac
+}
+
+# ---------------------------------------------------------------------------
+cmd_conflicts() {
+  # Worktrees move collisions from the working tree to merge time, which is the
+  # whole point — but they also hide them until then. This is the only place you
+  # can see, before merging, that two sessions are rewriting the same file.
+  load_config
+  # Global, not local: the EXIT trap runs after this function has returned, when a
+  # local would already be out of scope — and under `set -u` that turns cleanup
+  # into an "unbound variable" failure that silently becomes the exit code.
+  TMPFILE=$(mktemp)
+  trap 'rm -f "${TMPFILE:-}"' EXIT
+  local tmp="$TMPFILE"
+
+  local n dir s wt label f
+  local -a present=()
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    dir="$SESSIONS/$n"
+    present=()
+    while IFS= read -r s; do [ -n "$s" ] && present+=("$s"); done < <(session_subs "$dir")
+    for s in "" ${present[@]+"${present[@]}"}; do
+      wt="$dir${s:+/$s}"; label="${s:-root}"
+      [ -e "$wt/.git" ] || continue
+      # Committed work since branching, plus what is still uncommitted: both are
+      # edits this session owns and neither is visible to the others.
+      {
+        git -C "$wt" diff --name-only "$BASE...HEAD" 2>/dev/null || true
+        git -C "$wt" status --porcelain --untracked-files=no 2>/dev/null | cut -c4- || true
+      } | while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        printf '%s/%s\t%s\n' "$label" "$f" "$n"
+      done >> "$tmp"
+    done
+  done < <(session_names)
+
+  # sort -u sorts whole lines, so identical paths land together and exact
+  # duplicates (same file, same session) collapse. What `uniq -d` then reports on
+  # the path column is therefore precisely "touched by more than one session".
+  sort -u "$tmp" -o "$tmp"
+  local overlaps
+  overlaps=$(cut -f1 "$tmp" | uniq -d)
+
+  if [ -z "$overlaps" ]; then
+    echo "No file is being edited in more than one session."
+    return 0
+  fi
+
+  echo "Edited in more than one session:"
+  echo ""
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    printf '  %s\n' "$f"
+    awk -F'\t' -v want="$f" '$1 == want { printf "      %s\n", $2 }' "$tmp"
+  done <<EOF
+$overlaps
+EOF
+  echo ""
+  echo "This is information, not a failure — the conflict is real and resolves at"
+  echo "merge, with a diff. Knowing now is what lets you split the work instead."
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -1554,6 +1617,7 @@ Sessions
   prune [--apply]           List (and with --apply remove) fully integrated sessions.
   clean [<session>]         Delete git-ignored artifacts (node_modules, builds…).
   each '<command>'          Run a command in the canonical and in each session root.
+  conflicts                 Show files being edited in more than one session.
 
 Workspace
   init [--default]          Adopt pleach in the current repo (writes .pleach.conf).
@@ -1727,6 +1791,22 @@ invisible to your worktree until it merges. e.g.:
   pleach each 'git log --oneline -1'        last commit in each root
 EOF
     ;;
+    conflicts) cat <<'EOF'
+pleach conflicts
+
+Lists the files being edited in more than one session, with the sessions that
+touch each. It counts both committed work since the session branched and changes
+still uncommitted, in every repo of every session.
+
+Worktrees move collisions from the working tree to merge time, which is the
+point. The side effect is that they also HIDE them until then: parallel work in
+another session is invisible to yours by construction. This is the one place you
+can see the overlap before paying for it.
+
+Always exits 0. Two sessions touching the same file is a normal, resolvable
+state -- the value is knowing early enough to split the work differently.
+EOF
+    ;;
     path) cat <<'EOF'
 pleach path [<session>] [--canonical]
 
@@ -1877,7 +1957,7 @@ Guard rail for automation/harnesses (env, not conf):
                                   resolving to your real workspace.
 EOF
     ;;
-    *) err "no help for '$1' (commands: init new open ls path cd add sync rm prune clean each repos doctor shell-init completions install update version; topics: config)" ;;
+    *) err "no help for '$1' (commands: init new open ls path cd add sync rm prune clean each conflicts repos doctor shell-init completions install update version; topics: config)" ;;
   esac
 }
 
@@ -1903,11 +1983,12 @@ case "$cmd" in
   path)    cmd_path "$@" ;;
   cd)      cmd_cd "$@" ;;
   doctor)  cmd_doctor "$@" ;;
+  conflicts) cmd_conflicts "$@" ;;
   completions) cmd_completions "$@" ;;
   shell-init)  cmd_shell_init "$@" ;;
   install) cmd_install "$@" ;;
   update)  cmd_update "$@" ;;
   version|--version|-V) echo "pleach $PLEACH_VERSION" ;;
   help|-h|--help) cmd_help "$@" ;;
-  *) err "unknown command: $cmd (init|new|open|add|sync|repos|rm|prune|clean|each|ls|path|cd|doctor|completions|shell-init|install|update|version|help)" ;;
+  *) err "unknown command: $cmd (init|new|open|add|sync|repos|rm|prune|clean|each|ls|path|cd|doctor|conflicts|completions|shell-init|install|update|version|help)" ;;
 esac

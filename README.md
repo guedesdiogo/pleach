@@ -268,6 +268,7 @@ pleach sync --all --yes              # every session (explicit --yes outside a T
 pleach add fix-x payments            # mount a new sub-repo into an existing session
 pleach repos --sync                  # adopt a new workspace repo across ALL sessions
 
+pleach conflicts                     # files being edited in more than one session
 pleach each 'git log --oneline -1'   # run a command in the canonical + every session
 pleach clean fix-x --apply           # delete git-ignored artifacts (node_modules, builds)
 pleach prune --apply                 # remove every fully integrated session
@@ -372,6 +373,13 @@ other language means giving up `runtime deps: git + bash`. MCP is the right shap
 orchestrator. pleach is the substrate underneath one — git does not ship an MCP server
 either.
 
+**Isolation buys a blind spot, so `conflicts` sells it back.** Moving collisions to merge
+time is the entire point — but the same move hides them until then: work in another
+session is invisible to yours by construction. `pleach conflicts` lists the files being
+edited in more than one session, counting committed and uncommitted work alike. It always
+exits 0, because two sessions touching one file is a normal, resolvable state. The value
+is not the verdict; it is finding out early enough to split the work differently.
+
 **`doctor` asks out loud what a multi-repo tool otherwise gets wrong quietly.** A lock left
 by a run that died, a worktree git still believes in whose folder is gone, two sessions
 whose port blocks overlap, a sub-repo declared in the conf and absent from disk — each one
@@ -409,7 +417,7 @@ session and the canonical by their markers rather than by hardcoded directories:
 ## Tests
 
 ```bash
-tests/run.sh          # 142 assertions across 24 scenarios, in a throwaway sandbox
+tests/run.sh          # 152 assertions across 25 scenarios, in a throwaway sandbox
 tests/no-leaks.sh     # repository hygiene gate
 shellcheck pleach install.sh tests/*.sh examples/*.sh
 ```
@@ -419,9 +427,16 @@ creation, listing, sync (including the dry run, the dirty-repo skip and the wron
 skip), the non-interactive `--yes` requirement, removal, prune, clean, `each`, `add`,
 `repos --sync`, the runtime identity and its idempotent backfill, `ls --json` (parsed, not
 pattern-matched), `path`/`cd`/`shell-init`/`completions` (the emitted scripts are syntax
-checked), `doctor` against a planted stale lock and a planted conf/disk drift, help
-coverage for every command, and that `open` really runs inside the session. It pins
-`PLEACH_EXPECT_CANONICAL` to its own sandbox so it cannot escape.
+checked), `doctor` against a planted stale lock and a planted conf/disk drift, `conflicts` against a
+real overlap between two sessions (asserting both that the shared file is reported and that
+a file only one session touches is not), help coverage for every command, and that `open`
+really runs inside the session. It pins `PLEACH_EXPECT_CANONICAL` to its own sandbox so it
+cannot escape.
+
+The suite earns its keep: `conflicts` shipped with a defect its own test caught — an `EXIT`
+trap referencing a variable that was `local` to a function already returned, which under
+`set -u` turned cleanup into a non-zero exit code. Every command reported the right thing
+and then lied about it in `$?`.
 
 `tests/no-leaks.sh` is the gate that keeps this repository honest about its origins. It was
 itself mutation-tested: seven defects were planted — a forbidden reference, leftover prose

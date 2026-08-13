@@ -366,7 +366,7 @@ header "Test 18: every command is documented"
 # ---------------------------------------------------------------------------
 # The help text is the only user-facing documentation inside the tool, so a
 # command with no help topic is a real defect, not a nicety.
-for c in init new open ls path cd add sync rm prune clean each repos doctor shell-init completions install update version; do
+for c in init new open ls path cd add sync rm prune clean each conflicts repos doctor shell-init completions install update version; do
   run "$PLEACH" help "$c"
   if [ "$RC" -eq 0 ] && [ -n "$OUT" ]; then
     ok "help $c: documented"
@@ -509,6 +509,48 @@ run "$PLEACH" doctor
 assert_rc "doctor: non-zero rc when a declared sub-repo is missing" "$RC" 1
 assert_contains "doctor: names the missing sub-repo" "$OUT" "missing from disk: subC"
 mv "$CANON/subC.moved" "$CANON/subC"
+
+# ---------------------------------------------------------------------------
+header "Test 25: conflicts sees across sessions"
+# ---------------------------------------------------------------------------
+# The blind spot worktrees create: work in another session is invisible to yours
+# by construction, so an overlap only surfaces at merge. conflicts is the one
+# place it can be seen before then.
+run "$PLEACH" new s4 --no-bootstrap
+assert_rc "new s4: rc 0" "$RC" 0
+
+run "$PLEACH" conflicts
+assert_rc "conflicts (no overlap yet): rc 0" "$RC" 0
+assert_contains "conflicts: reports a clean state" "$OUT" "No file is being edited in more than one session"
+
+# The same file, committed in two different sessions.
+echo "from s3" > "$SESSIONS/s3/README.md"
+git -C "$SESSIONS/s3" commit -q -am "s3 edits the README"
+echo "from s4" > "$SESSIONS/s4/README.md"
+git -C "$SESSIONS/s4" commit -q -am "s4 edits the README"
+# And a file only one session touches - it must NOT be reported.
+echo "only s4" > "$SESSIONS/s4/solo.txt"
+git -C "$SESSIONS/s4" add solo.txt
+git -C "$SESSIONS/s4" commit -q -m "s4 adds a file nobody else has"
+
+run "$PLEACH" conflicts
+assert_rc "conflicts (overlap present): still rc 0 - it informs, it does not fail" "$RC" 0
+assert_contains "conflicts: names the overlapping file" "$OUT" "root/README.md"
+assert_contains "conflicts: attributes it to s3" "$OUT" "s3"
+assert_contains "conflicts: attributes it to s4" "$OUT" "s4"
+if [ "${OUT#*solo.txt}" != "$OUT" ]; then
+  fail "conflicts: reported solo.txt, which only one session touches"
+else
+  ok "conflicts: a file touched by a single session is not reported"
+fi
+
+# Uncommitted work counts too - it is just as invisible to the other sessions.
+echo "uncommitted in s3" > "$SESSIONS/s3/subA/f.txt"
+echo "uncommitted in s4" > "$SESSIONS/s4/subA/f.txt"
+run "$PLEACH" conflicts
+assert_contains "conflicts: uncommitted changes count as an overlap" "$OUT" "subA/f.txt"
+git -C "$SESSIONS/s3/subA" checkout -- f.txt
+git -C "$SESSIONS/s4/subA" checkout -- f.txt
 
 # ---------------------------------------------------------------------------
 # Summary
