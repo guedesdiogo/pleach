@@ -11,7 +11,7 @@ essentially zero disk cost.
 [![ci](https://github.com/guedesdiogo/pleach/actions/workflows/ci.yml/badge.svg)](https://github.com/guedesdiogo/pleach/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/%40diogoaguedes%2Fpleach?color=cb3837&logo=npm)](https://www.npmjs.com/package/@diogoaguedes/pleach)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
-![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)
+![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)
 ![runtime deps](https://img.shields.io/badge/runtime%20deps-git%20%2B%20bash-lightgrey)
 
 ```bash
@@ -127,12 +127,44 @@ implement the isolation — it arranged for git to enforce it.
 | **Full directory replicas** | Simple, obvious | Duplicates deps and builds (GBs each), multiplies RAM, and leaves you syncing N clones by hand |
 | **Copy-on-write clones** (`cp -c` on APFS) | Kills the *initial* disk cost | Still N independent clones with the same manual syncing; they diverge as builds rematerialize blocks; no structural isolation — two clones can work the same branch and collide on push. macOS only |
 | **Plain `git worktree`** | The right primitive, and what pleach uses underneath | Covers one repo. In a composite workspace the root's worktree arrives with no sub-repos, no secrets, colliding ports and no bootstrap |
-| **An agent's built-in worktrees** | Zero setup for that one tool | Isolates a single repo and serves only that tool. Does not assemble the composite, copy secrets or resolve ports — and does nothing for the editor open beside it |
 | **"Just be disciplined with branches"** | No tooling required | One working tree holds one branch. Two sessions in one folder would swap each other's checkout on every `git switch`, and still share `node_modules`, builds and dev servers. There is no real concurrency to be disciplined about |
 | **A container per session** | Strong isolation, ports included | Each session costs a VM's worth of RAM on macOS, starts slowly, and adds credential and tooling friction — the opposite of many cheap sessions on one machine |
 
+## Where it sits among the worktree tools
+
+Worktree tooling multiplied through 2026, and most of it is very good. Almost all of it
+is also **single-repo**, which is the line pleach is on the other side of.
+
+| Tool | Shape | Multi-repo | Ports | Secrets | `main` → session | Runtime deps |
+|---|---|:--:|:--:|:--:|:--:|---|
+| **pleach** | bash CLI | ✅ | ✅ | ✅ | ✅ `sync` | git + bash |
+| [worktrunk](https://github.com/max-sixty/worktrunk) | Rust CLI | — | template | — | — | binary |
+| [workz](https://github.com/rohansx/workz) | Rust CLI | — | ✅ + DB, compose | ✅ | — | binary |
+| [phantom](https://github.com/phantompane/phantom) | TS CLI | — | — | — | — | Node |
+| [gwq](https://github.com/d-kuro/gwq) | Go CLI | — | — | — | — | binary |
+| [git-worktree-manager](https://github.com/nanasess/git-worktree-manager) | bash CLI | ✅ | — | mise only | `pull` | git + bash |
+| [canopy](https://github.com/ashmitb95/canopy) | Python + MCP | ✅ | — | — | — | Python 3.10+ |
+| `claude --worktree`, Muse Code | agent-native | — | — | — | — | the agent |
+
+<sub>Read from each project's own documentation, not from running them. Corrections
+welcome as issues.</sub>
+
+**When to reach for one of those instead.** One repo and you want the sharpest
+ergonomics: worktrunk. One repo where the hard part is the *environment* — a database
+per branch, namespaced compose projects: workz, which goes further there than pleach
+does. A dashboard across many agents: Conductor, vibe-kanban, Claude Squad. Isolation
+that outranks startup cost: container-use or Sculptor, which use containers rather than
+worktrees.
+
+**The agent-native ones compose with pleach rather than replace it.** `claude --worktree`
+and Muse Code's parallel subagents create worktrees *inside* one repo, owned by the agent
+and discarded when it finishes. A pleach session is the durable, multi-repo floor those
+agents stand on — running Claude Code or Muse Code *inside* a session is the intended
+stack, not a competing one.
+
 None of these are wrong; they solve neighbouring problems. What none of them compose is
-**worktrees per repo + secrets + ports + bootstrap + lifecycle**, behind one command.
+**worktrees per repo + secrets + ports + runtime identity + bootstrap + lifecycle**,
+behind one command.
 
 ## Install
 
@@ -153,7 +185,31 @@ The package is scoped because npm reserves the bare name `pleach`, judging it to
 `pleach update` detects npm/bun-managed installs and redirects to the package manager, so
 the two paths never fight.
 
+Then, optionally, in `~/.zshrc` or `~/.bashrc`:
+
+```bash
+eval "$(pleach shell-init)"          # enables `pleach cd <session>`
+eval "$(pleach completions zsh)"     # or: completions bash
+```
+
+`shell-init` exists because `cd` is the one command a binary cannot perform: only a
+function running in your own shell can change that shell's directory. Rather than
+pretend otherwise, `pleach cd` without the wrapper prints the one line that fixes it.
+
+### Platforms
+
 Requirements: git >= 2.15 (worktrees) and bash >= 3.2 (the bash macOS ships).
+
+| Platform | Status |
+|---|---|
+| macOS | Supported. CI runs the suite on `macos-latest` |
+| Linux | Supported. CI runs the suite on `ubuntu-latest` |
+| **Windows** (Git Bash / WSL) | Supported. CI runs the suite on `windows-latest` under the Git Bash that ships with Git for Windows |
+| Windows (`cmd`, PowerShell natively) | Not supported, and not planned — it would be a rewrite, not a port |
+
+The repository pins `eol=lf` in `.gitattributes`: Git for Windows checks out CRLF by
+default, and a carriage return at the end of a shebang makes the interpreter unfindable.
+Port detection uses `lsof` where it exists and falls back to `netstat -ano` on Windows.
 
 ## Adopt it in your project
 
@@ -199,6 +255,11 @@ pleach new fix-x --fetch             # update the base from origin first
 
 pleach ls                            # instant: name, index, ports, repo count
 pleach ls -l                         # branch, commits ahead, changes, integration status
+pleach ls --json                     # the same map, machine-readable
+
+pleach cd fix-x                      # change into the session (needs shell-init)
+pleach path fix-x                    # print where it lives; --canonical for the canonical
+pleach doctor                        # drift, stale locks, port clashes; --fix repairs safely
 
 pleach sync fix-x                    # merge the local main into every repo of the session
 pleach sync fix-x --dry-run          # show what would happen, touch nothing
@@ -214,12 +275,31 @@ pleach prune --apply                 # remove every fully integrated session
 pleach help sync                     # detailed help per command (and `help config`)
 ```
 
-### Ports
+### Ports, and the state git cannot see
 
 Each session gets an exclusive block of 100 ports written to `.session-env` (`PORT`,
 `PLEACH_PORT_BASE`, and derivatives). `pleach open` exports them before launching, so dev
 servers that honour `PORT` never collide without any manual step. For the rest,
 `source .session-env` and pass the flag.
+
+Ports are only the visible half. Worktrees isolate **files**; they do nothing about the
+shared state around them — the dev database two sessions both migrate, the compose
+project two sessions both bring up. So the same file carries a runtime identity:
+
+```bash
+export PLEACH_SLUG=acme_fix_login
+export PLEACH_DB_NAME=acme_fix_login        # unique, and a valid SQL identifier
+export COMPOSE_PROJECT_NAME=acme_fix_login  # docker compose namespaces everything by it
+```
+
+It is namespaced by the workspace, not just the session, so two projects that both have a
+`fix-login` never meet. pleach does not create the database for you — it hands your
+tooling a name that cannot collide, which is the part that has to be decided centrally.
+
+Sockets also outlive worktrees: a dev server started in a session keeps its port after
+the session is removed. `pleach rm` reports any process still listening in the freed
+block, and `--reap` kills them. Reporting is the default, because a cleanup command
+should not kill processes behind your back.
 
 ### VS Code
 
@@ -281,6 +361,24 @@ impossible to repeat.
 **The lock is a `mkdir`.** Atomic on every filesystem that matters, and unlike `flock` it is
 present on a stock macOS.
 
+**There is no MCP server, and that is the decision — not an omission.** Most of the 2026
+worktree tooling ships one, so the absence is worth defending. Ask who would call it: the
+agent lives *inside* a session, and a session's lifecycle is decided from outside and
+before it. An agent in `fix-login` calling `rm fix-login` is sawing the branch it sits on.
+What an in-session agent legitimately needs is to *read* the map, and `ls --json` through a
+shell-out does that in any tool that can run a command. The cost on the other side is real:
+MCP is JSON-RPC over stdio, which in pure bash means hand-rolling a JSON parser, and in any
+other language means giving up `runtime deps: git + bash`. MCP is the right shape for an
+orchestrator. pleach is the substrate underneath one — git does not ship an MCP server
+either.
+
+**`doctor` asks out loud what a multi-repo tool otherwise gets wrong quietly.** A lock left
+by a run that died, a worktree git still believes in whose folder is gone, two sessions
+whose port blocks overlap, a sub-repo declared in the conf and absent from disk — each one
+surfaces later as a confusing failure somewhere else. It exits non-zero when it finds
+something, so it fits in CI or a prompt, and `--fix` performs only the two repairs that
+cannot lose work.
+
 ## Numbers from a real workspace
 
 A composite workspace of 1 root repo + 7 nested sub-repos, spanning ~20 bun/Next.js/Go
@@ -311,7 +409,7 @@ session and the canonical by their markers rather than by hardcoded directories:
 ## Tests
 
 ```bash
-tests/run.sh          # 100 assertions across 19 scenarios, in a throwaway sandbox
+tests/run.sh          # 142 assertions across 24 scenarios, in a throwaway sandbox
 tests/no-leaks.sh     # repository hygiene gate
 shellcheck pleach install.sh tests/*.sh examples/*.sh
 ```
@@ -319,10 +417,20 @@ shellcheck pleach install.sh tests/*.sh examples/*.sh
 `tests/run.sh` builds an ephemeral composite workspace and exercises the real lifecycle:
 creation, listing, sync (including the dry run, the dirty-repo skip and the wrong-branch
 skip), the non-interactive `--yes` requirement, removal, prune, clean, `each`, `add`,
-`repos --sync`, help coverage for every command, and that `open` really runs inside the
-session. It pins `PLEACH_EXPECT_CANONICAL` to its own sandbox so it cannot escape.
+`repos --sync`, the runtime identity and its idempotent backfill, `ls --json` (parsed, not
+pattern-matched), `path`/`cd`/`shell-init`/`completions` (the emitted scripts are syntax
+checked), `doctor` against a planted stale lock and a planted conf/disk drift, help
+coverage for every command, and that `open` really runs inside the session. It pins
+`PLEACH_EXPECT_CANONICAL` to its own sandbox so it cannot escape.
 
-CI runs the suite on ubuntu and macOS on every push.
+`tests/no-leaks.sh` is the gate that keeps this repository honest about its origins. It was
+itself mutation-tested: seven defects were planted — a forbidden reference, leftover prose
+in another language, a private scope, the wrong licence, a missing LICENSE, a restricted
+publish, and a near-empty scan that would have passed vacuously — and all seven were
+caught. Its needles are reassembled at runtime, because a gate that contains the strings it
+hunts for would only ever find itself.
+
+CI runs the suite on ubuntu, macOS and Windows on every push.
 
 ## Limitations
 
@@ -333,6 +441,11 @@ CI runs the suite on ubuntu and macOS on every push.
 - `rm` and `prune` judge "integrated" against the **local** base. If the merge only landed
   on the remote, `git fetch` in the repo first — or use `--force`, which preserves the
   branch.
+- Detecting processes that hold a session's ports needs `lsof` (macOS, Linux) or `netstat`
+  (Windows, Linux). With neither, `rm` and `doctor` say nothing rather than guess — the
+  ports are still freed, you just are not told who is holding them.
+- `PLEACH_DB_NAME` is a name, not a database. pleach never creates, migrates or drops one;
+  provisioning belongs to the project's own bootstrap.
 
 ## License
 
