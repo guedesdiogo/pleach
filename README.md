@@ -204,7 +204,9 @@ Requirements: git >= 2.15 (worktrees) and bash >= 3.2 (the bash macOS ships).
 
 The repository pins `eol=lf` in `.gitattributes`: Git for Windows checks out CRLF by
 default, and a carriage return at the end of a shebang makes the interpreter unfindable.
-Port detection uses `lsof` where it exists and falls back to `netstat -ano` on Windows.
+Port detection uses `lsof` where it exists, falls back to `ss -lntp` on Linux and to
+`netstat -ano` under Git Bash — `-ano` is Windows syntax, and on Linux those flags mean
+something else entirely.
 
 ## Adopt it in your project
 
@@ -267,6 +269,7 @@ pleach repos --sync                  # adopt a new workspace repo across ALL ses
 pleach conflicts                     # files being edited in more than one session
 pleach each 'git log --oneline -1'   # run a command in the canonical + every session
 pleach clean fix-x --apply           # delete git-ignored artifacts (node_modules, builds)
+pleach rm fix-x --reap               # remove the session; --reap kills leftover listeners
 pleach prune --apply                 # remove every fully integrated session
 
 pleach help sync                     # detailed help per command (and `help config`)
@@ -284,14 +287,21 @@ shared state around them — the dev database two sessions both migrate, the com
 project two sessions both bring up. So the same file carries a runtime identity:
 
 ```bash
-export PLEACH_SLUG=acme_fix_login
-export PLEACH_DB_NAME=acme_fix_login        # unique, and a valid SQL identifier
-export COMPOSE_PROJECT_NAME=acme_fix_login  # docker compose namespaces everything by it
+export PLEACH_SLUG=acme__fix_login
+export PLEACH_DB_NAME=acme__fix_login        # unique, and a valid SQL identifier
+export COMPOSE_PROJECT_NAME=acme__fix_login  # docker compose namespaces everything by it
 ```
 
 It is namespaced by the workspace, not just the session, so two projects that both have a
-`fix-login` never meet. pleach does not create the database for you — it hands your
-tooling a name that cannot collide, which is the part that has to be decided centrally.
+`fix-login` never meet. Session names map injectively: they are validated as `[a-z0-9_-]`,
+and the underscores already present are doubled first, so `fix-login` and `fix_login` never
+collapse onto one name. The workspace half is a plain directory name and gets no such
+guarantee — `acme-app` and `acme.app` both reduce to `acme_app`, so two workspaces whose
+directory names differ only in punctuation or case would share a slug. Closing that would
+mean hex-escaping every separator, and a database called `acme_2dapp__fix_2dlogin` is a
+worse daily cost than a collision nobody has hit; rename one of the directories if you are
+in that position. pleach does not create the database for you — it hands your tooling a
+name, which is the part that has to be decided centrally.
 
 Sockets also outlive worktrees: a dev server started in a session keeps its port after
 the session is removed. `pleach rm` reports any process still listening in the freed
@@ -394,9 +404,9 @@ CI runs the suite on ubuntu, macOS and Windows on every push.
 - `rm` and `prune` judge "integrated" against the **local** base. If the merge only landed
   on the remote, `git fetch` in the repo first — or use `--force`, which preserves the
   branch.
-- Detecting processes that hold a session's ports needs `lsof` (macOS, Linux) or `netstat`
-  (Windows, Linux). With neither, `rm` and `doctor` say nothing rather than guess — the
-  ports are still freed, you just are not told who is holding them.
+- Detecting processes that hold a session's ports needs `lsof` (macOS, Linux), `ss` (Linux)
+  or `netstat` (Git Bash on Windows). With none of them, `rm` and `doctor` say nothing rather
+  than guess — the ports are still freed, you just are not told who is holding them.
 - `PLEACH_DB_NAME` is a name, not a database. pleach never creates, migrates or drops one;
   provisioning belongs to the project's own bootstrap.
 

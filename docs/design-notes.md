@@ -62,12 +62,13 @@ them until then: work in another session is invisible to yours by construction. 
 version of this command reported files touched by more than one session. That is a proxy,
 and a proxy that cries wolf — two sessions editing distant regions of one file merge
 cleanly, and a tool that calls that a conflict is a tool you stop reading. It now runs
-git's own three-way merge in memory (`merge-tree --write-tree`, git >= 2.38) between each
-pair of session branches, and separates what *would actually conflict* from what merely
-overlaps. Nothing is written to obtain the answer. It always exits 0, because an overlap is
-a normal, resolvable state — the value is finding out early enough to split the work
-differently. Below git 2.38 the real check is skipped and says so, rather than quietly
-reporting less than it claims.
+git's own three-way merge without a checkout (`merge-tree --write-tree`, git >= 2.38)
+between each pair of session branches, and separates what *would actually conflict* from
+what merely overlaps. The working tree, the index and the branches are left untouched —
+only loose objects enter the object store, unreferenced and subject to garbage collection.
+It always exits 0, because an overlap is a normal, resolvable state — the value is finding
+out early enough to split the work differently. Below git 2.38 the real check is skipped
+and says so, rather than quietly reporting less than it claims.
 
 **`doctor` asks out loud what a multi-repo tool otherwise gets wrong quietly.** A lock left
 by a run that died, a worktree git still believes in whose folder is gone, two sessions
@@ -79,9 +80,10 @@ cannot lose work.
 **A stacked session is allowed to be a bad idea.** `new --from <session>` cuts from another
 session's tip, which means integrating against a moving target: `sync` still brings the base
 in, not the parent, and a parent rebased or squashed at merge leaves the child carrying
-commits that no longer exist upstream. The tool does not forbid it — it records the lineage
-in `.session-env` and marks it in `ls -l`, so the cost stays visible at the moment you would
-otherwise forget it.
+commits that no longer exist upstream. The tool does not forbid it — it records in
+`.session-env` the ref it was *actually* cut from (a `--from` no repo could resolve falls
+back to the base, and the record then says the base) and marks it in `ls -l`, so the cost
+stays visible at the moment you would otherwise forget it.
 
 ---
 

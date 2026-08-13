@@ -12,7 +12,7 @@
 # shellcheck disable=SC2015  # deliberate idiom: [ -z "$x" ] && x=… || err (err never runs after an assignment)
 set -euo pipefail
 
-PLEACH_VERSION="1.2.1"
+PLEACH_VERSION="1.2.2"
 
 CONF_NAME=".pleach.conf"
 USER_CONF="$HOME/.config/pleach/config"
@@ -116,10 +116,18 @@ lock() {
     [ "$tries" -gt 120 ] && err "could not acquire the lock at $LOCK_DIR (an earlier creation wedged? remove the dir by hand)"
     sleep 1
   done
+  # Who owns it. Without this, doctor cannot tell a stale lock from a LIVE one,
+  # and --fix would pull it out from under a run in progress — leaving two
+  # invocations creating worktrees at once, which is precisely what the lock
+  # exists to prevent.
+  printf '%s %s\n' "$$" "$(uname -n 2>/dev/null || echo '?')" > "$LOCK_DIR/owner" 2>/dev/null || true
   trap 'unlock' EXIT
 }
 unlock() {
-  [ -n "$LOCK_DIR" ] && rmdir "$LOCK_DIR" 2>/dev/null || true
+  if [ -n "$LOCK_DIR" ]; then
+    rm -f "$LOCK_DIR/owner" 2>/dev/null || true   # rmdir needs the dir empty
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+  fi
   LOCK_DIR=""
   trap - EXIT
 }
@@ -127,7 +135,21 @@ unlock() {
 session_branch() { echo "session/$1"; }
 
 sanitize_ident() { # -> [a-z0-9_] — safe as a Postgres identifier or a compose project name
-  local s="${1//[^a-zA-Z0-9]/_}"
+  # Injective over the SESSION-NAME alphabet, which is the collision that bites:
+  # names are validated as [a-z0-9_-], and if '-' and '_' collapsed onto the same
+  # character then 'fix-login' and 'fix_login' would share a database — exactly
+  # what this identity exists to prevent. Doubling the underscores already present
+  # keeps them apart: 'fix-login' -> fix_login, 'fix_login' -> fix__login.
+  #
+  # It is NOT injective over arbitrary text, and the canonical's directory name is
+  # arbitrary: 'acme-app' and 'acme.app' both become acme_app, as do 'Acme' and
+  # 'acme'. Two workspaces whose directory names differ only in punctuation or
+  # case would therefore share a slug. Closing that would mean hex-escaping every
+  # separator, and a database called acme_2dapp__fix_2dlogin is a worse daily cost
+  # than a collision nobody has hit. The limit is documented rather than hidden.
+  local s="$1"
+  s="${s//_/__}"
+  s="${s//[^a-zA-Z0-9_]/_}"
   printf '%s' "$s" | tr '[:upper:]' '[:lower:]'
 }
 
@@ -156,16 +178,38 @@ session_listeners() { # $1 port_base — echoes "<pid>\t<command>" per process l
       /^p/ { pid = substr($0, 2) }
       /^c/ { print pid "\t" substr($0, 2) }
     ' | sort -u
-  elif command -v netstat >/dev/null 2>&1 && [ "$(uname -s 2>/dev/null)" != "Darwin" ]; then
-    # Windows (Git Bash) and Linux: netstat -ano gives "…:<port> … LISTENING <pid>".
-    netstat -ano 2>/dev/null | awk -v lo="$pb" -v hi="$top" '
+  elif command -v ss >/dev/null 2>&1; then
+    # Linux: `netstat -ano` is NOT the right tool here — on Linux -o means timers,
+    # not pids, so the last column would be "off (0.00/0/0)". Filtered through
+    # /^[0-9]+$/ that yields an empty list: precisely the false "nothing is
+    # listening" this function exists to avoid. ss reports the owner:
+    # users:(("node",pid=1234,fd=20)).
+    ss -lntp 2>/dev/null | awk -v lo="$pb" -v hi="$top" '
       /LISTEN/ {
-        addr = $2; pid = $NF
-        n = split(addr, parts, ":")
+        n = split($4, parts, ":")
         port = parts[n] + 0
-        if (port >= lo && port <= hi && pid ~ /^[0-9]+$/) print pid "\t?"
+        if (port < lo || port > hi) next
+        if (match($0, /pid=[0-9]+/)) {
+          pid = substr($0, RSTART + 4, RLENGTH - 4)
+          cmd = "?"
+          if (match($0, /\(\("[^"]+"/)) cmd = substr($0, RSTART + 3, RLENGTH - 4)
+          print pid "\t" cmd
+        }
       }
     ' | sort -u
+  elif command -v netstat >/dev/null 2>&1; then
+    case "$(uname -s 2>/dev/null)" in
+      MINGW*|MSYS*|CYGWIN*)
+        # Windows (Git Bash): netstat -ano gives "…:<port> … LISTENING <pid>".
+        netstat -ano 2>/dev/null | awk -v lo="$pb" -v hi="$top" '
+          /LISTENING/ {
+            n = split($2, parts, ":")
+            port = parts[n] + 0
+            if (port >= lo && port <= hi && $NF ~ /^[0-9]+$/) print $NF "\t?"
+          }
+        ' | sort -u
+        ;;
+    esac
   fi
   return 0
 }
@@ -174,6 +218,11 @@ write_session_env() { # $1 dir, $2 name, $3 index, $4 port_base, [$5 base ref]
   # Per-session ports (next dev and friends honour PORT) plus a runtime identity.
   # The identity matters as much as the ports: two sessions migrating the same
   # database collide in state, and git cannot see that kind of collision.
+  #
+  # base_ref goes through %q rather than double quotes: this file is read with
+  # `source`, and git ACCEPTS branch names like 'feat/$(whoami)' — inside quotes,
+  # such a name would execute on the next `pleach open`. For ordinary values %q
+  # changes nothing (s4 -> s4), so session_env_get still reads them as before.
   local dir="$1" name="$2" idx="$3" pb="$4" base_ref="${5:-$BASE}" slug
   slug=$(session_slug "$name")
   cat > "$dir/.session-env" <<EOF
@@ -182,7 +231,7 @@ write_session_env() { # $1 dir, $2 name, $3 index, $4 port_base, [$5 base ref]
 export PLEACH_NAME=$name
 export PLEACH_CANONICAL="$CANONICAL"
 export PLEACH_INDEX=$idx
-export PLEACH_BASE_REF="$base_ref"
+export PLEACH_BASE_REF=$(printf '%q' "$base_ref")
 export PLEACH_PORT_BASE=$pb
 export PORT=$pb
 export WRANGLER_PORT=$((pb + 87))
@@ -526,15 +575,24 @@ cmd_new() {
 
   info "creating session '$name' (index $idx, ports ${port_base}-$((port_base + 99))) at $dir"
   [ -n "$from" ] && info "cutting from '$from' instead of $BASE"
+  # from_used separates "I asked for --from x" from "I actually cut from x". If no
+  # repo had the ref and every one fell back to the base, recording 'x' as the
+  # lineage would be a lie — `ls -l` and `ls --json` would claim the session came
+  # from somewhere it never did.
+  local from_ref from_used=0
   if [ -n "$from" ]; then
-    add_wt "$CANONICAL" "$dir" "$branch" "$(resolve_from_ref "$CANONICAL" "$from" "root")"
+    from_ref=$(resolve_from_ref "$CANONICAL" "$from" "root")
+    [ "$from_ref" = "$BASE" ] || from_used=1
+    add_wt "$CANONICAL" "$dir" "$branch" "$from_ref"
   else
     warn_if_behind "$CANONICAL" "root"
     add_wt "$CANONICAL" "$dir" "$branch"
   fi
   for s in ${subs[@]+"${subs[@]}"}; do
     if [ -n "$from" ]; then
-      add_wt "$CANONICAL/$s" "$dir/$s" "$branch" "$(resolve_from_ref "$CANONICAL/$s" "$from" "$s")"
+      from_ref=$(resolve_from_ref "$CANONICAL/$s" "$from" "$s")
+      [ "$from_ref" = "$BASE" ] || from_used=1
+      add_wt "$CANONICAL/$s" "$dir/$s" "$branch" "$from_ref"
     else
       warn_if_behind "$CANONICAL/$s" "$s"
       add_wt "$CANONICAL/$s" "$dir/$s" "$branch"
@@ -546,7 +604,9 @@ cmd_new() {
   info "copying secrets (.env*, .dev.vars*, extras from the conf)…"
   copy_secrets "$dir" 1 ${subs[@]+"${subs[@]}"}
 
-  write_session_env "$dir" "$name" "$idx" "$port_base" "${from:-$BASE}"
+  local recorded_ref="$BASE"
+  if [ -n "$from" ] && [ "$from_used" -eq 1 ]; then recorded_ref="$from"; fi
+  write_session_env "$dir" "$name" "$idx" "$port_base" "$recorded_ref"
 
   write_vscode_workspace "$name" "$dir" ${subs[@]+"${subs[@]}"}
   write_panorama_workspace
@@ -1419,20 +1479,39 @@ cmd_conflicts() {
   # -------------------------------------------------------------------------
   local real=0 degraded=0
   if [ ${#names[@]} -ge 2 ] && git_supports_merge_tree; then
-    local i j a b repo label s ba bb out files
+    local i j a b repo label s ba bb out files mt_rc
+    local -a subs_a=() subs_b=() pair=()
     for ((i = 0; i < ${#names[@]}; i++)); do
       for ((j = i + 1; j < ${#names[@]}; j++)); do
         a="${names[$i]}"; b="${names[$j]}"
         ba=$(session_branch "$a"); bb=$(session_branch "$b")
-        for s in "" ${SUBS[@]+"${SUBS[@]}"}; do
+        # The repos to compare are the ones mounted in BOTH sessions, not the ones
+        # declared in the conf: a sub mounted with `pleach add` and still outside
+        # PLEACH_SUBS would be skipped, and a blind spot inside the command that
+        # exists to remove them is worth nothing.
+        subs_a=(); subs_b=(); pair=()
+        while IFS= read -r s; do [ -n "$s" ] && subs_a+=("$s"); done < <(session_subs "$SESSIONS/$a")
+        while IFS= read -r s; do [ -n "$s" ] && subs_b+=("$s"); done < <(session_subs "$SESSIONS/$b")
+        for s in ${subs_a[@]+"${subs_a[@]}"}; do
+          in_list "$s" ${subs_b[@]+"${subs_b[@]}"} && pair+=("$s")
+        done
+        for s in "" ${pair[@]+"${pair[@]}"}; do
           repo=$(repo_path "$s"); label="${s:-root}"
           [ -e "$repo/.git" ] || continue
           git -C "$repo" show-ref --verify --quiet "refs/heads/$ba" || continue
           git -C "$repo" show-ref --verify --quiet "refs/heads/$bb" || continue
           # --write-tree builds the merged tree in the object store and prints its
-          # id; the working tree, the index and every branch stay untouched. A
-          # non-zero status is git itself saying these two need a decision.
-          out=$(git -C "$repo" merge-tree --write-tree --name-only "$ba" "$bb" 2>/dev/null) && continue
+          # id; the working tree, the index and every branch stay untouched.
+          mt_rc=0
+          out=$(git -C "$repo" merge-tree --write-tree --name-only "$ba" "$bb" 2>/dev/null) || mt_rc=$?
+          [ "$mt_rc" -eq 0 ] && continue
+          # rc 1 means conflict, which is the answer we want. Anything else is a
+          # git ERROR (no common ancestor, say) — stepping over it in silence
+          # would be another blind spot inside the command meant to remove them.
+          if [ "$mt_rc" -gt 1 ]; then
+            warn "$label: merge-tree failed (rc $mt_rc) between $ba and $bb — this pair was NOT checked"
+            continue
+          fi
           # Line 1 is the tree id; the conflicted paths follow, up to a blank line.
           files=$(printf '%s\n' "$out" | awk 'NR > 1 { if ($0 == "") exit; print }')
           [ -n "$files" ] || continue
@@ -1558,12 +1637,29 @@ cmd_doctor() {
   fi
 
   if [ -d "$SESSIONS/.pleach.lock" ]; then
-    if [ "$fix" -eq 1 ]; then
+    # A lock whose owner is ALIVE on this machine is not dirt — it is ordinary
+    # concurrency, and tearing it down would lose work. --fix only removes what
+    # can be shown to be abandoned.
+    local lock_pid="" lock_host="" this_host
+    this_host=$(uname -n 2>/dev/null || echo '?')
+    if [ -f "$SESSIONS/.pleach.lock/owner" ]; then
+      read -r lock_pid lock_host < "$SESSIONS/.pleach.lock/owner" 2>/dev/null || true
+    fi
+    if [ -z "$lock_pid" ]; then
+      # No owner recorded: either a lock from a version before owners existed —
+      # possibly held by a run that is very much alive — or plain dirt. We cannot
+      # tell, and guessing wrong tears down a live run. Unknown is never removed
+      # automatically; the manual escape hatch is printed instead.
+      dr_bad "lock held at $SESSIONS/.pleach.lock with no owner recorded — it may belong to a live run (older version?); --fix will not touch it. If you are sure nothing is running: rmdir '$SESSIONS/.pleach.lock'"
+    elif [ "$lock_host" = "$this_host" ] && kill -0 "$lock_pid" 2>/dev/null; then
+      dr_note "lock is LIVE (pid $lock_pid, on this machine) — another run is mid-way; --fix leaves it alone"
+    elif [ "$fix" -eq 1 ]; then
+      rm -f "$SESSIONS/.pleach.lock/owner" 2>/dev/null || true
       rmdir "$SESSIONS/.pleach.lock" 2>/dev/null \
-        && dr_ok "stale lock released" \
+        && dr_ok "stale lock released (its owner was pid $lock_pid, which no longer exists)" \
         || dr_bad "lock at $SESSIONS/.pleach.lock could not be released — remove the directory by hand"
     else
-      dr_bad "lock held at $SESSIONS/.pleach.lock (a run that died mid-way? release with: pleach doctor --fix)"
+      dr_bad "lock held at $SESSIONS/.pleach.lock (pid $lock_pid, no longer running) — release with: pleach doctor --fix"
     fi
   else
     dr_ok "no lock held"
@@ -1727,7 +1823,7 @@ Sessions
   path [<session>]          Print where a session lives (--canonical for the canonical).
   add [<session>] <sub …>   Mount sub-repos into an existing session.
   sync [<session>|--all]    Bring the canonical's local main into the session's branches.
-  rm <name> [--force]       Remove the session. Refuses when work is pending.
+  rm <name> [--force] [--reap]  Remove the session. Refuses when work is pending.
   prune [--apply]           List (and with --apply remove) fully integrated sessions.
   clean [<session>]         Delete git-ignored artifacts (node_modules, builds…).
   each '<command>'          Run a command in the canonical and in each session root.
@@ -1925,8 +2021,9 @@ serious:
 
   WOULD CONFLICT   git performs the three-way merge between each pair of session
                    branches in memory (merge-tree --write-tree) and reports what
-                   it cannot resolve. This is git's own verdict, not a guess, and
-                   nothing in any repository is written to obtain it. Needs
+                   it cannot resolve. This is git's own verdict, not a guess. The
+                   working tree, the index and the branches are left untouched —
+                   only loose objects enter the object store. Needs
                    git >= 2.38; below that the check is skipped and says so.
 
   ALSO TOUCHED     the same file appears in more than one session but git merges
