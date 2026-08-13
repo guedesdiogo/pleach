@@ -572,6 +572,93 @@ assert_rc "update (npm-managed): non-zero rc" "$RC" 1
 assert_contains "update (npm-managed): redirects to the package manager" "$OUT" "npm update -g"
 
 # ---------------------------------------------------------------------------
+header "Test 27: conflicts distinguishes a real conflict from a mere overlap"
+# ---------------------------------------------------------------------------
+# The whole point of asking git instead of guessing. Both sessions edit the SAME
+# file: s3 at the top, s4 at the bottom. An overlap heuristic calls that a
+# conflict; git merges it without complaint, and a tool that cries wolf here is a
+# tool you stop reading.
+printf 'top\nb\nc\nd\ne\nf\ng\nh\ni\nbottom\n' > "$CANON/subB/wide.txt"
+git -C "$CANON/subB" add wide.txt
+git -C "$CANON/subB" commit -q -m "a file with two distant regions"
+
+run "$PLEACH" sync s3 --any-branch
+run "$PLEACH" sync s4 --any-branch
+printf 'TOP-s3\nb\nc\nd\ne\nf\ng\nh\ni\nbottom\n' > "$SESSIONS/s3/subB/wide.txt"
+git -C "$SESSIONS/s3/subB" commit -q -am "s3 rewrites the top"
+printf 'top\nb\nc\nd\ne\nf\ng\nh\ni\nBOTTOM-s4\n' > "$SESSIONS/s4/subB/wide.txt"
+git -C "$SESSIONS/s4/subB" commit -q -am "s4 rewrites the bottom"
+
+# Isolate the WOULD CONFLICT section. s3 and s4 already clash on README.md from an
+# earlier scenario, so asking whether the word appears anywhere would prove
+# nothing - the question is which files are inside that section.
+conflict_block() { printf '%s\n' "$1" | awk '/WOULD CONFLICT/{f=1} /^(Also touched|Touched by)/{f=0} f'; }
+
+run "$PLEACH" conflicts
+assert_rc "conflicts: rc 0" "$RC" 0
+assert_contains "conflicts: the distant-region file is still reported as an overlap" "$OUT" "wide.txt"
+BLOCK=$(conflict_block "$OUT")
+if [ "${BLOCK#*wide.txt}" != "$BLOCK" ]; then
+  fail "conflicts: called wide.txt a real conflict, but git merges the two regions cleanly"
+else
+  ok "conflicts: distant regions of one file are NOT called a conflict"
+fi
+
+# Now the same region in both. This one git genuinely cannot resolve.
+printf 'CLASH-s3\nb\nc\nd\ne\nf\ng\nh\ni\nbottom\n' > "$SESSIONS/s3/subB/wide.txt"
+git -C "$SESSIONS/s3/subB" commit -q -am "s3 takes line 1"
+printf 'CLASH-s4\nb\nc\nd\ne\nf\ng\nh\ni\nbottom\n' > "$SESSIONS/s4/subB/wide.txt"
+git -C "$SESSIONS/s4/subB" commit -q -am "s4 takes line 1 too"
+
+run "$PLEACH" conflicts
+assert_rc "conflicts (real conflict): still rc 0 - it informs, it does not fail" "$RC" 0
+BLOCK=$(conflict_block "$OUT")
+assert_contains "conflicts: reports a real conflict" "$OUT" "WOULD CONFLICT"
+assert_contains "conflicts: the same-region file IS in the conflict section" "$BLOCK" "wide.txt"
+assert_contains "conflicts: names both sessions" "$BLOCK" "s3 <-> s4"
+assert_contains "conflicts: names the repo it is in" "$BLOCK" "(subB)"
+
+# ---------------------------------------------------------------------------
+header "Test 28: new --from stacks a session on another one's unmerged work"
+# ---------------------------------------------------------------------------
+# s4 has commits that are not in main. A session cut from main cannot see them;
+# one cut from s4 can. That is the difference between waiting for a merge and
+# building on top of it.
+echo "only in s4" > "$SESSIONS/s4/stacked-marker.txt"
+git -C "$SESSIONS/s4" add stacked-marker.txt
+git -C "$SESSIONS/s4" commit -q -m "work that has not landed on main"
+
+run "$PLEACH" new s5 --no-bootstrap
+assert_rc "new s5 (from the base): rc 0" "$RC" 0
+assert_true "new s5: does NOT see s4's unmerged work" \
+  [ ! -e "$SESSIONS/s5/stacked-marker.txt" ]
+
+run "$PLEACH" new s6 --from s4 --no-bootstrap
+assert_rc "new s6 --from s4: rc 0" "$RC" 0
+assert_contains "new s6: says what it cut from" "$OUT" "cutting from 's4'"
+assert_true "new s6: DOES see s4's unmerged work" \
+  [ -e "$SESSIONS/s6/stacked-marker.txt" ]
+assert_eq "new s6: still on its own branch, not s4's" \
+  "$(git -C "$SESSIONS/s6" branch --show-current)" "session/s6"
+assert_true "new s6: records its lineage in .session-env" \
+  grep -q '^export PLEACH_BASE_REF="s4"' "$SESSIONS/s6/.session-env"
+
+run "$PLEACH" ls -l
+assert_contains "ls -l: marks the stacked session with what it was cut from" "$OUT" "cut from s4"
+
+run "$PLEACH" ls --json
+assert_contains "ls --json: carries the lineage" "$OUT" '"cut_from": "s4"'
+
+# A ref that exists nowhere must fall back loudly, never silently.
+run "$PLEACH" new s7 --from no-such-ref --no-bootstrap
+assert_rc "new --from <missing ref>: rc 0 - falls back rather than blocking" "$RC" 0
+assert_contains "new --from <missing ref>: says it fell back" "$OUT" "cutting from main instead"
+
+run "$PLEACH" new s8 --from
+assert_rc "new --from with no value: non-zero rc" "$RC" 1
+assert_contains "new --from with no value: says what it needs" "$OUT" "needs a session name or a git ref"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

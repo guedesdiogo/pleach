@@ -162,6 +162,44 @@ and discarded when it finishes. A pleach session is the durable, multi-repo floo
 agents stand on — running Claude Code or Muse Code *inside* a session is the intended
 stack, not a competing one.
 
+### What Muse Code does differently, and what pleach took from it
+
+Meta's Muse Code fans a task out to child agents, one git worktree each. It is the closest
+thing to pleach with a different owner, so the divergences are informative:
+
+| | Muse Code | pleach |
+|---|---|---|
+| Who owns a worktree | the parent agent | you |
+| Lifetime | one task, then discarded | the branch's |
+| Ref | **detached HEAD** from the parent's HEAD | named branch `session/<name>` |
+| Location | `.muse/worktrees/`, inside the repo | `.sessions/`, beside it |
+| Scope | one repo | every repo in the workspace |
+| Integration | the parent merges children one at a time | your normal PR flow |
+| Recovery | a replayable JSONL event log | the filesystem *is* the state |
+| Cleanup | `cleanup_policy: remove_if_clean` | `prune`, dry run by default |
+
+**The detached HEAD is the load-bearing difference, and both answers are right.** Muse needs
+many children from one commit, and git refuses to check the same branch out twice — so it
+gives up branches to get the fan-out. pleach *wants* that refusal: it is the structural
+isolation, the thing that cannot be forgotten. Muse can trade it away because a child lives
+for one task; a pleach session outlives any single task, and two agents quietly sharing one
+would be the exact failure this tool exists to prevent.
+
+Two things were worth taking:
+
+- **`pleach new <name> --from <session|ref>`** — Muse cuts children from the parent's HEAD,
+  not from main. pleach only ever cut from the base, so work building on another session's
+  *unmerged* commits had to wait for a merge. Now it does not.
+- **Conflict prediction that is real.** `conflicts` used to report files touched by more
+  than one session. That is a proxy, and it cries wolf: two sessions editing distant regions
+  of one file merge cleanly. It now asks git to perform the three-way merge in memory
+  (`merge-tree --write-tree`) and reports only what git itself cannot resolve.
+
+And two worth refusing. **Auto-cleanup** (`remove_if_clean`) is right for a worktree the
+machine owns and wrong for one you do; deletion here stays opt-in. **The event log** solves
+a problem pleach does not have — a session is a directory and a branch, which survives a
+crash with nothing to replay.
+
 None of these are wrong; they solve neighbouring problems. What none of them compose is
 **worktrees per repo + secrets + ports + runtime identity + bootstrap + lifecycle**,
 behind one command.
@@ -256,6 +294,7 @@ pleach open fix-x code               # VS Code on the session's multi-root works
 
 pleach new fix-x api web             # a focused session: only these sub-repos
 pleach new fix-x --fetch             # update the base from origin first
+pleach new fix-y --from fix-x        # stack on fix-x's unmerged work, not on main
 
 pleach ls                            # instant: name, index, ports, repo count
 pleach ls -l                         # branch, commits ahead, changes, integration status
@@ -377,12 +416,18 @@ other language means giving up `runtime deps: git + bash`. MCP is the right shap
 orchestrator. pleach is the substrate underneath one — git does not ship an MCP server
 either.
 
-**Isolation buys a blind spot, so `conflicts` sells it back.** Moving collisions to merge
-time is the entire point — but the same move hides them until then: work in another
-session is invisible to yours by construction. `pleach conflicts` lists the files being
-edited in more than one session, counting committed and uncommitted work alike. It always
-exits 0, because two sessions touching one file is a normal, resolvable state. The value
-is not the verdict; it is finding out early enough to split the work differently.
+**Isolation buys a blind spot, so `conflicts` sells it back — and it asks git rather than
+guessing.** Moving collisions to merge time is the entire point, but the same move hides
+them until then: work in another session is invisible to yours by construction. The first
+version of this command reported files touched by more than one session. That is a proxy,
+and a proxy that cries wolf — two sessions editing distant regions of one file merge
+cleanly, and a tool that calls that a conflict is a tool you stop reading. It now runs
+git's own three-way merge in memory (`merge-tree --write-tree`, git >= 2.38) between each
+pair of session branches, and separates what *would actually conflict* from what merely
+overlaps. Nothing is written to obtain the answer. It always exits 0, because an overlap is
+a normal, resolvable state — the value is finding out early enough to split the work
+differently. Below git 2.38 the real check is skipped and says so, rather than quietly
+reporting less than it claims.
 
 **`doctor` asks out loud what a multi-repo tool otherwise gets wrong quietly.** A lock left
 by a run that died, a worktree git still believes in whose folder is gone, two sessions
@@ -421,7 +466,7 @@ session and the canonical by their markers rather than by hardcoded directories:
 ## Tests
 
 ```bash
-tests/run.sh          # 156 assertions across 26 scenarios, in a throwaway sandbox
+tests/run.sh          # 177 assertions across 28 scenarios, in a throwaway sandbox
 tests/no-leaks.sh     # repository hygiene gate
 shellcheck pleach install.sh tests/*.sh examples/*.sh
 ```
@@ -431,10 +476,11 @@ creation, listing, sync (including the dry run, the dirty-repo skip and the wron
 skip), the non-interactive `--yes` requirement, removal, prune, clean, `each`, `add`,
 `repos --sync`, the runtime identity and its idempotent backfill, `ls --json` (parsed, not
 pattern-matched), `path`/`cd`/`shell-init`/`completions` (the emitted scripts are syntax
-checked), `doctor` against a planted stale lock and a planted conf/disk drift, `conflicts` against a
-real overlap between two sessions (asserting both that the shared file is reported and that
-a file only one session touches is not), help coverage for every command, and that `open`
-really runs inside the session. It pins `PLEACH_EXPECT_CANONICAL` to its own sandbox so it
+checked), `doctor` against a planted stale lock and a planted conf/disk drift, `conflicts` against both a real
+conflict and a mere overlap (the decisive assertion is that a file two sessions edit in
+*distant regions* is reported as an overlap and **not** as a conflict — the exact case the
+old heuristic got wrong), `new --from` stacking a session on another's unmerged commits,
+help coverage for every command, and that `open` really runs inside the session. It pins `PLEACH_EXPECT_CANONICAL` to its own sandbox so it
 cannot escape.
 
 The suite earns its keep: `conflicts` shipped with a defect its own test caught — an `EXIT`
