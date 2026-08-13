@@ -366,7 +366,7 @@ header "Test 18: every command is documented"
 # ---------------------------------------------------------------------------
 # The help text is the only user-facing documentation inside the tool, so a
 # command with no help topic is a real defect, not a nicety.
-for c in init new open ls add sync rm prune clean each repos install update version; do
+for c in init new open ls path cd add sync rm prune clean each repos doctor shell-init completions install update version; do
   run "$PLEACH" help "$c"
   if [ "$RC" -eq 0 ] && [ -n "$OUT" ]; then
     ok "help $c: documented"
@@ -391,6 +391,124 @@ header "Test 19: open runs the command inside the session"
 run "$PLEACH" open s3 pwd
 assert_rc "open s3 pwd: rc 0" "$RC" 0
 assert_contains "open s3 pwd: the command runs in the session folder" "$OUT" "$SESSIONS/s3"
+
+# ---------------------------------------------------------------------------
+header "Test 20: runtime identity beyond ports"
+# ---------------------------------------------------------------------------
+# Worktrees isolate files. Databases and containers are shared state git cannot
+# see, so each session carries its own name for them.
+assert_true "session-env: exports PLEACH_SLUG" \
+  grep -q '^export PLEACH_SLUG=' "$SESSIONS/s3/.session-env"
+assert_true "session-env: exports PLEACH_DB_NAME" \
+  grep -q '^export PLEACH_DB_NAME=' "$SESSIONS/s3/.session-env"
+assert_true "session-env: exports COMPOSE_PROJECT_NAME" \
+  grep -q '^export COMPOSE_PROJECT_NAME=' "$SESSIONS/s3/.session-env"
+
+SLUG=$(grep -m1 '^export PLEACH_SLUG=' "$SESSIONS/s3/.session-env" | cut -d= -f2-)
+# A Postgres identifier and a compose project name cannot carry hyphens or case.
+case "$SLUG" in
+  *[!a-z0-9_]*) fail "slug '$SLUG' contains characters unsafe as a DB identifier" ;;
+  "")           fail "slug is empty" ;;
+  *)            ok "slug '$SLUG' is a safe identifier ([a-z0-9_])" ;;
+esac
+assert_contains "slug is namespaced by the workspace, not just the session" "$SLUG" "canon"
+
+# The backfill must be idempotent: opening a session twice may not duplicate them.
+run "$PLEACH" open s3 true
+assert_rc "open s3 (backfill path): rc 0" "$RC" 0
+assert_eq "backfill: PLEACH_SLUG appears exactly once" \
+  "$(grep -c '^export PLEACH_SLUG=' "$SESSIONS/s3/.session-env" | tr -d ' ')" "1"
+
+# ---------------------------------------------------------------------------
+header "Test 21: ls --json (the machine-readable surface)"
+# ---------------------------------------------------------------------------
+run "$PLEACH" ls --json
+assert_rc "ls --json: rc 0" "$RC" 0
+assert_contains "ls --json: reports the canonical" "$OUT" '"canonical"'
+assert_contains "ls --json: lists s3" "$OUT" '"name": "s3"'
+assert_contains "ls --json: carries the branch" "$OUT" '"branch": "session/s3"'
+assert_contains "ls --json: carries the mounted sub-repos" "$OUT" '"subs": ["subA", "subB", "subC"]'
+
+# Valid JSON, not just a string that looks like it. Parsed by whatever is around;
+# with no parser available the assertion is skipped rather than faked.
+if command -v python3 >/dev/null 2>&1; then
+  if printf '%s' "$OUT" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+    ok "ls --json: output parses as JSON"
+  else
+    fail "ls --json: output is not valid JSON"
+  fi
+else
+  echo "  (skipped: no python3 to validate the JSON)"
+fi
+
+# ---------------------------------------------------------------------------
+header "Test 22: path, cd and the shell wrapper"
+# ---------------------------------------------------------------------------
+run "$PLEACH" path s3
+assert_rc "path s3: rc 0" "$RC" 0
+assert_eq "path s3: prints the session directory" "$OUT" "$SESSIONS/s3"
+
+run "$PLEACH" path --canonical
+assert_eq "path --canonical: prints the canonical" "$OUT" "$CANON"
+
+run "$PLEACH" path nope
+assert_rc "path nope: non-zero rc for an unknown session" "$RC" 1
+
+# `cd` cannot work from a child process. It must say so, not fail obscurely.
+run "$PLEACH" cd s3
+assert_rc "cd without the wrapper: non-zero rc" "$RC" 1
+assert_contains "cd without the wrapper: points at shell-init" "$OUT" "shell-init"
+
+run "$PLEACH" shell-init
+assert_rc "shell-init: rc 0" "$RC" 0
+assert_contains "shell-init: defines the wrapper function" "$OUT" "pleach()"
+printf '%s' "$OUT" > "$SANDBOX/shell-init.sh"
+assert_true "shell-init: the emitted wrapper is valid shell" \
+  bash -n "$SANDBOX/shell-init.sh"
+
+# ---------------------------------------------------------------------------
+header "Test 23: completions"
+# ---------------------------------------------------------------------------
+run "$PLEACH" completions bash
+assert_rc "completions bash: rc 0" "$RC" 0
+assert_contains "completions bash: registers the completion" "$OUT" "complete -F _pleach pleach"
+printf '%s' "$OUT" > "$SANDBOX/completions.bash"
+assert_true "completions bash: the emitted script is valid shell" \
+  bash -n "$SANDBOX/completions.bash"
+
+run "$PLEACH" completions zsh
+assert_rc "completions zsh: rc 0" "$RC" 0
+assert_contains "completions zsh: registers the completion" "$OUT" "compdef _pleach pleach"
+
+run "$PLEACH" completions fish
+assert_rc "completions fish: non-zero rc for an unsupported shell" "$RC" 1
+
+# ---------------------------------------------------------------------------
+header "Test 24: doctor detects and repairs"
+# ---------------------------------------------------------------------------
+run "$PLEACH" doctor
+assert_rc "doctor: rc 0 on a healthy workspace" "$RC" 0
+assert_contains "doctor: says so" "$OUT" "no problems found"
+
+# A lock left behind by a run that died mid-way is invisible until the next
+# create hangs for two minutes. doctor must name it.
+mkdir -p "$SESSIONS/.pleach.lock"
+run "$PLEACH" doctor
+assert_rc "doctor: non-zero rc with a stale lock" "$RC" 1
+assert_contains "doctor: reports the stale lock" "$OUT" "lock held"
+
+run "$PLEACH" doctor --fix
+assert_rc "doctor --fix: rc 0" "$RC" 0
+assert_contains "doctor --fix: releases the lock" "$OUT" "stale lock released"
+assert_true "doctor --fix: the lock directory is gone" [ ! -d "$SESSIONS/.pleach.lock" ]
+
+# Drift between the conf and disk is the multi-repo failure mode: a sub-repo
+# declared but absent makes every session silently incomplete.
+mv "$CANON/subC" "$CANON/subC.moved"
+run "$PLEACH" doctor
+assert_rc "doctor: non-zero rc when a declared sub-repo is missing" "$RC" 1
+assert_contains "doctor: names the missing sub-repo" "$OUT" "missing from disk: subC"
+mv "$CANON/subC.moved" "$CANON/subC"
 
 # ---------------------------------------------------------------------------
 # Summary
