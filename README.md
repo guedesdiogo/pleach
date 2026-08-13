@@ -176,14 +176,18 @@ pleach update                  # self-updates from main; push is release
 Or through a package manager:
 
 ```bash
+brew install guedesdiogo/tap/pleach     # completions included
 npm install -g @diogoaguedes/pleach     # or: bun add -g @diogoaguedes/pleach
 ```
 
-The package is scoped because npm reserves the bare name `pleach`, judging it too close to
-`preact`. The command it installs is still `pleach`.
+The npm package is scoped because npm reserves the bare name `pleach`, judging it too
+close to `preact`. The command it installs is still `pleach`.
 
-`pleach update` detects npm/bun-managed installs and redirects to the package manager, so
-the two paths never fight.
+`pleach update` recognises installs owned by Homebrew, npm or bun and redirects to that
+package manager rather than self-updating over the top of them — which would leave the
+managed copy stale and a second one shadowing it. Four channels that never fight is a
+property worth testing, so it is: the suite asserts each redirect fires before any network
+call is made.
 
 Then, optionally, in `~/.zshrc` or `~/.bashrc`:
 
@@ -417,7 +421,7 @@ session and the canonical by their markers rather than by hardcoded directories:
 ## Tests
 
 ```bash
-tests/run.sh          # 152 assertions across 25 scenarios, in a throwaway sandbox
+tests/run.sh          # 156 assertions across 26 scenarios, in a throwaway sandbox
 tests/no-leaks.sh     # repository hygiene gate
 shellcheck pleach install.sh tests/*.sh examples/*.sh
 ```

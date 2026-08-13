@@ -553,6 +553,25 @@ git -C "$SESSIONS/s3/subA" checkout -- f.txt
 git -C "$SESSIONS/s4/subA" checkout -- f.txt
 
 # ---------------------------------------------------------------------------
+header "Test 26: update defers to whoever owns the install"
+# ---------------------------------------------------------------------------
+# pleach ships through four channels. A copy installed by a package manager must
+# never self-update over the top of it - it would write to ~/.local/bin, leaving
+# the managed copy stale and a second one shadowing it. These assertions also
+# prove `update` decides BEFORE reaching the network: nothing is downloaded here.
+mkdir -p "$SANDBOX/fake/Cellar/pleach/1.1.0/bin"
+cp "$PLEACH" "$SANDBOX/fake/Cellar/pleach/1.1.0/bin/pleach"
+run "$SANDBOX/fake/Cellar/pleach/1.1.0/bin/pleach" update
+assert_rc "update (Homebrew-managed): non-zero rc" "$RC" 1
+assert_contains "update (Homebrew-managed): redirects to brew" "$OUT" "brew upgrade pleach"
+
+mkdir -p "$SANDBOX/fake/node_modules/.bin"
+cp "$PLEACH" "$SANDBOX/fake/node_modules/.bin/pleach"
+run "$SANDBOX/fake/node_modules/.bin/pleach" update
+assert_rc "update (npm-managed): non-zero rc" "$RC" 1
+assert_contains "update (npm-managed): redirects to the package manager" "$OUT" "npm update -g"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
