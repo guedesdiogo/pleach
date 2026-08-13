@@ -1133,7 +1133,7 @@ cmd_update() {
   [ -L "$self" ] && self=$(readlink "$self")
   case "$self" in
     *node_modules*|*/.bun/*)
-      err "this install is managed by npm/bun — update with: bun update -g pleach (or npm update -g pleach)"
+      err "this install is managed by npm/bun — update with: bun update -g @diogoaguedes/pleach (or npm update -g @diogoaguedes/pleach)"
       ;;
   esac
   command -v curl >/dev/null 2>&1 \

@@ -112,10 +112,14 @@ echo ""
 echo "--- package identity ---"
 pkg_field() { sed -nE "s/.*\"$1\": *\"([^\"]+)\".*/\1/p" package.json | head -1; }
 
-if [ "$(pkg_field name)" = "pleach" ]; then
-  pass "package name is 'pleach'"
+# The package is scoped under the author's own npm account because npm reserves
+# the bare name. The scope is part of the identity, so it is pinned here: a
+# different scope would mean the package was published somewhere unintended.
+EXPECTED_PKG="@diogoaguedes/pleach"
+if [ "$(pkg_field name)" = "$EXPECTED_PKG" ]; then
+  pass "package name is '$EXPECTED_PKG'"
 else
-  report "package name is '$(pkg_field name)', expected 'pleach'"
+  report "package name is '$(pkg_field name)', expected '$EXPECTED_PKG'"
 fi
 
 if [ "$(pkg_field license)" = "MIT" ]; then

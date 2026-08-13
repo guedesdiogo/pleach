@@ -9,7 +9,7 @@ same time without them overwriting each other, without directory replicas, and a
 essentially zero disk cost.
 
 [![ci](https://github.com/guedesdiogo/pleach/actions/workflows/ci.yml/badge.svg)](https://github.com/guedesdiogo/pleach/actions/workflows/ci.yml)
-[![npm](https://img.shields.io/npm/v/pleach?color=cb3837&logo=npm)](https://www.npmjs.com/package/pleach)
+[![npm](https://img.shields.io/npm/v/%40diogoaguedes%2Fpleach?color=cb3837&logo=npm)](https://www.npmjs.com/package/@diogoaguedes/pleach)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 ![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)
 ![runtime deps](https://img.shields.io/badge/runtime%20deps-git%20%2B%20bash-lightgrey)
@@ -137,15 +137,18 @@ None of these are wrong; they solve neighbouring problems. What none of them com
 ## Install
 
 ```bash
-npm install -g pleach          # or: bun add -g pleach
-```
-
-Or without a package manager:
-
-```bash
 curl -fsSL https://raw.githubusercontent.com/guedesdiogo/pleach/main/install.sh | bash
 pleach update                  # self-updates from main; push is release
 ```
+
+Or through a package manager:
+
+```bash
+npm install -g @diogoaguedes/pleach     # or: bun add -g @diogoaguedes/pleach
+```
+
+The package is scoped because npm reserves the bare name `pleach`, judging it too close to
+`preact`. The command it installs is still `pleach`.
 
 `pleach update` detects npm/bun-managed installs and redirects to the package manager, so
 the two paths never fight.
