@@ -55,6 +55,16 @@ assert_contains() { # <description> <output> <substring>
   fi
 }
 
+assert_not_contains() { # <description> <output> <substring>
+  local desc="$1" out="$2" needle="$3"
+  if [ "${out#*"$needle"}" != "$out" ]; then
+    fail "$desc - it must not contain: [$needle]"
+    printf '    captured output:\n%s\n' "$out" | sed 's/^/    | /' >&2
+  else
+    ok "$desc"
+  fi
+}
+
 assert_rc() { # <description> <actual-rc> <expected-rc>
   local desc="$1" rc="$2" want="$3"
   if [ "$rc" -eq "$want" ]; then
@@ -494,13 +504,17 @@ assert_contains "doctor: says so" "$OUT" "no problems found"
 # create hangs for two minutes. doctor must name it.
 mkdir -p "$SESSIONS/.pleach.lock"
 run "$PLEACH" doctor
-assert_rc "doctor: non-zero rc with a stale lock" "$RC" 1
-assert_contains "doctor: reports the stale lock" "$OUT" "lock held"
+assert_rc "doctor: non-zero rc with a lock held" "$RC" 1
+assert_contains "doctor: reports the lock" "$OUT" "lock held"
 
+# A lock with NO owner recorded cannot be judged: it may come from a version that
+# predates owners and still be held by a live run. Guessing wrong tears that run
+# down, so --fix must refuse and hand over the manual escape hatch instead.
 run "$PLEACH" doctor --fix
-assert_rc "doctor --fix: rc 0" "$RC" 0
-assert_contains "doctor --fix: releases the lock" "$OUT" "stale lock released"
-assert_true "doctor --fix: the lock directory is gone" [ ! -d "$SESSIONS/.pleach.lock" ]
+assert_rc "doctor --fix: still non-zero for an ownerless lock" "$RC" 1
+assert_contains "doctor --fix: says it will not touch an ownerless lock" "$OUT" "no owner recorded"
+assert_true "doctor --fix: the ownerless lock was NOT removed" [ -d "$SESSIONS/.pleach.lock" ]
+rmdir "$SESSIONS/.pleach.lock"
 
 # Drift between the conf and disk is the multi-repo failure mode: a sub-repo
 # declared but absent makes every session silently incomplete.
@@ -583,7 +597,11 @@ git -C "$CANON/subB" add wide.txt
 git -C "$CANON/subB" commit -q -m "a file with two distant regions"
 
 run "$PLEACH" sync s3 --any-branch
+assert_rc "sync s3 (setup): rc 0" "$RC" 0
 run "$PLEACH" sync s4 --any-branch
+assert_rc "sync s4 (setup): rc 0" "$RC" 0
+assert_true "setup: both sessions received wide.txt" \
+  [ -f "$SESSIONS/s3/subB/wide.txt" ] && [ -f "$SESSIONS/s4/subB/wide.txt" ]
 printf 'TOP-s3\nb\nc\nd\ne\nf\ng\nh\ni\nbottom\n' > "$SESSIONS/s3/subB/wide.txt"
 git -C "$SESSIONS/s3/subB" commit -q -am "s3 rewrites the top"
 printf 'top\nb\nc\nd\ne\nf\ng\nh\ni\nBOTTOM-s4\n' > "$SESSIONS/s4/subB/wide.txt"
@@ -641,7 +659,7 @@ assert_true "new s6: DOES see s4's unmerged work" \
 assert_eq "new s6: still on its own branch, not s4's" \
   "$(git -C "$SESSIONS/s6" branch --show-current)" "session/s6"
 assert_true "new s6: records its lineage in .session-env" \
-  grep -q '^export PLEACH_BASE_REF="s4"' "$SESSIONS/s6/.session-env"
+  grep -q '^export PLEACH_BASE_REF=s4$' "$SESSIONS/s6/.session-env"
 
 run "$PLEACH" ls -l
 assert_contains "ls -l: marks the stacked session with what it was cut from" "$OUT" "cut from s4"
@@ -653,10 +671,132 @@ assert_contains "ls --json: carries the lineage" "$OUT" '"cut_from": "s4"'
 run "$PLEACH" new s7 --from no-such-ref --no-bootstrap
 assert_rc "new --from <missing ref>: rc 0 - falls back rather than blocking" "$RC" 0
 assert_contains "new --from <missing ref>: says it fell back" "$OUT" "cutting from main instead"
+# And the recorded lineage has to be the TRUTH: it fell back to the base, so the
+# base is what lands in .session-env. Recording 'no-such-ref' would make `ls -l`
+# claim the session came from somewhere it never did.
+assert_true "lineage: records the base, not the ref that did not exist" \
+  grep -q '^export PLEACH_BASE_REF=main$' "$SESSIONS/s7/.session-env"
+run "$PLEACH" ls -l
+assert_not_contains "ls -l: invents no lineage for s7" "$OUT" "cut from no-such-ref"
 
 run "$PLEACH" new s8 --from
 assert_rc "new --from with no value: non-zero rc" "$RC" 1
 assert_contains "new --from with no value: says what it needs" "$OUT" "needs a session name or a git ref"
+
+# ---------------------------------------------------------------------------
+header "Test 29: a ref name must not be able to execute"
+# ---------------------------------------------------------------------------
+# git ACCEPTS branch names like 'feat/$(...)'. .session-env is read with `source`,
+# so a double-quoted value would run on the next `open`. %q neutralises it without
+# changing a byte of any ordinary value.
+#
+# The payload cannot contain spaces (git rejects those in refs); brace expansion
+# `{touch,<path>}` yields the two words without a literal space in the name. The
+# path must be normalised: on macOS $TMPDIR already ends in '/', so $SANDBOX
+# carries a double slash, and git rejects refs containing '//' — which would make
+# this scenario SKIP silently, passing green while measuring nothing.
+SANDBOX_REF=$(cd "$SANDBOX" && pwd -P)
+# shellcheck disable=SC2016  # single quotes deliberate: the $( ) MUST stay literal
+PAYLOAD='feat/$({touch,'"$SANDBOX_REF"'/PWNED})'
+
+# Sanity first: if the payload did not fire, the test would pass by measuring
+# nothing. Prove the OLD form (double-quoted) really does execute.
+printf 'export PLEACH_BASE_REF="%s"\n' "$PAYLOAD" > "$SANDBOX/vuln-probe.sh"
+# shellcheck disable=SC1091  # generated at runtime — it does not exist for the linter
+( . "$SANDBOX/vuln-probe.sh" ) >/dev/null 2>&1 || true
+assert_true "sanity: the old (quoted) form really did fire" \
+  [ -e "$SANDBOX_REF/PWNED" ]
+rm -f "$SANDBOX_REF/PWNED"
+
+if git -C "$CANON" branch "$PAYLOAD" >/dev/null 2>&1; then
+  run "$PLEACH" new s9 --from "$PAYLOAD" --no-bootstrap
+  assert_rc "new --from <ref with \$( )>: rc 0" "$RC" 0
+  assert_true "the hostile ref did NOT execute while writing .session-env" \
+    [ ! -e "$SANDBOX_REF/PWNED" ]
+
+  # And the one that matters: open sources the file.
+  run "$PLEACH" open s9 true
+  assert_rc "open s9: rc 0" "$RC" 0
+  assert_true "the hostile ref did NOT execute when open sourced it" \
+    [ ! -e "$SANDBOX_REF/PWNED" ]
+  # shellcheck disable=SC1091  # .session-env is generated by pleach at runtime
+  assert_eq "the original value survives the escaping intact" \
+    "$(cd "$SESSIONS/s9" && . ./.session-env && printf '%s' "$PLEACH_BASE_REF")" \
+    "$PAYLOAD"
+else
+  echo "  (skipped: this git rejects the ref name used as the payload)"
+fi
+
+# ---------------------------------------------------------------------------
+header "Test 30: distinct session identities must not collapse onto one slug"
+# ---------------------------------------------------------------------------
+# 'fix-login' and 'fix_login' are two valid, distinct names. If the slug merged
+# them they would share PLEACH_DB_NAME — exactly the collision the runtime
+# identity exists to prevent.
+run "$PLEACH" new fix-login --no-bootstrap
+assert_rc "new fix-login: rc 0" "$RC" 0
+run "$PLEACH" new fix_login --no-bootstrap
+assert_rc "new fix_login: rc 0" "$RC" 0
+SLUG_A=$(grep -m1 '^export PLEACH_SLUG=' "$SESSIONS/fix-login/.session-env" | cut -d= -f2-)
+SLUG_B=$(grep -m1 '^export PLEACH_SLUG=' "$SESSIONS/fix_login/.session-env" | cut -d= -f2-)
+if [ "$SLUG_A" = "$SLUG_B" ]; then
+  fail "slug: 'fix-login' and 'fix_login' both collapsed to [$SLUG_A] — they would share a database"
+else
+  ok "slug: 'fix-login' [$SLUG_A] != 'fix_login' [$SLUG_B]"
+fi
+case "$SLUG_B" in
+  *[!a-z0-9_]*) fail "slug '$SLUG_B' is no longer a safe identifier" ;;
+  *)            ok "slug '$SLUG_B' is still safe as an identifier ([a-z0-9_])" ;;
+esac
+
+# ---------------------------------------------------------------------------
+header "Test 31: doctor --fix must not tear down a LIVE lock"
+# ---------------------------------------------------------------------------
+# --fix promises only the repairs that cannot lose work. Removing the lock of a
+# run in progress would leave two invocations creating worktrees at once, which
+# is precisely what the lock prevents.
+mkdir -p "$SESSIONS/.pleach.lock"
+printf '%s %s\n' "$$" "$(uname -n 2>/dev/null || echo '?')" > "$SESSIONS/.pleach.lock/owner"
+run "$PLEACH" doctor --fix
+assert_contains "doctor: recognises the lock as LIVE" "$OUT" "lock is LIVE"
+assert_true "doctor --fix: the live lock was PRESERVED" [ -d "$SESSIONS/.pleach.lock" ]
+
+# An owner that no longer exists is a different story: that one is dirt and goes.
+# The pid comes from a process that has actually terminated — a hard-coded number
+# like 999999 could be ALIVE on a machine with a high pid_max, and then the test
+# would pass for the wrong reason.
+( exit 0 ) & DEAD_PID=$!; wait "$DEAD_PID" 2>/dev/null || true
+printf '%s %s\n' "$DEAD_PID" "$(uname -n 2>/dev/null || echo '?')" > "$SESSIONS/.pleach.lock/owner"
+run "$PLEACH" doctor --fix
+assert_contains "doctor --fix: releases the lock whose owner died" "$OUT" "stale lock released"
+assert_true "doctor --fix: the abandoned lock is gone" [ ! -d "$SESSIONS/.pleach.lock" ]
+
+# ---------------------------------------------------------------------------
+header "Test 32: conflicts sees sub-repos mounted outside the conf"
+# ---------------------------------------------------------------------------
+# conflicts exists to remove a blind spot; iterating PLEACH_SUBS alone gave it a
+# blind spot of its own — a sub mounted with `add` and still outside the conf
+# went unchecked.
+setup_repo "$CANON/subD"
+echo "base" > "$CANON/subD/shared.txt"
+git -C "$CANON/subD" add shared.txt
+git -C "$CANON/subD" commit -q -m "initial commit for subD"
+assert_true "subD is on disk but OUTSIDE PLEACH_SUBS" \
+  bash -c "! grep -q 'PLEACH_SUBS=(.*subD' '$CANON/.pleach.conf'"
+
+run "$PLEACH" add s3 subD --no-bootstrap
+assert_rc "add s3 subD: rc 0" "$RC" 0
+run "$PLEACH" add s4 subD --no-bootstrap
+assert_rc "add s4 subD: rc 0" "$RC" 0
+printf 'from-s3\n' > "$SESSIONS/s3/subD/shared.txt"
+git -C "$SESSIONS/s3/subD" commit -q -am "s3 rewrites shared"
+printf 'from-s4\n' > "$SESSIONS/s4/subD/shared.txt"
+git -C "$SESSIONS/s4/subD" commit -q -am "s4 rewrites shared"
+
+run "$PLEACH" conflicts
+BLOCK=$(conflict_block "$OUT")
+assert_contains "conflicts: checks a sub mounted outside the conf" "$BLOCK" "(subD)"
+assert_contains "conflicts: names the conflicting file in that sub" "$BLOCK" "shared.txt"
 
 # ---------------------------------------------------------------------------
 # Summary

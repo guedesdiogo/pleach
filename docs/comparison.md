@@ -151,8 +151,10 @@ Taken:
   commits had to wait for a merge. Now it does not.
 - **Conflict prediction that is real.** `conflicts` used to report files touched by more than
   one session. That is a proxy, and it cries wolf: two sessions editing distant regions of
-  one file merge cleanly. It now runs git's own three-way merge in memory
-  (`merge-tree --write-tree`) and reports only what git itself cannot resolve.
+  one file merge cleanly. It now runs git's own three-way merge without a checkout
+  (`merge-tree --write-tree`, which leaves the working tree, the index and the branches
+  untouched — only unreferenced loose objects enter the object store) and reports only what
+  git itself cannot resolve.
 
 Refused:
 
