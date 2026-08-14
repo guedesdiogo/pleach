@@ -50,7 +50,10 @@ worktree tooling ships one, so the absence is worth defending. Ask who would cal
 agent lives *inside* a session, and a session's lifecycle is decided from outside and
 before it. An agent in `fix-login` calling `rm fix-login` is sawing the branch it sits on.
 What an in-session agent legitimately needs is to *read* the map, and `ls --json` through a
-shell-out does that in any tool that can run a command. The cost on the other side is real:
+shell-out does that in any tool that can run a command. The other half of that need — knowing
+which command to run, and which ones only report until `--apply` — is a documentation
+problem rather than a protocol one, and `pleach skill` answers it by emitting a skill file
+the agent's own runtime loads. Teaching, not serving. The cost on the other side is real:
 MCP is JSON-RPC over stdio, which in pure bash means hand-rolling a JSON parser, and in any
 other language means giving up `runtime deps: git + bash`. MCP is the right shape for an
 orchestrator. pleach is the substrate underneath one — git does not ship an MCP server

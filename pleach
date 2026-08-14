@@ -12,7 +12,7 @@
 # shellcheck disable=SC2015  # deliberate idiom: [ -z "$x" ] && x=… || err (err never runs after an assignment)
 set -euo pipefail
 
-PLEACH_VERSION="1.2.2"
+PLEACH_VERSION="1.3.0"
 
 CONF_NAME=".pleach.conf"
 USER_CONF="$HOME/.config/pleach/config"
@@ -1398,7 +1398,7 @@ cmd_completions() {
     bash) cat <<'EOF'
 # pleach bash completion. Add to ~/.bashrc:
 #   eval "$(pleach completions bash)"
-_pleach_commands="init new open ls add sync rm prune clean each conflicts repos path cd doctor completions shell-init install update version help"
+_pleach_commands="init new open ls add sync rm prune clean each conflicts repos path cd doctor skill completions shell-init install update version help"
 _pleach_sessions() { pleach ls --json 2>/dev/null | sed -nE 's/.*"name": "([^"]+)".*/\1/p'; }
 _pleach() {
   local cur="${COMP_WORDS[COMP_CWORD]}"
@@ -1421,7 +1421,7 @@ EOF
 #   eval "$(pleach completions zsh)"
 _pleach() {
   local -a cmds
-  cmds=(init new open ls add sync rm prune clean each conflicts repos path cd doctor completions shell-init install update version help)
+  cmds=(init new open ls add sync rm prune clean each conflicts repos path cd doctor skill completions shell-init install update version help)
   if (( CURRENT == 2 )); then
     _describe 'pleach command' cmds
     return
@@ -1757,6 +1757,161 @@ cmd_doctor() {
 }
 
 # ---------------------------------------------------------------------------
+skill_doc() {
+  # Kept inside this script on purpose, exactly like `completions` and
+  # `shell-init`: a single copied `pleach` stays self-sufficient (cmd_install
+  # copies nothing else, and npm/brew ship one executable). A skill in a separate
+  # file would be a path that is right in the repo and wrong everywhere else.
+  cat <<'PLEACH_SKILL_EOF'
+---
+name: pleach
+description: Use when a workspace has a .pleach.conf at its root or a .session-env in the tree, when several tasks, branches or agents have to run in parallel over one or more git repos without colliding, or when a request involves creating, syncing, inspecting or removing parallel worktree sessions.
+---
+
+# pleach
+
+Parallel work sessions for a multi-repo workspace: one git worktree per repo on
+branch `session/<name>`, plus the state git cannot isolate — an exclusive block of
+100 ports and a runtime identity (database name, compose project name).
+
+Every flag lives in the tool — `pleach help`, `pleach help <command>`, `pleach help config`.
+Read those rather than guess. This skill carries the judgment they do not.
+
+## Two roles, one boundary
+
+A `.session-env` at or above the working directory means you are INSIDE a session.
+A `.pleach.conf` and no `.session-env` means you are in the canonical checkout.
+
+|                                | Canonical (outside)                     | Inside a session                                                        |
+| ------------------------------ | --------------------------------------- | ----------------------------------------------------------------------- |
+| Purpose                        | integration, releases, session lifecycle | implementing one task                                                    |
+| Create / remove / prune sessions | yes                                    | **no** — you would be cutting the branch you are sitting on              |
+| Deploy, publish, `terraform apply` | yes                                  | **no** — two sessions collide in the *environment*; git isolates files, not environments |
+| Edit code                      | prefer a session                        | yes, that is the job                                                     |
+
+When a request from inside a session needs the other side, name the command and
+where it must run. Do not run it.
+
+## Inside a session, source the environment first
+
+```
+source .session-env        # from the session root
+```
+
+before any dev server, migration, container or test run. It carries `PORT`,
+`WRANGLER_PORT`, `PLAYWRIGHT_PORT`, `PLEACH_DB_NAME` and `COMPOSE_PROJECT_NAME`.
+Git isolates files; it does not isolate a database or a container name — two
+sessions migrating the same database collide in state and nothing in git will show
+it. `pleach open` sources it for the command it launches; a shell you opened
+yourself has not.
+
+## The blind spot isolation buys
+
+Worktrees move collisions to merge time — and hide them until then. Work in another
+session is invisible to yours by construction.
+
+- `pleach conflicts` — git's own three-way merge between every pair of session
+  branches, in memory. WOULD CONFLICT is git's verdict, not a guess; ALSO TOUCHED
+  merges cleanly today. Always exits 0.
+- `pleach each '<command>'` — runs it in the canonical and in every session. Use it
+  before claiming any workspace-wide identifier: a migration number, an RFC number,
+  a port, a feature-flag name. What your worktree lists is not evidence it is free.
+
+## Read the map as data
+
+`pleach ls --json` is the machine surface: `canonical`, `sessions_dir`, `base`, and
+per session `name`, `index`, `port_base`, `slug`, `cut_from`, `path`, `branch`, `subs`. Parse
+that. Do not scrape `pleach ls` or `pleach ls -l` — those are formatted for people.
+There is no MCP server; the shell-out is the interface, deliberately.
+
+## Reporting commands are not acting commands
+
+|                       | Default behaviour                       | What makes it act            |
+| --------------------- | --------------------------------------- | ---------------------------- |
+| `pleach prune`        | lists fully integrated sessions          | `pleach prune --apply`       |
+| `pleach clean`        | lists git-ignored artifacts, with sizes  | `pleach clean --apply`       |
+| `pleach sync --all`   | refuses without a TTY                    | `pleach sync --all --yes`    |
+| `pleach rm <name>`    | refuses while work is pending            | `--force` (branches holding unintegrated commits are still kept) |
+
+Reporting a dry run as though it acted is the easiest way to be wrong with this
+tool. No `--apply`, nothing removed.
+
+"Integrated" is judged against the **local** base, and `sync` integrates the local
+base rather than reaching for origin. A PR merged on the remote is invisible until
+`git fetch` — so pass `--fetch`, or pull in the canonical first.
+
+## Quick reference
+
+| Goal                      | Command                                                                       |
+| ------------------------- | ----------------------------------------------------------------------------- |
+| Start work on a task      | `pleach open <name>` — creates the session if it does not exist               |
+| ... with another tool     | `pleach open <name> codex`                                                    |
+| Machine-readable map      | `pleach ls --json`                                                            |
+| Where does it live        | `pleach path <name>`                                                          |
+| Bring the base in         | `pleach sync <name>` (`--fetch` to advance the base first)                    |
+| Will these collide?       | `pleach conflicts`                                                            |
+| Ask every session         | `pleach each 'git log --oneline -1'`                                          |
+| Mount a new sub-repo      | `pleach add <name> <sub>`, or `pleach repos --sync` for every session         |
+| Workspace health          | `pleach doctor` — non-zero on findings; `--fix` does only the two repairs that cannot lose work |
+| After a merge lands       | `pleach prune`, then `pleach prune --apply`                                   |
+| Build on unmerged work    | `pleach new <name> --from <session>` — integrates against a moving target     |
+
+## Red flags — stop
+
+- Running `rm`, `prune --apply` or `clean --apply` from inside a session.
+- Running a deploy, a publish or `terraform apply` from inside a session.
+- Reporting a `prune` or `clean` listing as work performed.
+- Starting a dev server, a migration or a container without `source .session-env`.
+- Choosing a migration, RFC or port number from what a single worktree can see.
+- Piping `pleach ls` through grep or sed instead of using `--json`.
+
+## Rationalizations
+
+| Thought                                                  | Reality                                                                 |
+| -------------------------------------------------------- | ----------------------------------------------------------------------- |
+| "They asked me to tidy up, so I will remove this session." | You are inside it. Name what should go and let it be run outside.      |
+| "It is a one-line deploy and the code is identical."      | The environment is shared. That is the collision git cannot see.        |
+| "`clean` listed the folders, so they are gone."           | Dry run. Nothing was deleted.                                           |
+| "`pleach ls` is easy enough to grep."                     | It is a human format with no stability guarantee. `--json` is the contract. |
+| "Nothing else touches this file."                         | You cannot see the other sessions. `pleach conflicts` can.              |
+| "The PR merged, so `sync`/`prune` will see it."           | Only the *local* base counts. `git fetch` first, or pass `--fetch`.     |
+| "The ports are only defaults, it will be fine."           | Two sessions on one port is the exact failure `.session-env` prevents.  |
+PLEACH_SKILL_EOF
+}
+
+cmd_skill() {
+  local dest="" chosen="" flag
+  while [ $# -gt 0 ]; do
+    flag="$1"
+    case "$1" in
+      --install)  dest="$HOME/.claude/skills/pleach" ;;
+      --project)  dest="$PWD/.claude/skills/pleach" ;;
+      --dir)      shift
+                  [ $# -gt 0 ] && [ -n "$1" ] || err "--dir needs a path"
+                  # A following flag is a typo, not a directory: without this,
+                  # `--dir --install` reaches mkdir and fails in mkdir's words.
+                  case "$1" in -*) err "--dir needs a path, got the flag $1 (for a path starting with '-', use --dir=$1)" ;; esac
+                  flag="--dir"; dest="$1/pleach" ;;
+      --dir=*)    [ -n "${1#--dir=}" ] || err "--dir needs a path"
+                  flag="--dir"; dest="${1#--dir=}/pleach" ;;
+      -*)         err "unknown flag: $1 (usage: pleach skill [--install|--project|--dir <path>])" ;;
+      *)          err "unexpected argument: $1 (usage: pleach skill [--install|--project|--dir <path>])" ;;
+    esac
+    # One destination only — silently honouring the last flag would be a trap.
+    [ -z "$chosen" ] || err "pick a single destination, not both $chosen and $flag"
+    chosen="$flag"
+    shift
+  done
+  # No config is loaded on purpose: the skill must be installable before pleach
+  # has been adopted anywhere, and from any directory.
+  if [ -z "$dest" ]; then skill_doc; return 0; fi
+  mkdir -p "$dest" || err "cannot create $dest"
+  skill_doc > "$dest/SKILL.md"
+  info "skill written to $dest/SKILL.md"
+  info "it is a copy, not a link — re-run this after upgrading pleach"
+}
+
+# ---------------------------------------------------------------------------
 cmd_install() {
   local target="$HOME/.local/bin/pleach" src
   src=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
@@ -1827,7 +1982,7 @@ Sessions
   prune [--apply]           List (and with --apply remove) fully integrated sessions.
   clean [<session>]         Delete git-ignored artifacts (node_modules, builds…).
   each '<command>'          Run a command in the canonical and in each session root.
-  conflicts                 Show files being edited in more than one session.
+  conflicts                 Report what parallel sessions would break in each other at merge.
 
 Workspace
   init [--default]          Adopt pleach in the current repo (writes .pleach.conf).
@@ -1835,6 +1990,7 @@ Workspace
   doctor [--fix]            Check the workspace for drift, stale locks and port clashes.
 
 Tool
+  skill [--install]         Emit (or install) the agent skill that teaches an LLM to drive pleach.
   shell-init                Emit the shell wrapper that enables `pleach cd`.
   completions <bash|zsh>    Emit the completion script for your shell.
   install                   Copy this script to ~/.local/bin/pleach.
@@ -1845,6 +2001,7 @@ Tool
 e.g. pleach open fix-login          create/open and get to work
      pleach repos --sync            adopt a new workspace repo (e.g. payments)
      pleach sync fix-login          bring the session up to date with main
+     pleach skill --install         teach your LLM to drive pleach
 EOF
 }
 
@@ -2067,6 +2224,29 @@ its parent's directory. It needs the wrapper:
 Without the wrapper the command explains itself rather than failing silently.
 EOF
     ;;
+    skill) cat <<'EOF'
+pleach skill [--install | --project | --dir <path>]
+
+Emits the agent skill: a single Markdown file, with the frontmatter the skill
+runtimes expect, that teaches an LLM to drive pleach — the boundary between the
+canonical and a session, the runtime state git does not isolate, which commands
+only report and which ones act, and how to read the map as JSON instead of
+scraping human output.
+
+With no flags it prints to stdout, which is the portable form: pipe it into any
+tool, any model, any file your runtime reads.
+
+  --install     Write to ~/.claude/skills/pleach/SKILL.md — personal, every project.
+  --project     Write to ./.claude/skills/pleach/SKILL.md — commit it and the whole
+                team's agents get it.
+  --dir P       Write to P/pleach/SKILL.md — for any other runtime's skills folder.
+
+The skill lives inside this script, so a `pleach` copied anywhere still emits it.
+What is written is a COPY: re-run this after upgrading pleach.
+
+Needs no workspace and no .pleach.conf — install it before adopting pleach.
+EOF
+      ;;
     shell-init) cat <<'EOF'
 pleach shell-init
 
@@ -2220,9 +2400,10 @@ case "$cmd" in
   conflicts) cmd_conflicts "$@" ;;
   completions) cmd_completions "$@" ;;
   shell-init)  cmd_shell_init "$@" ;;
+  skill)   cmd_skill "$@" ;;
   install) cmd_install "$@" ;;
   update)  cmd_update "$@" ;;
   version|--version|-V) echo "pleach $PLEACH_VERSION" ;;
   help|-h|--help) cmd_help "$@" ;;
-  *) err "unknown command: $cmd (init|new|open|add|sync|repos|rm|prune|clean|each|ls|path|cd|doctor|conflicts|completions|shell-init|install|update|version|help)" ;;
+  *) err "unknown command: $cmd (init|new|open|add|sync|repos|rm|prune|clean|each|ls|path|cd|doctor|conflicts|skill|completions|shell-init|install|update|version|help)" ;;
 esac
