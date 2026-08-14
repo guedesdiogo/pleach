@@ -815,8 +815,10 @@ FM=$(printf '%s\n' "$OUT" | awk 'NR==1{next} /^---$/{exit} {print}')
 assert_true "skill: frontmatter fits the 1024-character budget" [ "${#FM}" -le 1024 ]
 
 # Anti-drift: every `pleach <command>` the skill names must exist in the dispatcher.
-DISPATCH=$(grep -oE '^  [a-zA-Z|-]+\)[[:space:]]*(cmd_[a-z_]+|echo)' "$PLEACH" \
-  | sed 's/).*//' | tr -d ' ' | tr '|' '\n' | sort -u)
+# Anchored to the final `case "$cmd"` block rather than matched by indentation, so
+# a case label added elsewhere can never widen what counts as a real command.
+DISPATCH=$(awk '/^case "\$cmd" in$/,/^esac$/' "$PLEACH" \
+  | grep -oE '^  [a-zA-Z|-]+\)' | tr -d ' )' | tr '|' '\n' | sort -u)
 NAMED=$(printf '%s\n' "$OUT" | grep -oE '`pleach [a-z-]+' | sed 's/`pleach //' | sort -u)
 assert_true "skill: names 10+ commands (proves the extraction is not silently empty)" \
   [ "$(printf '%s\n' "$NAMED" | grep -c .)" -ge 10 ]
@@ -858,6 +860,15 @@ assert_contains "skill: tells you to pick one" "$OUT" "pick a single destination
 run "$PLEACH" skill --dir
 assert_rc "skill --dir with no path: error" "$RC" 1
 assert_contains "skill --dir with no path: says which flag" "$OUT" "--dir needs a path"
+
+# A following flag is a typo, not a directory. Without the guard this reached
+# mkdir and failed in mkdir's words, having already accepted "--install" as a path.
+run "$PLEACH" skill --dir --install
+assert_rc "skill --dir swallowing a flag: error" "$RC" 1
+assert_contains "skill --dir swallowing a flag: names the flag" "$OUT" "got the flag --install"
+assert_not_contains "skill --dir swallowing a flag: does not reach mkdir" "$OUT" "mkdir"
+assert_true "skill --dir swallowing a flag: created nothing" \
+  bash -c "! [ -e '--install' ] && ! [ -e './--install' ]"
 
 run "$PLEACH" skill --bogus
 assert_rc "skill: unknown flag is an error" "$RC" 1

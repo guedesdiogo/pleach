@@ -1888,6 +1888,9 @@ cmd_skill() {
       --project)  dest="$PWD/.claude/skills/pleach" ;;
       --dir)      shift
                   [ $# -gt 0 ] && [ -n "$1" ] || err "--dir needs a path"
+                  # A following flag is a typo, not a directory: without this,
+                  # `--dir --install` reaches mkdir and fails in mkdir's words.
+                  case "$1" in -*) err "--dir needs a path, got the flag $1 (for a path starting with '-', use --dir=$1)" ;; esac
                   flag="--dir"; dest="$1/pleach" ;;
       --dir=*)    [ -n "${1#--dir=}" ] || err "--dir needs a path"
                   flag="--dir"; dest="${1#--dir=}/pleach" ;;
