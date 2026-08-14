@@ -191,6 +191,9 @@ eval "$(pleach completions zsh)"     # or: completions bash
 function running in your own shell can change that shell's directory. Rather than
 pretend otherwise, `pleach cd` without the wrapper prints the one line that fixes it.
 
+If a coding agent will be using this workspace, `pleach skill --install` teaches it how —
+see [Teach your agent to drive it](#teach-your-agent-to-drive-it).
+
 ### Platforms
 
 Requirements: git >= 2.15 (worktrees) and bash >= 3.2 (the bash macOS ships).
@@ -266,12 +269,13 @@ pleach sync --all --yes              # every session (explicit --yes outside a T
 pleach add fix-x payments            # mount a new sub-repo into an existing session
 pleach repos --sync                  # adopt a new workspace repo across ALL sessions
 
-pleach conflicts                     # files being edited in more than one session
+pleach conflicts                     # what sessions would break in each other at merge
 pleach each 'git log --oneline -1'   # run a command in the canonical + every session
 pleach clean fix-x --apply           # delete git-ignored artifacts (node_modules, builds)
 pleach rm fix-x --reap               # remove the session; --reap kills leftover listeners
 pleach prune --apply                 # remove every fully integrated session
 
+pleach skill --install               # teach your coding agent to drive all of the above
 pleach help sync                     # detailed help per command (and `help config`)
 ```
 
@@ -349,6 +353,34 @@ After moving to pleach:
 - isolation verified: a commit in one session invisible to the others and to the canonical;
 - 6 sessions now cost about what 1 replica used to.
 
+## Teach your agent to drive it
+
+```bash
+pleach skill --install       # ~/.claude/skills/pleach/SKILL.md — personal, every project
+pleach skill --project       # ./.claude/skills/pleach/ — commit it, the whole team's agents get it
+pleach skill --dir <path>    # any other runtime's skills folder
+pleach skill                 # just print it: pipe into any tool, any model
+```
+
+`pleach skill` emits a Markdown skill, frontmatter and all, covering the parts of this tool
+an LLM cannot infer from `--help`: that lifecycle belongs outside a session and
+implementation inside one, that `.session-env` carries the state git does not isolate, that
+`prune` and `clean` only *report* until `--apply`, that `ls --json` is the contract and the
+human output is not, and that work in another session stays invisible until `conflicts` asks
+git about it.
+
+It lives inside the script rather than beside it, exactly like `completions` and
+`shell-init`. A skill shipped as a separate file is a path that is right in the repo and
+wrong in every install; one emitted by the binary is right everywhere the binary is. What
+gets written is a copy, so re-run it after upgrading.
+
+The suite holds the skill to its own claims: every command it names must exist in the
+dispatcher or the build fails. That assertion was mutation-tested in both directions — a
+skill citing a command that does not exist, and a dispatcher losing a command the skill
+still cites — and it caught both.
+
+The skill teaches; the hooks below enforce.
+
 ## Guard hooks for coding agents
 
 Two optional hooks live in [`examples/`](examples/), both path-agnostic — they find the
@@ -364,7 +396,7 @@ session and the canonical by their markers rather than by hardcoded directories:
 ## Tests
 
 ```bash
-tests/run.sh          # 177 assertions across 28 scenarios, in a throwaway sandbox
+tests/run.sh          # 222 assertions across 34 scenarios, in a throwaway sandbox
 tests/no-leaks.sh     # repository hygiene gate
 shellcheck pleach install.sh tests/*.sh examples/*.sh
 ```
@@ -378,7 +410,9 @@ checked), `doctor` against a planted stale lock and a planted conf/disk drift, `
 conflict and a mere overlap (the decisive assertion is that a file two sessions edit in
 *distant regions* is reported as an overlap and **not** as a conflict — the exact case the
 old heuristic got wrong), `new --from` stacking a session on another's unmerged commits,
-help coverage for every command, and that `open` really runs inside the session. It pins `PLEACH_EXPECT_CANONICAL` to its own sandbox so it
+help coverage for every command, the emitted agent skill (frontmatter, its
+character budget, all three install destinations and the anti-drift check), and that `open`
+really runs inside the session. It pins `PLEACH_EXPECT_CANONICAL` to its own sandbox so it
 cannot escape.
 
 The suite earns its keep: `conflicts` shipped with a defect its own test caught — an `EXIT`

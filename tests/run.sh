@@ -799,6 +799,79 @@ assert_contains "conflicts: checks a sub mounted outside the conf" "$BLOCK" "(su
 assert_contains "conflicts: names the conflicting file in that sub" "$BLOCK" "shared.txt"
 
 # ---------------------------------------------------------------------------
+header "Test 33: the emitted skill is valid and cannot name a command that does not exist"
+# ---------------------------------------------------------------------------
+# A reference whose facts drift is worse than no reference, because an agent
+# trusts it. These assertions fail the build the day the skill mentions a command
+# the dispatcher lost, or loses the frontmatter its runtime needs to load it.
+run "$PLEACH" skill
+assert_rc "skill: rc 0" "$RC" 0
+assert_eq "skill: opens with the frontmatter fence" "$(printf '%s' "$OUT" | head -1)" "---"
+assert_contains "skill: declares its name" "$OUT" "name: pleach"
+assert_contains "skill: the description says WHEN to use it" "$OUT" "description: Use when"
+
+# The skill specification budgets 1024 characters for the frontmatter.
+FM=$(printf '%s\n' "$OUT" | awk 'NR==1{next} /^---$/{exit} {print}')
+assert_true "skill: frontmatter fits the 1024-character budget" [ "${#FM}" -le 1024 ]
+
+# Anti-drift: every `pleach <command>` the skill names must exist in the dispatcher.
+DISPATCH=$(grep -oE '^  [a-zA-Z|-]+\)[[:space:]]*(cmd_[a-z_]+|echo)' "$PLEACH" \
+  | sed 's/).*//' | tr -d ' ' | tr '|' '\n' | sort -u)
+NAMED=$(printf '%s\n' "$OUT" | grep -oE '`pleach [a-z-]+' | sed 's/`pleach //' | sort -u)
+assert_true "skill: names 10+ commands (proves the extraction is not silently empty)" \
+  [ "$(printf '%s\n' "$NAMED" | grep -c .)" -ge 10 ]
+UNKNOWN=""
+while IFS= read -r c; do
+  [ -n "$c" ] || continue
+  printf '%s\n' "$DISPATCH" | grep -qx "$c" || UNKNOWN="$UNKNOWN $c"
+done <<NAMED_EOF
+$NAMED
+NAMED_EOF
+assert_eq "skill: every command it names is a real one" "$UNKNOWN" ""
+
+# ---------------------------------------------------------------------------
+header "Test 34: skill installs to each destination, and refuses two at once"
+# ---------------------------------------------------------------------------
+SKILLHOME="$SANDBOX/skill-home"
+run env HOME="$SKILLHOME" "$PLEACH" skill --install
+assert_rc "skill --install: rc 0" "$RC" 0
+assert_true "skill --install: writes under HOME/.claude/skills/pleach" \
+  [ -f "$SKILLHOME/.claude/skills/pleach/SKILL.md" ]
+assert_true "skill --install: the file is byte-identical to stdout" \
+  bash -c "\"$PLEACH\" skill | diff -q - \"$SKILLHOME/.claude/skills/pleach/SKILL.md\""
+
+run "$PLEACH" skill --dir "$SANDBOX/runtimes"
+assert_rc "skill --dir: rc 0" "$RC" 0
+assert_true "skill --dir: writes <dir>/pleach/SKILL.md" \
+  [ -f "$SANDBOX/runtimes/pleach/SKILL.md" ]
+
+mkdir -p "$SANDBOX/projdir"
+run bash -c "cd \"$SANDBOX/projdir\" && \"$PLEACH\" skill --project"
+assert_rc "skill --project: rc 0" "$RC" 0
+assert_true "skill --project: writes ./.claude/skills/pleach" \
+  [ -f "$SANDBOX/projdir/.claude/skills/pleach/SKILL.md" ]
+
+run "$PLEACH" skill --install --project
+assert_rc "skill: two destinations is an error" "$RC" 1
+assert_contains "skill: tells you to pick one" "$OUT" "pick a single destination"
+
+run "$PLEACH" skill --dir
+assert_rc "skill --dir with no path: error" "$RC" 1
+assert_contains "skill --dir with no path: says which flag" "$OUT" "--dir needs a path"
+
+run "$PLEACH" skill --bogus
+assert_rc "skill: unknown flag is an error" "$RC" 1
+run "$PLEACH" skill stray-argument
+assert_rc "skill: stray argument is an error" "$RC" 1
+
+# `help skill` claims it needs no workspace. Strip both pleach variables and run
+# from a bare directory: safe to drop the guard rail here because with no
+# destination flag the command only writes to stdout.
+mkdir -p "$SANDBOX/nowhere"
+run bash -c "cd \"$SANDBOX/nowhere\" && env -u PLEACH_CANONICAL -u PLEACH_EXPECT_CANONICAL \"$PLEACH\" skill"
+assert_rc "skill: works with no workspace and no config" "$RC" 0
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
