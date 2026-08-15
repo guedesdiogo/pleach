@@ -33,6 +33,7 @@ SESSIONS="$SANDBOX/.sessions"
 # ---------------------------------------------------------------------------
 TESTS=0
 FAILS=0
+FAILED_NAMES=""
 
 ok() {
   TESTS=$((TESTS + 1))
@@ -42,6 +43,12 @@ ok() {
 fail() {
   TESTS=$((TESTS + 1))
   FAILS=$((FAILS + 1))
+  # Also collected for the summary. A count on its own is useless the moment the
+  # output is piped through `tail`, which is how it gets read from a gate or a CI
+  # log — "Failures: 4" with no names sends you back to re-run and hope it happens
+  # again. That is exactly what an intermittent failure will not do.
+  FAILED_NAMES="${FAILED_NAMES}  - $1
+"
   echo "  FAIL - $1" >&2
 }
 
@@ -1184,6 +1191,11 @@ assert_not_contains "doctor/skill: silent when no skill is installed" "$OUT" "ag
 echo ""
 echo "===================================="
 echo "Tests: $TESTS   Failures: $FAILS"
+if [ "$FAILS" -gt 0 ]; then
+  echo ""
+  echo "Failed:"
+  printf '%s' "$FAILED_NAMES"
+fi
 echo "===================================="
 
 [ "$FAILS" -eq 0 ]
