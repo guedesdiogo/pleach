@@ -956,26 +956,55 @@ header "Test 36: a run killed mid-creation leaves a lock doctor can name and --f
 # question rather than answering it, and skipping loudly beats a green tick.
 case "$(uname -s 2>/dev/null)" in
   MINGW*|MSYS*|CYGWIN*)
-    echo "  SKIPPED on Windows - the crash cannot be reproduced through Git Bash's"
-    echo "  process model; stale-lock recovery there remains UNTESTED (see comment)."
+    # The CRASH does not reproduce here — but the recovery logic can still be
+    # exercised, by planting a lock whose owner is a pid that is definitely dead.
+    # That answers "does doctor recognise a dead owner and release it on Windows",
+    # and leaves exactly one thing unanswered: whether a real crash on Windows
+    # produces this state in the first place.
+    echo "  (Windows: the crash itself does not reproduce through Git Bash's process"
+    echo "   model — planting a dead owner instead, to test the recovery path.)"
+    ( exit 0 ) & DEAD_PID=$!
+    wait "$DEAD_PID" 2>/dev/null || true
+    mkdir -p "$SESSIONS/.pleach.lock"
+    printf '%s %s\n' "$DEAD_PID" "$(uname -n 2>/dev/null || echo '?')" \
+      > "$SESSIONS/.pleach.lock/owner"
+
+    run "$PLEACH" doctor
+    assert_rc "windows/dead owner: doctor exits non-zero" "$RC" 1
+    assert_contains "windows/dead owner: doctor names it" "$OUT" "no longer running"
+
+    run "$PLEACH" doctor --fix
+    assert_true "windows/dead owner: --fix released the lock" \
+      [ ! -d "$SESSIONS/.pleach.lock" ]
+
+    run "$PLEACH" new after-crash --no-bootstrap
+    assert_rc "windows/dead owner: a session can be created after the repair" "$RC" 0
     ;;
   *)
-"$PLEACH" new crashy --no-bootstrap >/dev/null 2>&1 &
-CRASHY=$!
-CRASH_SEEN=0
-for _ in $(seq 1 400); do
-  [ -d "$SESSIONS/.pleach.lock" ] && { CRASH_SEEN=1; break; }
-  sleep 0.05
+# Catching a run mid-lock is inherently a race: between spotting the lock and
+# landing the kill, the run can finish on its own. On a loaded machine it does,
+# and four assertions then fail in a cascade that says nothing about pleach. So
+# retry, with a fresh session name each time, and fail loudly only if three
+# attempts all lose the race — never silently.
+CAUGHT=0
+for attempt in 1 2 3; do
+  "$PLEACH" new "crashy$attempt" --no-bootstrap >/dev/null 2>&1 &
+  CRASHY=$!
+  for _ in $(seq 1 400); do
+    [ -d "$SESSIONS/.pleach.lock" ] && break
+    sleep 0.05
+  done
+  if [ -d "$SESSIONS/.pleach.lock" ] && kill -0 "$CRASHY" 2>/dev/null; then
+    kill -9 "$CRASHY" 2>/dev/null || true
+    wait "$CRASHY" 2>/dev/null || true
+    # It only counts if the lock outlived it — SIGKILL runs no EXIT trap.
+    [ -d "$SESSIONS/.pleach.lock" ] && { CAUGHT=1; break; }
+  else
+    wait "$CRASHY" 2>/dev/null || true
+  fi
 done
-# Kill only what is demonstrably still running: SIGKILL against an already-exited
-# process would leave this scenario asserting a crash that never happened.
-CRASH_ALIVE=0
-kill -0 "$CRASHY" 2>/dev/null && CRASH_ALIVE=1
-kill -9 "$CRASHY" 2>/dev/null || true
-wait "$CRASHY" 2>/dev/null || true
 
-assert_eq "killed run: the lock was observed being held" "$CRASH_SEEN" "1"
-assert_eq "killed run: the process was still alive when it was killed" "$CRASH_ALIVE" "1"
+assert_eq "killed run: caught a run holding the lock, within 3 attempts" "$CAUGHT" "1"
 assert_true "killed run: the lock outlived the process (SIGKILL runs no EXIT trap)" \
   [ -d "$SESSIONS/.pleach.lock" ]
 
@@ -1086,6 +1115,68 @@ assert_contains "update (newer version): reports the version it landed on" "$OUT
 assert_eq "update (newer version): the installed copy is the new one" \
   "$("$UPD" version)" "pleach 9.9.9"
 assert_true "update (newer version): and it is executable" [ -x "$UPD" ]
+
+# ---------------------------------------------------------------------------
+header "Test 39: conflicts sees two sessions claiming one numbered slot"
+# ---------------------------------------------------------------------------
+# The collision git structurally cannot report: different filenames, so the merge
+# is clean, exits 0, and lands two migrations numbered the same. Everything else
+# in this command answers "would the merge break"; this answers "would the result
+# be wrong", which is a different question.
+mkdir -p "$SESSIONS/s3/migrations" "$SESSIONS/s4/migrations"
+echo "-- billing"    > "$SESSIONS/s3/migrations/0007_billing.sql"
+echo "-- last_login" > "$SESSIONS/s4/migrations/0007_last_login.sql"
+git -C "$SESSIONS/s3" add -A && git -C "$SESSIONS/s3" commit -q -m "s3 claims slot 0007"
+git -C "$SESSIONS/s4" add -A && git -C "$SESSIONS/s4" commit -q -m "s4 claims slot 0007"
+
+run "$PLEACH" conflicts
+assert_rc "slot clash: conflicts still exits 0" "$RC" 0
+assert_contains "slot clash: reports the shared slot" "$OUT" "slot 0007"
+assert_contains "slot clash: names s3's file" "$OUT" "0007_billing.sql"
+assert_contains "slot clash: names s4's file" "$OUT" "0007_last_login.sql"
+assert_contains "slot clash: says git merges it cleanly anyway" "$OUT" "merges these CLEANLY"
+
+# The decisive negative: one session using a slot twice is its own business, and a
+# check that cried wolf on that is a check nobody reads.
+echo "-- extra" > "$SESSIONS/s3/migrations/0008_a.sql"
+echo "-- extra" > "$SESSIONS/s3/migrations/0008_b.sql"
+git -C "$SESSIONS/s3" add -A && git -C "$SESSIONS/s3" commit -q -m "s3 takes 0008 twice, alone"
+run "$PLEACH" conflicts
+assert_not_contains "slot clash: one session using a slot twice is not reported" "$OUT" "slot 0008"
+
+# ---------------------------------------------------------------------------
+header "Test 40: doctor notices an installed agent skill that no longer matches"
+# ---------------------------------------------------------------------------
+# The skill is written as a COPY, so it ages the moment pleach is upgraded — and a
+# stale one is not harmless: an earlier revision of it made agents refuse
+# legitimate work. HOME is redirected so the real one is never touched.
+DOC_HOME="$SANDBOX/doctor-home"
+mkdir -p "$DOC_HOME"
+run env HOME="$DOC_HOME" "$PLEACH" skill --install
+assert_rc "doctor/skill: install into the redirected HOME" "$RC" 0
+
+run env HOME="$DOC_HOME" "$PLEACH" doctor
+assert_contains "doctor/skill: a fresh copy is reported as matching" "$OUT" "matches this pleach"
+
+printf '\nstale text from an older pleach\n' >> "$DOC_HOME/.claude/skills/pleach/SKILL.md"
+run env HOME="$DOC_HOME" "$PLEACH" doctor
+assert_rc "doctor/skill: a stale copy makes doctor exit non-zero" "$RC" 1
+assert_contains "doctor/skill: and names the refresh command" "$OUT" "pleach skill --install"
+
+# A COMMITTED copy ages the same way, and doctor knows where the canonical is, so
+# there is no excuse for only watching the personal one.
+run bash -c "cd \"$CANON\" && \"$PLEACH\" skill --project"
+assert_rc "doctor/skill: install a project copy in the canonical" "$RC" 0
+printf '\nstale project text\n' >> "$CANON/.claude/skills/pleach/SKILL.md"
+run env HOME="$SANDBOX/empty-home" "$PLEACH" doctor
+assert_rc "doctor/skill: a stale PROJECT copy also fails doctor" "$RC" 1
+assert_contains "doctor/skill: and names the project refresh flag" "$OUT" "pleach skill --project"
+rm -f "$CANON/.claude/skills/pleach/SKILL.md"
+
+# No copy installed at all must stay silent — most users have none.
+mkdir -p "$SANDBOX/empty-home"
+run env HOME="$SANDBOX/empty-home" "$PLEACH" doctor
+assert_not_contains "doctor/skill: silent when no skill is installed" "$OUT" "agent skill"
 
 # ---------------------------------------------------------------------------
 # Summary

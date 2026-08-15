@@ -12,7 +12,7 @@
 # shellcheck disable=SC2015  # deliberate idiom: [ -z "$x" ] && x=… || err (err never runs after an assignment)
 set -euo pipefail
 
-PLEACH_VERSION="1.3.3"
+PLEACH_VERSION="1.3.4"
 
 CONF_NAME=".pleach.conf"
 USER_CONF="$HOME/.config/pleach/config"
@@ -1578,16 +1578,63 @@ EOF
     echo ""
   fi
 
+  # -------------------------------------------------------------------------
+  # 3. The same numbered slot, claimed by different filenames.
+  #
+  # git's merge cannot see this one and never will: two sessions adding
+  # 0004_billing.sql and 0004_last_login.sql are adding DIFFERENT files, so the
+  # merge is clean, exits 0, and lands two migrations both numbered 0004. The
+  # sequence is a shared namespace living inside the filename, and nothing in git
+  # models it. Covers the common NNNN_name / NNN-name convention only.
+  # -------------------------------------------------------------------------
+  local slots
+  slots=$(awk -F'\t' '
+    {
+      path = $1; sess = $2
+      n = split(path, p, "/"); base = p[n]
+      dir = substr(path, 1, length(path) - length(base))
+      if (base ~ /^[0-9]+[-_]/) {
+        match(base, /^[0-9]+/); pref = substr(base, RSTART, RLENGTH)
+        key = dir "|" pref
+        pair = base "\t" sess
+        if (!(key SUBSEP pair in seen)) {
+          seen[key SUBSEP pair] = 1
+          rows[key] = rows[key] sprintf("        %-28s (%s)\n", base, sess)
+          if (!(key SUBSEP base in ub)) { ub[key SUBSEP base] = 1; nbase[key]++ }
+          if (!(key SUBSEP sess in us)) { us[key SUBSEP sess] = 1; nsess[key]++ }
+        }
+      }
+    }
+    END {
+      for (k in rows) {
+        if (nbase[k] < 2 || nsess[k] < 2) continue
+        i = index(k, "|")
+        printf "  %s   slot %s\n%s", substr(k, 1, i - 1), substr(k, i + 1), rows[k]
+      }
+    }
+  ' "$tmp")
+
+  if [ -n "$slots" ]; then
+    echo "Same numbered slot, different filenames — git merges these CLEANLY and they are"
+    echo "still wrong. The sequence is a shared namespace git does not model:"
+    echo ""
+    printf '%s\n' "$slots"
+    echo ""
+  fi
+
   if [ "$degraded" -eq 1 ]; then
     warn "git $(git --version | awk '{print $3}') has no 'merge-tree --write-tree' (needs 2.38)"
     warn "— only the overlap heuristic above ran; real conflicts were NOT decided"
   fi
 
-  if [ "$real" -eq 0 ] && [ -z "$overlaps" ]; then
+  if [ "$real" -eq 0 ] && [ -z "$overlaps" ] && [ -z "$slots" ]; then
     echo "No file is being edited in more than one session."
     return 0
   fi
-  if [ "$real" -eq 0 ]; then
+  if [ "$real" -eq 0 ] && [ -n "$slots" ]; then
+    echo "Nothing would conflict TEXTUALLY at merge — but a clean merge is not the same"
+    echo "question as a correct result, and the slot clash above is the difference."
+  elif [ "$real" -eq 0 ]; then
     echo "Nothing would conflict at merge as things stand."
   else
     echo "Overlap is normal; a real conflict is a decision waiting to happen. Both resolve"
@@ -1747,6 +1794,22 @@ cmd_doctor() {
   done < <(session_names)
   [ "$found" -eq 0 ] && dr_note "(no sessions)"
 
+  # An installed agent skill is a COPY, so it ages the moment pleach is upgraded —
+  # silently, which is the worst way for guidance to be wrong. Reported, never
+  # repaired: the file is generated, but it is also editable, and --fix is
+  # reserved for repairs that cannot lose work.
+  local skill_copy how
+  for skill_copy in "$HOME/.claude/skills/pleach/SKILL.md" \
+                    "$CANONICAL/.claude/skills/pleach/SKILL.md"; do
+    [ -f "$skill_copy" ] || continue
+    case "$skill_copy" in "$CANONICAL"/*) how="--project" ;; *) how="--install" ;; esac
+    if skill_doc | cmp -s - "$skill_copy"; then
+      dr_ok "the agent skill at $skill_copy matches this pleach"
+    else
+      dr_bad "the agent skill at $skill_copy is from a different pleach — refresh with: pleach skill $how"
+    fi
+  done
+
   echo ""
   if [ "$DOCTOR_PROBLEMS" -eq 0 ]; then
     echo "✅ no problems found."
@@ -1798,12 +1861,15 @@ Worktrees move collisions to merge time — and hide them until then. Work in an
 session is invisible to yours by construction.
 
 - `pleach conflicts` — git's own three-way merge between every pair of session
-  branches, in memory. WOULD CONFLICT is git's verdict, not a guess; ALSO TOUCHED
-  merges cleanly today. Always exits 0.
-  **A green result is not compatibility.** It answers "would this merge textually
-  conflict?", never "is the combined result correct?". Two sessions adding
-  `0004_billing.sql` and `0004_last_login.sql` merge clean, exit 0, and are wrong.
-  A green answer from a check whose scope does not cover your question is not evidence.
+  branches, in memory, plus a check for two sessions claiming the same numbered
+  slot (`0004_billing.sql` against `0004_last_login.sql`: different files, so git
+  merges them clean and lands two migrations numbered 0004). Always exits 0.
+  **A green result is still not compatibility.** It answers "would this merge
+  conflict?" and "is a numbered slot claimed twice?" — never "is the combined
+  result correct?". Duplicate route paths, two features taking one feature-flag
+  name, the same port hardcoded twice: all merge clean and none of them show up
+  here. A green answer from a check whose scope does not cover your question is
+  not evidence.
 - `pleach each '<command>'` — runs it in the canonical and in every session. Use it
   before claiming any workspace-wide identifier: a migration number, an RFC number,
   a port, a feature-flag name. What your worktree lists is not evidence it is free.
@@ -1841,7 +1907,7 @@ away, and the baseline agents this skill was tested against all reached for it f
 | Thought                                                  | Reality                                                                 |
 | -------------------------------------------------------- | ----------------------------------------------------------------------- |
 | "They asked me to tidy up, so I will remove this session." | Other sessions are fine. Removing the one you occupy pulls the ground from under you — name it, let it run outside. |
-| "`conflicts` was green, so the sessions are compatible."  | It ruled out a textual merge conflict, nothing else. Two differently-named files still collide in meaning. |
+| "`conflicts` was green, so the sessions are compatible."  | It ruled out a textual merge conflict and a twice-claimed numbered slot. Two files can still collide in meaning without either. |
 | "It is a one-line deploy and the code is identical."      | The environment is shared. That is the collision git cannot see.        |
 | "Nothing else touches this file."                         | You cannot see the other sessions. `pleach conflicts` can — for files.  |
 | "The next number is whatever my worktree does not have."  | Your worktree answers what *you* have, never what is taken. `pleach each`. |
@@ -2148,7 +2214,7 @@ EOF
 pleach conflicts
 
 Answers, before you merge anything, what parallel sessions have done to each
-other. Two separate questions, reported separately because they are not equally
+other. Three separate questions, reported separately because they are not equally
 serious:
 
   WOULD CONFLICT   git performs the three-way merge between each pair of session
@@ -2162,8 +2228,15 @@ serious:
                    it cleanly today -- or the work is not committed yet, so no
                    merge can be decided. Worth knowing, not worth stopping for.
 
-Both cover every repo of every session, counting committed work since the session
-branched as well as uncommitted changes.
+  SAME SLOT        two sessions claiming one numbered slot with different
+                   filenames -- 0004_billing.sql against 0004_last_login.sql.
+                   git merges these CLEANLY, because they are different files,
+                   and lands two migrations numbered 0004. The sequence is a
+                   shared namespace living inside the filename, and nothing in
+                   git models it. Covers the NNNN_name / NNN-name convention.
+
+All three cover every repo of every session, counting committed work since the
+session branched as well as uncommitted changes.
 
 Worktrees move collisions from the working tree to merge time, which is the
 point. The side effect is that they also HIDE them until then: parallel work in
