@@ -12,7 +12,7 @@
 # shellcheck disable=SC2015  # deliberate idiom: [ -z "$x" ] && x=… || err (err never runs after an assignment)
 set -euo pipefail
 
-PLEACH_VERSION="1.3.0"
+PLEACH_VERSION="1.3.1"
 
 CONF_NAME=".pleach.conf"
 USER_CONF="$HOME/.config/pleach/config"
@@ -1785,7 +1785,7 @@ A `.pleach.conf` and no `.session-env` means you are in the canonical checkout.
 |                                | Canonical (outside)                     | Inside a session                                                        |
 | ------------------------------ | --------------------------------------- | ----------------------------------------------------------------------- |
 | Purpose                        | integration, releases, session lifecycle | implementing one task                                                    |
-| Create / remove / prune sessions | yes                                    | **no** — you would be cutting the branch you are sitting on              |
+| Remove / prune sessions        | yes                                     | other sessions only. `rm` refuses your own **only while it still holds pending work**, and `prune --apply` sweeps every integrated session — including the one you stand in |
 | Deploy, publish, `terraform apply` | yes                                  | **no** — two sessions collide in the *environment*; git isolates files, not environments |
 | Edit code                      | prefer a session                        | yes, that is the job                                                     |
 
@@ -1813,6 +1813,10 @@ session is invisible to yours by construction.
 - `pleach conflicts` — git's own three-way merge between every pair of session
   branches, in memory. WOULD CONFLICT is git's verdict, not a guess; ALSO TOUCHED
   merges cleanly today. Always exits 0.
+  **A green result is not compatibility.** It answers "would this merge textually
+  conflict?", never "is the combined result correct?". Two sessions adding
+  `0004_billing.sql` and `0004_last_login.sql` merge clean, exit 0, and are wrong.
+  A green answer from a check whose scope does not cover your question is not evidence.
 - `pleach each '<command>'` — runs it in the canonical and in every session. Use it
   before claiming any workspace-wide identifier: a migration number, an RFC number,
   a port, a feature-flag name. What your worktree lists is not evidence it is free.
@@ -1858,7 +1862,9 @@ base rather than reaching for origin. A PR merged on the remote is invisible unt
 
 ## Red flags — stop
 
-- Running `rm`, `prune --apply` or `clean --apply` from inside a session.
+- Removing the session you stand in — directly with `rm`, or by letting
+  `prune --apply` sweep it once its work has landed.
+- Treating a green `pleach conflicts` as proof that parallel work is compatible.
 - Running a deploy, a publish or `terraform apply` from inside a session.
 - Reporting a `prune` or `clean` listing as work performed.
 - Starting a dev server, a migration or a container without `source .session-env`.
@@ -1869,7 +1875,8 @@ base rather than reaching for origin. A PR merged on the remote is invisible unt
 
 | Thought                                                  | Reality                                                                 |
 | -------------------------------------------------------- | ----------------------------------------------------------------------- |
-| "They asked me to tidy up, so I will remove this session." | You are inside it. Name what should go and let it be run outside.      |
+| "They asked me to tidy up, so I will remove this session." | Other sessions are fine. Removing the one you occupy pulls the ground from under you — name it, let it run outside. |
+| "`conflicts` was green, so the sessions are compatible."  | It ruled out a textual merge conflict, nothing else. Two differently-named files still collide in meaning. |
 | "It is a one-line deploy and the code is identical."      | The environment is shared. That is the collision git cannot see.        |
 | "`clean` listed the folders, so they are gone."           | Dry run. Nothing was deleted.                                           |
 | "`pleach ls` is easy enough to grep."                     | It is a human format with no stability guarantee. `--json` is the contract. |
