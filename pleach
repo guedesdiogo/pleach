@@ -1884,11 +1884,13 @@ cmd_skill() {
 cmd_install() {
   local target_dir="$HOME/.local/bin" target src
   mkdir -p "$target_dir"
-  # Both sides go through cd+pwd before being compared. Comparing the raw strings
-  # let any non-normalised HOME — a trailing slash, a doubled slash, a symlink —
-  # walk straight past this guard, and then cp refused in its own words instead.
-  target=$(cd "$target_dir" && pwd)/pleach
-  src=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+  # Both sides are resolved to a PHYSICAL path before being compared. Comparing
+  # the raw strings let any non-normalised HOME — a trailing slash, a doubled
+  # slash — walk straight past this guard, and cp then refused in its own words
+  # instead of pleach's. Plain `pwd` is not enough either: it is logical, so a
+  # symlinked home resolves on one side of the comparison and not the other.
+  target=$(cd "$target_dir" && pwd -P)/pleach
+  src=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
   [ "$src" = "$target" ] && err "you are running the installed copy — run install from the source checkout (the pleach repo)"
   cp "$src" "$target"
   chmod +x "$target"

@@ -1002,6 +1002,14 @@ run env HOME="$INSTALL_HOME" "$INSTALL_HOME/.local/bin/pleach" install
 assert_rc "install: refuses when run from the installed copy" "$RC" 1
 assert_contains "install: and says which copy it is" "$OUT" "installed copy"
 
+# The same, reached through a SYMLINKED home. Plain `pwd` is logical, so it would
+# report the symlink on one side of the comparison and the real path on the other
+# — the guard passes only if both sides are resolved physically.
+ln -s "$INSTALL_HOME" "$SANDBOX/linked-home"
+run env HOME="$SANDBOX/linked-home" "$SANDBOX/linked-home/.local/bin/pleach" install
+assert_rc "install: refuses through a symlinked HOME too" "$RC" 1
+assert_contains "install: and still names the installed copy" "$OUT" "installed copy"
+
 # ---------------------------------------------------------------------------
 header "Test 38: update verifies what it downloaded BEFORE replacing anything"
 # ---------------------------------------------------------------------------
