@@ -1156,12 +1156,22 @@ run env HOME="$DOC_HOME" "$PLEACH" skill --install
 assert_rc "doctor/skill: install into the redirected HOME" "$RC" 0
 
 run env HOME="$DOC_HOME" "$PLEACH" doctor
-assert_contains "doctor/skill: a fresh copy is reported as matching" "$OUT" "agent skill matches"
+assert_contains "doctor/skill: a fresh copy is reported as matching" "$OUT" "matches this pleach"
 
 printf '\nstale text from an older pleach\n' >> "$DOC_HOME/.claude/skills/pleach/SKILL.md"
 run env HOME="$DOC_HOME" "$PLEACH" doctor
 assert_rc "doctor/skill: a stale copy makes doctor exit non-zero" "$RC" 1
 assert_contains "doctor/skill: and names the refresh command" "$OUT" "pleach skill --install"
+
+# A COMMITTED copy ages the same way, and doctor knows where the canonical is, so
+# there is no excuse for only watching the personal one.
+run bash -c "cd \"$CANON\" && \"$PLEACH\" skill --project"
+assert_rc "doctor/skill: install a project copy in the canonical" "$RC" 0
+printf '\nstale project text\n' >> "$CANON/.claude/skills/pleach/SKILL.md"
+run env HOME="$SANDBOX/empty-home" "$PLEACH" doctor
+assert_rc "doctor/skill: a stale PROJECT copy also fails doctor" "$RC" 1
+assert_contains "doctor/skill: and names the project refresh flag" "$OUT" "pleach skill --project"
+rm -f "$CANON/.claude/skills/pleach/SKILL.md"
 
 # No copy installed at all must stay silent — most users have none.
 mkdir -p "$SANDBOX/empty-home"

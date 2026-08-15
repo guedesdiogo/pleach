@@ -1798,14 +1798,17 @@ cmd_doctor() {
   # silently, which is the worst way for guidance to be wrong. Reported, never
   # repaired: the file is generated, but it is also editable, and --fix is
   # reserved for repairs that cannot lose work.
-  local skill_copy="$HOME/.claude/skills/pleach/SKILL.md"
-  if [ -f "$skill_copy" ]; then
+  local skill_copy how
+  for skill_copy in "$HOME/.claude/skills/pleach/SKILL.md" \
+                    "$CANONICAL/.claude/skills/pleach/SKILL.md"; do
+    [ -f "$skill_copy" ] || continue
+    case "$skill_copy" in "$CANONICAL"/*) how="--project" ;; *) how="--install" ;; esac
     if skill_doc | cmp -s - "$skill_copy"; then
-      dr_ok "the installed agent skill matches this pleach"
+      dr_ok "the agent skill at $skill_copy matches this pleach"
     else
-      dr_bad "the agent skill at $skill_copy is from a different pleach — refresh with: pleach skill --install"
+      dr_bad "the agent skill at $skill_copy is from a different pleach — refresh with: pleach skill $how"
     fi
-  fi
+  done
 
   echo ""
   if [ "$DOCTOR_PROBLEMS" -eq 0 ]; then
@@ -1904,7 +1907,7 @@ away, and the baseline agents this skill was tested against all reached for it f
 | Thought                                                  | Reality                                                                 |
 | -------------------------------------------------------- | ----------------------------------------------------------------------- |
 | "They asked me to tidy up, so I will remove this session." | Other sessions are fine. Removing the one you occupy pulls the ground from under you — name it, let it run outside. |
-| "`conflicts` was green, so the sessions are compatible."  | It ruled out a textual merge conflict, nothing else. Two differently-named files still collide in meaning. |
+| "`conflicts` was green, so the sessions are compatible."  | It ruled out a textual merge conflict and a twice-claimed numbered slot. Two files can still collide in meaning without either. |
 | "It is a one-line deploy and the code is identical."      | The environment is shared. That is the collision git cannot see.        |
 | "Nothing else touches this file."                         | You cannot see the other sessions. `pleach conflicts` can — for files.  |
 | "The next number is whatever my worktree does not have."  | Your worktree answers what *you* have, never what is taken. `pleach each`. |
@@ -2211,7 +2214,7 @@ EOF
 pleach conflicts
 
 Answers, before you merge anything, what parallel sessions have done to each
-other. Two separate questions, reported separately because they are not equally
+other. Three separate questions, reported separately because they are not equally
 serious:
 
   WOULD CONFLICT   git performs the three-way merge between each pair of session
@@ -2232,8 +2235,8 @@ serious:
                    shared namespace living inside the filename, and nothing in
                    git models it. Covers the NNNN_name / NNN-name convention.
 
-Both cover every repo of every session, counting committed work since the session
-branched as well as uncommitted changes.
+All three cover every repo of every session, counting committed work since the
+session branched as well as uncommitted changes.
 
 Worktrees move collisions from the working tree to merge time, which is the
 point. The side effect is that they also HIDE them until then: parallel work in

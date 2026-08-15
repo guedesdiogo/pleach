@@ -408,7 +408,7 @@ session and the canonical by their markers rather than by hardcoded directories:
 ## Tests
 
 ```bash
-tests/run.sh          # 277 assertions across 40 scenarios, in a throwaway sandbox
+tests/run.sh          # 280 assertions across 40 scenarios, in a throwaway sandbox
 tests/no-leaks.sh     # repository hygiene gate
 shellcheck pleach install.sh tests/*.sh examples/*.sh
 ```
