@@ -1,6 +1,6 @@
 {
   "name": "@diogoaguedes/pleach",
-  "version": "1.3.1",
+  "version": "1.3.2",
   "description": "Parallel, isolated work sessions for multi-repo workspaces: one git worktree per repo, with ports, secrets and lifecycle resolved",
   "keywords": [
     "git",
