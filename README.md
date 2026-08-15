@@ -363,11 +363,19 @@ pleach skill                 # just print it: pipe into any tool, any model
 ```
 
 `pleach skill` emits a Markdown skill, frontmatter and all, covering the parts of this tool
-an LLM cannot infer from `--help`: that lifecycle belongs outside a session and
-implementation inside one, that `.session-env` carries the state git does not isolate, that
-`prune` and `clean` only *report* until `--apply`, that `ls --json` is the contract and the
-human output is not, and that work in another session stays invisible until `conflicts` asks
-git about it.
+an LLM cannot infer from `--help`: that removing the session you stand in pulls the ground
+from under you (and that `prune --apply` can do it for you), that `.session-env` carries the
+state git does not isolate, that `prune` and `clean` only *report* until `--apply`, that
+`ls --json` is the contract and the human output is not, and that a green `conflicts` rules
+out a textual merge conflict and nothing more — two sessions adding `0004_billing.sql` and
+`0004_last_login.sql` merge clean and are wrong.
+
+Those last two points came out of testing the skill the way this project tests code: four
+agents were given realistic tasks in a throwaway pleach workspace *without* the skill, to
+find out which mistakes they actually make. They made almost none — `pleach help` is
+opinionated enough to carry most of it — but the exercise showed one rule in the skill was
+broader than the hazard it named, and surfaced the `conflicts` caveat the skill had been
+missing entirely.
 
 It lives inside the script rather than beside it, exactly like `completions` and
 `shell-init`. A skill shipped as a separate file is a path that is right in the repo and
