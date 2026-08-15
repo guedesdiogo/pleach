@@ -12,7 +12,7 @@
 # shellcheck disable=SC2015  # deliberate idiom: [ -z "$x" ] && x=… || err (err never runs after an assignment)
 set -euo pipefail
 
-PLEACH_VERSION="1.3.2"
+PLEACH_VERSION="1.3.3"
 
 CONF_NAME=".pleach.conf"
 USER_CONF="$HOME/.config/pleach/config"
@@ -1882,10 +1882,14 @@ cmd_skill() {
 
 # ---------------------------------------------------------------------------
 cmd_install() {
-  local target="$HOME/.local/bin/pleach" src
+  local target_dir="$HOME/.local/bin" target src
+  mkdir -p "$target_dir"
+  # Both sides go through cd+pwd before being compared. Comparing the raw strings
+  # let any non-normalised HOME — a trailing slash, a doubled slash, a symlink —
+  # walk straight past this guard, and then cp refused in its own words instead.
+  target=$(cd "$target_dir" && pwd)/pleach
   src=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
   [ "$src" = "$target" ] && err "you are running the installed copy — run install from the source checkout (the pleach repo)"
-  mkdir -p "$HOME/.local/bin"
   cp "$src" "$target"
   chmod +x "$target"
   info "installed at $target"
