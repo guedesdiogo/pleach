@@ -891,46 +891,33 @@ env_val() { # <session dir> <variable> -> its value in .session-env
 }
 
 # ---------------------------------------------------------------------------
-header "Test 35: the lock really blocks a second run — proved deterministically"
+header "Test 35: two creations contend for the lock, and never take the same index"
 # ---------------------------------------------------------------------------
-# Launching two runs and hoping they overlap proves nothing: if the first finishes
-# before the second starts, every assertion passes without contention ever having
-# happened. So hold the lock by hand, show a creation cannot proceed while it is
-# held, then release it and show the same creation completes on its own.
+# Launching two runs and hoping they overlap proves nothing: if the first releases
+# the lock before the second reaches it, every assertion below passes without
+# contention having happened at all — a test that measures nothing and reports
+# green. So the overlap is manufactured rather than hoped for: hold the lock, start
+# both, prove both are stuck, and only then let go.
 mkdir "$SESSIONS/.pleach.lock"
 printf '%s %s\n' "$$" "$(uname -n 2>/dev/null || echo '?')" > "$SESSIONS/.pleach.lock/owner"
 
-"$PLEACH" new blocked --no-bootstrap >"$SANDBOX/blocked.log" 2>&1 &
-BLOCKED=$!
-sleep 3
-assert_true "held lock: the waiting run is still alive after 3s" kill -0 "$BLOCKED"
-assert_true "held lock: it created nothing while the lock was held" \
-  [ ! -d "$SESSIONS/blocked" ]
-
-rm -f "$SESSIONS/.pleach.lock/owner"
-rmdir "$SESSIONS/.pleach.lock"
-wait "$BLOCKED" 2>/dev/null || true
-assert_true "released lock: the waiting run then completed the creation" \
-  [ -d "$SESSIONS/blocked" ]
-assert_true "released lock: and released the lock in turn" \
-  [ ! -d "$SESSIONS/.pleach.lock" ]
-
-# ---------------------------------------------------------------------------
-header "Test 36: two creations at once never take the same index"
-# ---------------------------------------------------------------------------
-# Companion to the above, and weaker on purpose: nothing here GUARANTEES the two
-# runs overlapped in time — Test 35 is the proof that the lock blocks. What this
-# adds is the invariant that matters when they do overlap. It is deliberately not
-# "both succeeded", which would pass even if the lock did nothing: it is that they
-# took DIFFERENT indexes, because the port block is derived from the index, and
-# two sessions on one block is the exact collision the design exists to prevent.
 ( "$PLEACH" new conc-a --no-bootstrap >"$SANDBOX/conc-a.log" 2>&1; echo $? >"$SANDBOX/conc-a.rc" ) &
 CONC_A=$!
 ( "$PLEACH" new conc-b --no-bootstrap >"$SANDBOX/conc-b.log" 2>&1; echo $? >"$SANDBOX/conc-b.rc" ) &
 CONC_B=$!
+sleep 3
+assert_true "held lock: both runs are alive, waiting on it" \
+  bash -c "kill -0 $CONC_A 2>/dev/null && kill -0 $CONC_B 2>/dev/null"
+assert_true "held lock: neither created anything while it was held" \
+  bash -c "[ ! -d '$SESSIONS/conc-a' ] && [ ! -d '$SESSIONS/conc-b' ]"
+
+rm -f "$SESSIONS/.pleach.lock/owner"
+rmdir "$SESSIONS/.pleach.lock"
 wait "$CONC_A" 2>/dev/null || true
 wait "$CONC_B" 2>/dev/null || true
 
+# Now the invariant that matters, from two runs PROVEN to have contended. Note it
+# is not "both succeeded" — that would pass even if the lock did nothing.
 assert_eq "concurrent new: first run exits 0"  "$(cat "$SANDBOX/conc-a.rc")" "0"
 assert_eq "concurrent new: second run exits 0" "$(cat "$SANDBOX/conc-b.rc")" "0"
 assert_true "concurrent new: both sessions were created" \
@@ -955,7 +942,7 @@ assert_true "concurrent new: the lock was released by both runs" \
   [ ! -d "$SESSIONS/.pleach.lock" ]
 
 # ---------------------------------------------------------------------------
-header "Test 37: a run killed mid-creation leaves a lock doctor can name and --fix can clear"
+header "Test 36: a run killed mid-creation leaves a lock doctor can name and --fix can clear"
 # ---------------------------------------------------------------------------
 # SIGKILL means the EXIT trap never runs, so the lock survives its owner — the
 # "run that died mid-way" doctor's help promises to detect. Every earlier test
