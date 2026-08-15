@@ -12,7 +12,7 @@
 # shellcheck disable=SC2015  # deliberate idiom: [ -z "$x" ] && x=… || err (err never runs after an assignment)
 set -euo pipefail
 
-PLEACH_VERSION="1.3.1"
+PLEACH_VERSION="1.3.2"
 
 CONF_NAME=".pleach.conf"
 USER_CONF="$HOME/.config/pleach/config"
@@ -1785,25 +1785,12 @@ A `.pleach.conf` and no `.session-env` means you are in the canonical checkout.
 |                                | Canonical (outside)                     | Inside a session                                                        |
 | ------------------------------ | --------------------------------------- | ----------------------------------------------------------------------- |
 | Purpose                        | integration, releases, session lifecycle | implementing one task                                                    |
-| Remove / prune sessions        | yes                                     | target other sessions. Your own is the hazard, and the tool is not a safety net for it: `rm` refuses it only while it still holds pending work, and `prune --apply` sweeps every integrated session — including the one you stand in |
+| Remove / prune sessions        | yes                                     | target other sessions. Your own is the hazard, and the tool is not a safety net for it: `pleach rm` refuses it only while it still holds pending work, and `pleach prune --apply` sweeps every integrated session — including the one you stand in |
 | Deploy, publish, `terraform apply` | yes                                  | **no** — two sessions collide in the *environment*; git isolates files, not environments |
 | Edit code                      | prefer a session                        | yes, that is the job                                                     |
 
 When a request from inside a session needs the other side, name the command and
 where it must run. Do not run it.
-
-## Inside a session, source the environment first
-
-```
-source .session-env        # from the session root
-```
-
-before any dev server, migration, container or test run. It carries `PORT`,
-`WRANGLER_PORT`, `PLAYWRIGHT_PORT`, `PLEACH_DB_NAME` and `COMPOSE_PROJECT_NAME`.
-Git isolates files; it does not isolate a database or a container name — two
-sessions migrating the same database collide in state and nothing in git will show
-it. `pleach open` sources it for the command it launches; a shell you opened
-yourself has not.
 
 ## The blind spot isolation buys
 
@@ -1821,55 +1808,33 @@ session is invisible to yours by construction.
   before claiming any workspace-wide identifier: a migration number, an RFC number,
   a port, a feature-flag name. What your worktree lists is not evidence it is free.
 
-## Read the map as data
+## What the tool already says — read it there
 
-`pleach ls --json` is the machine surface: `canonical`, `sessions_dir`, `base`, and
-per session `name`, `index`, `port_base`, `slug`, `cut_from`, `path`, `branch`, `subs`. Parse
-that. Do not scrape `pleach ls` or `pleach ls -l` — those are formatted for people.
-There is no MCP server; the shell-out is the interface, deliberately.
+`pleach help <command>` carries these in full, and cannot drift from the code the way a
+copy here would. Go to it rather than assume:
 
-## Reporting commands are not acting commands
+- `pleach prune` and `pleach clean` only **list** until `--apply`; `pleach sync --all`
+  refuses without a TTY unless you pass `--yes`; `pleach rm` refuses while work is pending.
+- "Integrated" is judged against the **local** base, and `pleach sync` never reaches for
+  origin — a PR merged on the remote is invisible until `git fetch`.
+- `pleach ls --json` is the machine surface; the human table is not a contract. There is no
+  MCP server, and the shell-out is the interface deliberately.
+- `.session-env` holds `PORT` and the runtime identity (`PLEACH_DB_NAME`,
+  `COMPOSE_PROJECT_NAME`) — the state git does not isolate. `pleach open` sources it for
+  the command it launches; a shell you opened yourself has not.
 
-|                       | Default behaviour                       | What makes it act            |
-| --------------------- | --------------------------------------- | ---------------------------- |
-| `pleach prune`        | lists fully integrated sessions          | `pleach prune --apply`       |
-| `pleach clean`        | lists git-ignored artifacts, with sizes  | `pleach clean --apply`       |
-| `pleach sync --all`   | refuses without a TTY                    | `pleach sync --all --yes`    |
-| `pleach rm <name>`    | refuses while work is pending            | `--force` (branches holding unintegrated commits are still kept) |
-
-Reporting a dry run as though it acted is the easiest way to be wrong with this
-tool. No `--apply`, nothing removed.
-
-"Integrated" is judged against the **local** base, and `sync` integrates the local
-base rather than reaching for origin. A PR merged on the remote is invisible until
-`git fetch` — so pass `--fetch`, or pull in the canonical first.
-
-## Quick reference
-
-| Goal                      | Command                                                                       |
-| ------------------------- | ----------------------------------------------------------------------------- |
-| Start work on a task      | `pleach open <name>` — creates the session if it does not exist               |
-| ... with another tool     | `pleach open <name> codex`                                                    |
-| Machine-readable map      | `pleach ls --json`                                                            |
-| Where does it live        | `pleach path <name>`                                                          |
-| Bring the base in         | `pleach sync <name>` (`--fetch` to advance the base first)                    |
-| Will these collide?       | `pleach conflicts`                                                            |
-| Ask every session         | `pleach each 'git log --oneline -1'`                                          |
-| Mount a new sub-repo      | `pleach add <name> <sub>`, or `pleach repos --sync` for every session         |
-| Workspace health          | `pleach doctor` — non-zero on findings; `--fix` does only the two repairs that cannot lose work |
-| After a merge lands       | `pleach prune`, then `pleach prune --apply`                                   |
-| Build on unmerged work    | `pleach new <name> --from <session>` — integrates against a moving target     |
+Everything else — the command list, every flag, `.pleach.conf` — is one `pleach help`
+away, and the baseline agents this skill was tested against all reached for it first.
 
 ## Red flags — stop
 
-- Removing the session you stand in — directly with `rm`, or by letting
-  `prune --apply` sweep it once its work has landed.
+- Removing the session you stand in — directly with `pleach rm`, or by letting
+  `pleach prune --apply` sweep it once its work has landed.
 - Treating a green `pleach conflicts` as proof that parallel work is compatible.
 - Running a deploy, a publish or `terraform apply` from inside a session.
-- Reporting a `prune` or `clean` listing as work performed.
-- Starting a dev server, a migration or a container without `source .session-env`.
 - Choosing a migration, RFC or port number from what a single worktree can see.
-- Piping `pleach ls` through grep or sed instead of using `--json`.
+- Reporting a `pleach prune` or `pleach clean` listing as work performed.
+- Starting a dev server, a migration or a container without `source .session-env`.
 
 ## Rationalizations
 
@@ -1878,11 +1843,8 @@ base rather than reaching for origin. A PR merged on the remote is invisible unt
 | "They asked me to tidy up, so I will remove this session." | Other sessions are fine. Removing the one you occupy pulls the ground from under you — name it, let it run outside. |
 | "`conflicts` was green, so the sessions are compatible."  | It ruled out a textual merge conflict, nothing else. Two differently-named files still collide in meaning. |
 | "It is a one-line deploy and the code is identical."      | The environment is shared. That is the collision git cannot see.        |
-| "`clean` listed the folders, so they are gone."           | Dry run. Nothing was deleted.                                           |
-| "`pleach ls` is easy enough to grep."                     | It is a human format with no stability guarantee. `--json` is the contract. |
-| "Nothing else touches this file."                         | You cannot see the other sessions. `pleach conflicts` can.              |
-| "The PR merged, so `sync`/`prune` will see it."           | Only the *local* base counts. `git fetch` first, or pass `--fetch`.     |
-| "The ports are only defaults, it will be fine."           | Two sessions on one port is the exact failure `.session-env` prevents.  |
+| "Nothing else touches this file."                         | You cannot see the other sessions. `pleach conflicts` can — for files.  |
+| "The next number is whatever my worktree does not have."  | Your worktree answers what *you* have, never what is taken. `pleach each`. |
 PLEACH_SKILL_EOF
 }
 

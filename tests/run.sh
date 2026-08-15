@@ -820,8 +820,12 @@ assert_true "skill: frontmatter fits the 1024-character budget" [ "${#FM}" -le 1
 DISPATCH=$(awk '/^case "\$cmd" in$/,/^esac$/' "$PLEACH" \
   | grep -oE '^  [a-zA-Z|-]+\)' | tr -d ' )' | tr '|' '\n' | sort -u)
 NAMED=$(printf '%s\n' "$OUT" | grep -oE '`pleach [a-z-]+' | sed 's/`pleach //' | sort -u)
-assert_true "skill: names 10+ commands (proves the extraction is not silently empty)" \
-  [ "$(printf '%s\n' "$NAMED" | grep -c .)" -ge 10 ]
+# A floor, not a content requirement: without it, an extraction that matched nothing would
+# make the anti-drift assertion below pass vacuously. It was 10 while the skill still
+# carried a command table; the skill dropped that table on purpose (`pleach help` already
+# is one), so the floor follows the extraction's real purpose rather than pinning content.
+assert_true "skill: names 8+ commands (proves the extraction is not silently empty)" \
+  [ "$(printf '%s\n' "$NAMED" | grep -c .)" -ge 8 ]
 UNKNOWN=""
 while IFS= read -r c; do
   [ -n "$c" ] || continue
