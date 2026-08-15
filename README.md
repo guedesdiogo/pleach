@@ -407,7 +407,7 @@ session and the canonical by their markers rather than by hardcoded directories:
 ## Tests
 
 ```bash
-tests/run.sh          # 226 assertions across 34 scenarios, in a throwaway sandbox
+tests/run.sh          # 243 assertions across 36 scenarios, in a throwaway sandbox
 tests/no-leaks.sh     # repository hygiene gate
 shellcheck pleach install.sh tests/*.sh examples/*.sh
 ```
@@ -423,8 +423,28 @@ conflict and a mere overlap (the decisive assertion is that a file two sessions 
 old heuristic got wrong), `new --from` stacking a session on another's unmerged commits,
 help coverage for every command, the emitted agent skill (frontmatter, its
 character budget, all three install destinations and the anti-drift check), and that `open`
-really runs inside the session. It pins `PLEACH_EXPECT_CANONICAL` to its own sandbox so it
-cannot escape.
+really runs inside the session.
+
+It pins `PLEACH_EXPECT_CANONICAL` to its own sandbox so it cannot escape.
+
+Two scenarios exercise the lock rather than describe it, because until they landed it was
+only ever tested by *planting* a lock directory — never by contention, never by a crash.
+
+The first **manufactures the overlap instead of hoping for it**: it holds the lock by hand,
+starts two `new` invocations, asserts both are alive and have created nothing, and only then
+lets go. Launching two runs and hoping they collide proves nothing — a first run that
+releases the lock before the second reaches it passes every assertion without contention
+having happened at all. With the overlap guaranteed, it then asserts the two runs took
+*different indexes*: deliberately not "both succeeded", which would pass even if the lock did
+nothing, because the port block is derived from the index and two sessions on one block is
+the exact collision the design exists to prevent.
+
+The second **SIGKILLs a run mid-creation** — verifying first that it is genuinely still
+running, so the scenario cannot assert a crash that never happened. SIGKILL runs no `EXIT`
+trap, so the lock outlives its owner: precisely the "run that died mid-way" `doctor` promises
+to detect. It then asserts `doctor` exits non-zero and names the dead owner, that `--fix`
+releases it, and — the part that matters — that a session can be created again afterwards. A
+repair whose only evidence is its own success message is not a repair.
 
 The suite earns its keep: `conflicts` shipped with a defect its own test caught — an `EXIT`
 trap referencing a variable that was `local` to a function already returned, which under
