@@ -423,7 +423,26 @@ conflict and a mere overlap (the decisive assertion is that a file two sessions 
 old heuristic got wrong), `new --from` stacking a session on another's unmerged commits,
 help coverage for every command, the emitted agent skill (frontmatter, its
 character budget, all three install destinations and the anti-drift check), and that `open`
-really runs inside the session. It pins `PLEACH_EXPECT_CANONICAL` to its own sandbox so it
+really runs inside the session.
+
+Two scenarios exercise the lock rather than describe it. The first runs two `new` invocations
+**at the same time** and asserts they did not take the same index — not merely that both
+succeeded, because the port block is derived from the index, and two sessions on one block is
+the collision the whole design exists to prevent. The second **SIGKILLs a run mid-creation**,
+which skips the `EXIT` trap and leaves the lock outliving its owner: exactly the "run that
+died mid-way" `doctor` promises to detect. It asserts `doctor` names the dead owner, that
+`--fix` releases it, and — the part that matters — that a session can be created again
+afterwards. Until these landed, the lock was only ever tested by *planting* a lock directory,
+never by contention or by a real crash.
+
+Two of them exercise the lock rather than describe it. The first runs two `new` invocations
+**at the same time** and asserts they did not take the same index — not merely that both
+succeeded, because the port block is derived from the index and two sessions on one block is
+the collision the whole design exists to prevent. The second **SIGKILLs a run mid-creation**,
+which skips the `EXIT` trap and leaves the lock outliving its owner: exactly the "run that
+died mid-way" `doctor` promises to detect. It then asserts `doctor` names the dead owner,
+`--fix` releases it, and — the part that matters — that a session can be created again
+afterwards. Until these landed, the lock was only ever tested by *planting* a lock directory. It pins `PLEACH_EXPECT_CANONICAL` to its own sandbox so it
 cannot escape.
 
 The suite earns its keep: `conflicts` shipped with a defect its own test caught — an `EXIT`

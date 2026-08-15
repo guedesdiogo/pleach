@@ -886,6 +886,81 @@ mkdir -p "$SANDBOX/nowhere"
 run bash -c "cd \"$SANDBOX/nowhere\" && env -u PLEACH_CANONICAL -u PLEACH_EXPECT_CANONICAL \"$PLEACH\" skill"
 assert_rc "skill: works with no workspace and no config" "$RC" 0
 
+env_val() { # <session dir> <variable> -> its value in .session-env
+  grep "^export $2=" "$1/.session-env" | head -1 | cut -d= -f2-
+}
+
+# ---------------------------------------------------------------------------
+header "Test 35: two creations at once serialise, and never take the same index"
+# ---------------------------------------------------------------------------
+# The premise of this tool is N sessions at once, and the lock is what makes
+# concurrent invocations safe — yet until now it was only exercised by PLANTING a
+# lock directory, never by real contention. The invariant that matters is not
+# "both succeeded": it is that they did not both take the same index, because the
+# port block is derived from it. Two sessions on one block is the exact collision
+# .session-env exists to prevent.
+( "$PLEACH" new conc-a --no-bootstrap >"$SANDBOX/conc-a.log" 2>&1; echo $? >"$SANDBOX/conc-a.rc" ) &
+CONC_A=$!
+( "$PLEACH" new conc-b --no-bootstrap >"$SANDBOX/conc-b.log" 2>&1; echo $? >"$SANDBOX/conc-b.rc" ) &
+CONC_B=$!
+wait "$CONC_A" 2>/dev/null || true
+wait "$CONC_B" 2>/dev/null || true
+
+assert_eq "concurrent new: first run exits 0"  "$(cat "$SANDBOX/conc-a.rc")" "0"
+assert_eq "concurrent new: second run exits 0" "$(cat "$SANDBOX/conc-b.rc")" "0"
+assert_true "concurrent new: both sessions were created" \
+  bash -c "[ -d '$SESSIONS/conc-a' ] && [ -d '$SESSIONS/conc-b' ]"
+
+IDX_A=$(env_val "$SESSIONS/conc-a" PLEACH_INDEX)
+IDX_B=$(env_val "$SESSIONS/conc-b" PLEACH_INDEX)
+assert_true "concurrent new: the two runs took different indexes ($IDX_A vs $IDX_B)" \
+  [ "$IDX_A" != "$IDX_B" ]
+
+PB_A=$(env_val "$SESSIONS/conc-a" PLEACH_PORT_BASE)
+PB_B=$(env_val "$SESSIONS/conc-b" PLEACH_PORT_BASE)
+assert_true "concurrent new: the two port blocks differ ($PB_A vs $PB_B)" \
+  [ "$PB_A" != "$PB_B" ]
+
+# doctor is the independent judge here: it checks for duplicate indexes and
+# overlapping blocks without knowing how they came about.
+run "$PLEACH" doctor
+assert_not_contains "concurrent new: doctor finds no duplicate index or block" \
+  "$OUT" "is already taken by another session"
+assert_true "concurrent new: the lock was released by both runs" \
+  [ ! -d "$SESSIONS/.pleach.lock" ]
+
+# ---------------------------------------------------------------------------
+header "Test 36: a run killed mid-creation leaves a lock doctor can name and --fix can clear"
+# ---------------------------------------------------------------------------
+# SIGKILL means the EXIT trap never runs, so the lock survives its owner — the
+# "run that died mid-way" doctor's help promises to detect. Every earlier test
+# planted that state by hand; this one causes it.
+"$PLEACH" new crashy --no-bootstrap >/dev/null 2>&1 &
+CRASHY=$!
+CRASH_SEEN=0
+for _ in $(seq 1 400); do
+  [ -d "$SESSIONS/.pleach.lock" ] && { CRASH_SEEN=1; break; }
+  sleep 0.05
+done
+kill -9 "$CRASHY" 2>/dev/null || true
+wait "$CRASHY" 2>/dev/null || true
+
+assert_eq "killed run: the lock was observed being held" "$CRASH_SEEN" "1"
+assert_true "killed run: the lock outlived the process (SIGKILL runs no EXIT trap)" \
+  [ -d "$SESSIONS/.pleach.lock" ]
+
+run "$PLEACH" doctor
+assert_rc "killed run: doctor exits non-zero" "$RC" 1
+assert_contains "killed run: doctor names the dead owner" "$OUT" "no longer running"
+
+run "$PLEACH" doctor --fix
+assert_true "killed run: --fix released the lock" [ ! -d "$SESSIONS/.pleach.lock" ]
+
+# The point of a repair is that the workspace works again afterwards.
+run "$PLEACH" new after-crash --no-bootstrap
+assert_rc "killed run: a session can be created after the repair" "$RC" 0
+assert_true "killed run: that session really exists" [ -d "$SESSIONS/after-crash" ]
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
