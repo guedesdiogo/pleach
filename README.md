@@ -407,7 +407,7 @@ session and the canonical by their markers rather than by hardcoded directories:
 ## Tests
 
 ```bash
-tests/run.sh          # 226 assertions across 34 scenarios, in a throwaway sandbox
+tests/run.sh          # 245 assertions across 37 scenarios, in a throwaway sandbox
 tests/no-leaks.sh     # repository hygiene gate
 shellcheck pleach install.sh tests/*.sh examples/*.sh
 ```
@@ -425,25 +425,28 @@ help coverage for every command, the emitted agent skill (frontmatter, its
 character budget, all three install destinations and the anti-drift check), and that `open`
 really runs inside the session.
 
-Two scenarios exercise the lock rather than describe it. The first runs two `new` invocations
-**at the same time** and asserts they did not take the same index — not merely that both
-succeeded, because the port block is derived from the index, and two sessions on one block is
-the collision the whole design exists to prevent. The second **SIGKILLs a run mid-creation**,
-which skips the `EXIT` trap and leaves the lock outliving its owner: exactly the "run that
-died mid-way" `doctor` promises to detect. It asserts `doctor` names the dead owner, that
-`--fix` releases it, and — the part that matters — that a session can be created again
-afterwards. Until these landed, the lock was only ever tested by *planting* a lock directory,
-never by contention or by a real crash.
+It pins `PLEACH_EXPECT_CANONICAL` to its own sandbox so it cannot escape.
 
-Two of them exercise the lock rather than describe it. The first runs two `new` invocations
-**at the same time** and asserts they did not take the same index — not merely that both
-succeeded, because the port block is derived from the index and two sessions on one block is
-the collision the whole design exists to prevent. The second **SIGKILLs a run mid-creation**,
-which skips the `EXIT` trap and leaves the lock outliving its owner: exactly the "run that
-died mid-way" `doctor` promises to detect. It then asserts `doctor` names the dead owner,
-`--fix` releases it, and — the part that matters — that a session can be created again
-afterwards. Until these landed, the lock was only ever tested by *planting* a lock directory. It pins `PLEACH_EXPECT_CANONICAL` to its own sandbox so it
-cannot escape.
+Three scenarios exercise the lock rather than describe it, because until they landed it was
+only ever tested by *planting* a lock directory — never by contention, never by a crash.
+
+The first is the deterministic one: it **holds the lock by hand**, starts a creation, and
+asserts that after three seconds the run is still alive and has created nothing — then
+releases the lock and asserts the same run completes on its own. Launching two runs and
+hoping they overlap would prove nothing, since a first run that finishes before the second
+starts passes every assertion without contention ever happening.
+
+The second runs two `new` invocations **at the same time** and asserts they did not take the
+same index. Deliberately not "both succeeded", which would pass even if the lock did nothing:
+the port block is derived from the index, and two sessions on one block is the exact
+collision the design exists to prevent.
+
+The third **SIGKILLs a run mid-creation** — verifying first that it is genuinely still
+running, so the scenario cannot assert a crash that never happened. SIGKILL runs no `EXIT`
+trap, so the lock outlives its owner: precisely the "run that died mid-way" `doctor` promises
+to detect. It then asserts `doctor` exits non-zero and names the dead owner, that `--fix`
+releases it, and — the part that matters — that a session can be created again afterwards. A
+repair whose only evidence is its own success message is not a repair.
 
 The suite earns its keep: `conflicts` shipped with a defect its own test caught — an `EXIT`
 trap referencing a variable that was `local` to a function already returned, which under
