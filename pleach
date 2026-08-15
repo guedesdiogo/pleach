@@ -1785,7 +1785,7 @@ A `.pleach.conf` and no `.session-env` means you are in the canonical checkout.
 |                                | Canonical (outside)                     | Inside a session                                                        |
 | ------------------------------ | --------------------------------------- | ----------------------------------------------------------------------- |
 | Purpose                        | integration, releases, session lifecycle | implementing one task                                                    |
-| Remove / prune sessions        | yes                                     | other sessions only. `rm` refuses your own **only while it still holds pending work**, and `prune --apply` sweeps every integrated session — including the one you stand in |
+| Remove / prune sessions        | yes                                     | target other sessions. Your own is the hazard, and the tool is not a safety net for it: `rm` refuses it only while it still holds pending work, and `prune --apply` sweeps every integrated session — including the one you stand in |
 | Deploy, publish, `terraform apply` | yes                                  | **no** — two sessions collide in the *environment*; git isolates files, not environments |
 | Edit code                      | prefer a session                        | yes, that is the job                                                     |
 
