@@ -407,7 +407,7 @@ session and the canonical by their markers rather than by hardcoded directories:
 ## Tests
 
 ```bash
-tests/run.sh          # 243 assertions across 36 scenarios, in a throwaway sandbox
+tests/run.sh          # 267 assertions across 38 scenarios, in a throwaway sandbox
 tests/no-leaks.sh     # repository hygiene gate
 shellcheck pleach install.sh tests/*.sh examples/*.sh
 ```
@@ -445,6 +445,15 @@ trap, so the lock outlives its owner: precisely the "run that died mid-way" `doc
 to detect. It then asserts `doctor` exits non-zero and names the dead owner, that `--fix`
 releases it, and — the part that matters — that a session can be created again afterwards. A
 repair whose only evidence is its own success message is not a repair.
+
+`install` and `update` are covered too, with `HOME` redirected into the sandbox — a test that
+writes to your real `~/.local/bin` is a test nobody can run twice. `update` reaches the
+network, so a `curl` double stands in for it, and the property under test is not "it updates"
+but that a **failed or corrupt download leaves a working `pleach` behind**: a payload that is
+not valid bash must be rejected by the syntax gate with the old copy untouched. Writing these
+found a real defect on the first run — the "you are running the installed copy" guard
+compared raw path strings, so any non-normalised `HOME` (a doubled slash, a trailing slash, a
+symlink) walked straight past it, and `cp` refused in its own words instead of pleach's.
 
 The suite earns its keep: `conflicts` shipped with a defect its own test caught — an `EXIT`
 trap referencing a variable that was `local` to a function already returned, which under

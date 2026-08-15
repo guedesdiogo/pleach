@@ -12,7 +12,7 @@
 # shellcheck disable=SC2015  # deliberate idiom: [ -z "$x" ] && x=… || err (err never runs after an assignment)
 set -euo pipefail
 
-PLEACH_VERSION="1.3.2"
+PLEACH_VERSION="1.3.3"
 
 CONF_NAME=".pleach.conf"
 USER_CONF="$HOME/.config/pleach/config"
@@ -1882,10 +1882,16 @@ cmd_skill() {
 
 # ---------------------------------------------------------------------------
 cmd_install() {
-  local target="$HOME/.local/bin/pleach" src
-  src=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+  local target_dir="$HOME/.local/bin" target src
+  mkdir -p "$target_dir"
+  # Both sides are resolved to a PHYSICAL path before being compared. Comparing
+  # the raw strings let any non-normalised HOME — a trailing slash, a doubled
+  # slash — walk straight past this guard, and cp then refused in its own words
+  # instead of pleach's. Plain `pwd` is not enough either: it is logical, so a
+  # symlinked home resolves on one side of the comparison and not the other.
+  target=$(cd "$target_dir" && pwd -P)/pleach
+  src=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
   [ "$src" = "$target" ] && err "you are running the installed copy — run install from the source checkout (the pleach repo)"
-  mkdir -p "$HOME/.local/bin"
   cp "$src" "$target"
   chmod +x "$target"
   info "installed at $target"
