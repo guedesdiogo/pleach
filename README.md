@@ -366,8 +366,9 @@ pleach skill                 # just print it: pipe into any tool, any model
 that removing the session you stand in pulls the ground from under you — and that
 `pleach prune --apply` will do it for you once the work has landed; that shipping from
 inside a session collides in the *environment* rather than in the files; and that a green
-`conflicts` rules out a textual merge conflict and nothing more — two sessions adding
-`0004_billing.sql` and `0004_last_login.sql` merge clean, exit 0, and are wrong.
+`conflicts` rules out a textual merge conflict and a duplicated numbered slot — and nothing
+beyond those two. Duplicate route paths, one feature-flag name taken twice, the same port
+hardcoded in two sessions: all merge clean, none of them show up there.
 
 What it deliberately does **not** carry is a second copy of the command reference. The skill
 was tested the way this project tests code: four agents were given realistic tasks in a
@@ -407,7 +408,7 @@ session and the canonical by their markers rather than by hardcoded directories:
 ## Tests
 
 ```bash
-tests/run.sh          # 267 assertions across 38 scenarios, in a throwaway sandbox
+tests/run.sh          # 277 assertions across 40 scenarios, in a throwaway sandbox
 tests/no-leaks.sh     # repository hygiene gate
 shellcheck pleach install.sh tests/*.sh examples/*.sh
 ```
@@ -439,12 +440,28 @@ having happened at all. With the overlap guaranteed, it then asserts the two run
 nothing, because the port block is derived from the index and two sessions on one block is
 the exact collision the design exists to prevent.
 
-The second **SIGKILLs a run mid-creation** — verifying first that it is genuinely still
-running, so the scenario cannot assert a crash that never happened. SIGKILL runs no `EXIT`
-trap, so the lock outlives its owner: precisely the "run that died mid-way" `doctor` promises
-to detect. It then asserts `doctor` exits non-zero and names the dead owner, that `--fix`
-releases it, and — the part that matters — that a session can be created again afterwards. A
-repair whose only evidence is its own success message is not a repair.
+The second **SIGKILLs a run mid-creation**. SIGKILL runs no `EXIT` trap, so the lock outlives
+its owner: precisely the "run that died mid-way" `doctor` promises to detect. It asserts
+`doctor` exits non-zero and names the dead owner, that `--fix` releases it, and — the part
+that matters — that a session can be created again afterwards. A repair whose only evidence
+is its own success message is not a repair.
+
+Catching a run mid-lock is inherently a race, and on a loaded machine it is lost: the run
+finishes before the kill lands and four assertions fail in a cascade that says nothing about
+pleach. So it retries up to three times with a fresh session name, and fails loudly only if
+every attempt loses. On **Windows** the crash does not reproduce at all through Git Bash's
+process model, so there the scenario plants a lock owned by a pid that is provably dead
+instead — which still answers *"does `doctor` recognise a dead owner and release it here"*,
+and leaves exactly one thing open: whether a real crash on Windows produces that state in the
+first place.
+
+Two more scenarios cover what the tool now catches for you: `conflicts` reporting **one
+numbered slot claimed by two sessions** — `0004_billing.sql` against `0004_last_login.sql`,
+different files, so git merges them clean and lands two migrations numbered 0004 — with the
+decisive negative that one session using a slot twice is its own business and is *not*
+reported; and `doctor` noticing an **installed agent skill that no longer matches the
+binary**, since the skill is written as a copy and ages silently the moment pleach is
+upgraded.
 
 `install` and `update` are covered too, with `HOME` redirected into the sandbox — a test that
 writes to your real `~/.local/bin` is a test nobody can run twice. `update` reaches the
