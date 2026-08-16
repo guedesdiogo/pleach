@@ -408,7 +408,7 @@ session and the canonical by their markers rather than by hardcoded directories:
 ## Tests
 
 ```bash
-tests/run.sh          # 280 assertions across 40 scenarios, in a throwaway sandbox
+tests/run.sh          # 313 assertions across 43 scenarios, in a throwaway sandbox
 tests/no-leaks.sh     # repository hygiene gate
 shellcheck pleach install.sh tests/*.sh examples/*.sh
 ```
@@ -462,6 +462,16 @@ decisive negative that one session using a slot twice is its own business and is
 reported; and `doctor` noticing an **installed agent skill that no longer matches the
 binary**, since the skill is written as a copy and ages silently the moment pleach is
 upgraded.
+
+Two scenarios exist because the suite could not have written them. They came from running
+the **published npm package** against a project it had never seen, with someone who was told
+not to read the source. The pending-work check used `--untracked-files=no`, so a session
+whose only content was files never `git add`ed reported as empty: `ls -l` called it *"fully
+integrated — removable"* and `rm` deleted it, green tick, exit 0, content gone. And identity
+came from the folder name, so renaming a session folder made the branch lookup miss and the
+same deletion happen to committed work. Both now refuse, and both scenarios assert the
+negative that keeps the fix honest — a genuinely empty session must still be removable, or
+the fix would just have broken post-merge hygiene instead.
 
 `install` and `update` are covered too, with `HOME` redirected into the sandbox — a test that
 writes to your real `~/.local/bin` is a test nobody can run twice. `update` reaches the

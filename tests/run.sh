@@ -1186,6 +1186,142 @@ run env HOME="$SANDBOX/empty-home" "$PLEACH" doctor
 assert_not_contains "doctor/skill: silent when no skill is installed" "$OUT" "agent skill"
 
 # ---------------------------------------------------------------------------
+header "Test 41: untracked files are pending work — the data-loss case"
+# ---------------------------------------------------------------------------
+# Found by an outsider running the PUBLISHED package against a project this suite
+# had never seen. The pending-work check read --untracked-files=no, so a session
+# whose only content was files never `git add`ed reported as empty: `ls -l` called
+# it "fully integrated — removable" and `rm` deleted it, green tick, exit 0. The
+# content had never entered the object store, so it was simply gone. `git worktree
+# remove` refuses exactly this; pleach was going around it.
+run "$PLEACH" new lossy --no-bootstrap
+assert_rc "untracked: session created" "$RC" 0
+printf 'the only copy of this\n' > "$SESSIONS/lossy/subA/brand-new.js"
+
+run "$PLEACH" ls -l
+assert_contains "untracked: ls -l counts it as a change" "$OUT" "✎1 changes"
+
+# The decisive assertion: it must NOT be advertised as safe to delete.
+LOSSY_BLOCK=$(printf '%s\n' "$OUT" | awk '/^● lossy /{p=1} p&&/^● /&&!/lossy/{p=0} p')
+assert_not_contains "untracked: ls -l does NOT call it removable" \
+  "$LOSSY_BLOCK" "fully integrated"
+
+run "$PLEACH" rm lossy
+assert_rc "untracked: rm refuses" "$RC" 1
+assert_contains "untracked: and says why" "$OUT" "uncommitted or untracked changes"
+assert_true "untracked: the file is still there" [ -f "$SESSIONS/lossy/subA/brand-new.js" ]
+
+run "$PLEACH" prune
+assert_not_contains "untracked: prune does not offer to remove it" "$OUT" "✓ lossy"
+
+# The decisive one: run the destructive path for real. This is the exact command an
+# outsider ran as documented post-merge hygiene, and it took the work with it.
+run "$PLEACH" prune --apply
+assert_true "untracked: prune --apply leaves the session standing" [ -d "$SESSIONS/lossy" ]
+assert_true "untracked: and the only copy of the file is still there" \
+  [ -f "$SESSIONS/lossy/subA/brand-new.js" ]
+assert_eq "untracked: with its contents intact" \
+  "$(cat "$SESSIONS/lossy/subA/brand-new.js")" "the only copy of this"
+
+# The negative that keeps the fix honest: a genuinely empty session must still be
+# removable, or this "fix" would have broken post-merge hygiene for everyone.
+run "$PLEACH" new spotless --no-bootstrap
+assert_rc "untracked: a clean session was created" "$RC" 0
+run "$PLEACH" ls -l
+SPOTLESS_BLOCK=$(printf '%s\n' "$OUT" | awk '/^● spotless /{p=1} p&&/^● /&&!/spotless/{p=0} p')
+assert_contains "untracked: a clean session is STILL removable" \
+  "$SPOTLESS_BLOCK" "fully integrated"
+
+# .session-env lives inside the root worktree. Without the exclude, a `git add -A`
+# at the session root commits this machine's ports and canonical path onto the
+# branch — and under the rule above it would also make every session permanently
+# dirty, breaking prune for everyone.
+assert_eq "untracked: .session-env does not dirty the session root" \
+  "$(git -C "$SESSIONS/spotless" status --porcelain -- .session-env)" ""
+
+# ---------------------------------------------------------------------------
+header "Test 42: a renamed session folder is refused, not guessed at"
+# ---------------------------------------------------------------------------
+# Identity came from the folder name, so renaming it (the ticket got renamed…)
+# made the branch lookup miss, the session read as empty, and rm deleted it — with
+# committed work surviving only as an orphan branch that nothing lists.
+echo "committed work" > "$SESSIONS/spotless/subA/real-work.js"
+git -C "$SESSIONS/spotless/subA" add -A
+git -C "$SESSIONS/spotless/subA" commit -q -m "work that must not vanish"
+mv "$SESSIONS/spotless" "$SESSIONS/spotless-renamed"
+
+run "$PLEACH" rm spotless-renamed
+assert_rc "renamed: rm refuses" "$RC" 1
+assert_contains "renamed: names both the folder and the record" "$OUT" "says 'spotless'"
+assert_contains "renamed: and how to undo it" "$OUT" "Rename it back"
+assert_true "renamed: nothing was removed" [ -d "$SESSIONS/spotless-renamed" ]
+
+# --force must not override this: the guard rails cannot be evaluated at all, so
+# forcing would mean deleting blind.
+run "$PLEACH" rm spotless-renamed --force
+assert_rc "renamed: --force does not override it either" "$RC" 1
+assert_true "renamed: still nothing removed" [ -d "$SESSIONS/spotless-renamed" ]
+
+run "$PLEACH" doctor
+assert_rc "renamed: doctor reports it" "$RC" 1
+assert_contains "renamed: doctor names the mismatch" "$OUT" "says 'spotless'"
+
+mv "$SESSIONS/spotless-renamed" "$SESSIONS/spotless"
+run "$PLEACH" rm spotless --force
+assert_rc "renamed: removable again once the name matches" "$RC" 0
+assert_true "renamed: and the folder is actually gone" [ ! -d "$SESSIONS/spotless" ]
+
+# ---------------------------------------------------------------------------
+header "Test 43: a moved canonical is reported, not certified healthy"
+# ---------------------------------------------------------------------------
+# `branch --show-current` returns empty both for a detached HEAD and for a repo git
+# cannot open, and doctor reported the second as the first — printing "✅ no problems
+# found" over a workspace where every repo answered "fatal: not a git repository".
+# Its own folders all still exist, so nothing is "registered but gone" either: the
+# first version of the fix hung repair off the stale-registration branch and never
+# ran at all.
+#
+# A separate mini workspace, because this scenario moves a canonical and the suite's
+# own is pinned by PLEACH_EXPECT_CANONICAL.
+MINI="$SANDBOX/mini"
+mkdir -p "$MINI"
+setup_repo "$MINI/canon"
+echo "root" > "$MINI/canon/f.txt"
+git -C "$MINI/canon" add -A && git -C "$MINI/canon" commit -q -m "initial"
+setup_repo "$MINI/canon/svc"
+echo "svc" > "$MINI/canon/svc/f.txt"
+git -C "$MINI/canon/svc" add -A && git -C "$MINI/canon/svc" commit -q -m "initial"
+
+run bash -c "cd '$MINI/canon' && env PLEACH_CANONICAL='$MINI/canon' PLEACH_EXPECT_CANONICAL='$MINI/canon' '$PLEACH' init"
+assert_rc "moved canonical: mini workspace adopted" "$RC" 0
+run env PLEACH_CANONICAL="$MINI/canon" PLEACH_EXPECT_CANONICAL="$MINI/canon" "$PLEACH" new relocate --no-bootstrap
+assert_rc "moved canonical: session created" "$RC" 0
+
+echo "must survive" > "$MINI/.sessions/relocate/svc/keepme.txt"
+git -C "$MINI/.sessions/relocate/svc" add -A
+git -C "$MINI/.sessions/relocate/svc" commit -q -m "work that must survive the move"
+
+mv "$MINI/canon" "$MINI/canon-moved"
+
+run env PLEACH_CANONICAL="$MINI/canon-moved" PLEACH_EXPECT_CANONICAL="$MINI/canon-moved" "$PLEACH" doctor
+assert_rc "moved canonical: doctor exits non-zero" "$RC" 1
+assert_contains "moved canonical: names it as unusable, not detached" \
+  "$OUT" "not a usable git worktree"
+assert_contains "moved canonical: hands over the repair command" "$OUT" "worktree repair"
+assert_not_contains "moved canonical: does NOT certify it healthy" "$OUT" "no problems found"
+
+run env PLEACH_CANONICAL="$MINI/canon-moved" PLEACH_EXPECT_CANONICAL="$MINI/canon-moved" "$PLEACH" doctor --fix
+assert_rc "moved canonical: --fix repairs it" "$RC" 0
+assert_contains "moved canonical: and says so" "$OUT" "no problems found"
+
+# The point of a repair is what survives it.
+assert_eq "moved canonical: the session's commit survived" \
+  "$(git -C "$MINI/.sessions/relocate/svc" log --oneline -1 --format='%s')" \
+  "work that must survive the move"
+assert_true "moved canonical: and its file is still on disk" \
+  [ -f "$MINI/.sessions/relocate/svc/keepme.txt" ]
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

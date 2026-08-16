@@ -12,7 +12,7 @@
 # shellcheck disable=SC2015  # deliberate idiom: [ -z "$x" ] && x=… || err (err never runs after an assignment)
 set -euo pipefail
 
-PLEACH_VERSION="1.3.4"
+PLEACH_VERSION="1.4.0"
 
 CONF_NAME=".pleach.conf"
 USER_CONF="$HOME/.config/pleach/config"
@@ -607,6 +607,17 @@ cmd_new() {
   local recorded_ref="$BASE"
   if [ -n "$from" ] && [ "$from_used" -eq 1 ]; then recorded_ref="$from"; fi
   write_session_env "$dir" "$name" "$idx" "$port_base" "$recorded_ref"
+  # .session-env lives INSIDE the root worktree, so `git add -A` at the session root
+  # would commit this machine's port block, DB name and absolute canonical path onto
+  # the branch — and from there into main, where every session's copy then conflicts
+  # with every other. info/exclude is local-only and never committed, so this costs
+  # the repo nothing.
+  local excl
+  excl=$(git -C "$dir" rev-parse --git-path info/exclude 2>/dev/null || true)
+  if [ -n "$excl" ] && ! grep -qxF '.session-env' "$excl" 2>/dev/null; then
+    mkdir -p "$(dirname "$excl")" 2>/dev/null || true
+    printf '.session-env\n' >> "$excl" 2>/dev/null || true
+  fi
 
   write_vscode_workspace "$name" "$dir" ${subs[@]+"${subs[@]}"}
   write_panorama_workspace
@@ -994,6 +1005,43 @@ cmd_repos() {
 }
 
 # ---------------------------------------------------------------------------
+worktree_dirt() { # $1 = worktree, $2 = session dir when $1 is the ROOT worktree
+  # Work that would be LOST if this worktree were removed. Untracked files count,
+  # and that is the whole point: they exist nowhere else, which is exactly why
+  # `git worktree remove` refuses to delete them. Every check here used to read
+  # --untracked-files=no, so a session whose only content was new files reported as
+  # empty, `ls -l` called it "fully integrated — removable", and `rm` deleted it
+  # with a green tick and exit 0. A coding agent produces new files, and this tool
+  # exists to run coding agents.
+  #
+  # Two things are pleach's own footprint rather than the user's work, and are
+  # filtered out: .session-env, and the mounted sub-repo directories, which the
+  # root worktree sees as untracked whenever the root repo does not ignore them.
+  local wt="$1" sessdir="${2:-}" line f
+  local -a skip=(".session-env")
+  if [ -n "$sessdir" ]; then
+    while IFS= read -r f; do [ -n "$f" ] && skip+=("$f"); done < <(session_subs "$sessdir")
+  fi
+  git -C "$wt" status --porcelain 2>/dev/null | while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    f="${line:3}"; f="${f%/}"
+    in_list "$f" ${skip[@]+"${skip[@]}"} && continue
+    printf '%s\n' "$line"
+  done
+}
+
+session_identity_problem() { # $1 name — echoes why the folder cannot be judged, if so
+  # Identity comes from the folder name, so a rename silently retargets every check:
+  # the branch lookup misses, the session reads as empty, and rm deletes it. Rather
+  # than guess, say that the two disagree.
+  local dir="$SESSIONS/$1" recorded
+  recorded=$(session_env_get "$dir" PLEACH_NAME)
+  [ -n "$recorded" ] || return 1          # created before this was recorded
+  [ "$recorded" = "$1" ] && return 1
+  printf '%s' "the folder is '$1' but its .session-env says '$recorded' — the branches are session/$recorded, so nothing here can be judged by name. Rename it back: mv '$dir' '$SESSIONS/$recorded'"
+  return 0
+}
+
 session_problems() { # $1 name — echoes pending work (one per line); rc 0 if none
   # Criterion shared by rm and prune: uncommitted changes in any worktree, or
   # commits on session/<name> not yet integrated into the local BASE.
@@ -1006,8 +1054,8 @@ session_problems() { # $1 name — echoes pending work (one per line); rc 0 if n
     repo=$(repo_path "$s"); label="${s:-root}"
     wt="$dir${s:+/$s}"
     [ -e "$wt/.git" ] || continue
-    if [ -n "$(git -C "$wt" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
-      echo "$label: uncommitted changes"
+    if [ -n "$(worktree_dirt "$wt" "$([ -z "$s" ] && printf '%s' "$dir")")" ]; then
+      echo "$label: uncommitted or untracked changes"
       count=$((count + 1))
     fi
     ahead=$(git -C "$repo" rev-list --count "$BASE..$branch" 2>/dev/null || echo 0)
@@ -1032,6 +1080,13 @@ cmd_rm() {
   done
   [ -n "$name" ] || err "usage: pleach rm <name> [--force] [--reap]"
   load_config
+  # Before anything destructive: refuse when the folder and its own record disagree.
+  # --force does not override this, because there is nothing to override — the guard
+  # rails cannot be evaluated at all, so "force" would mean "delete blind".
+  local id_problem
+  if id_problem=$(session_identity_problem "$name"); then
+    err "cannot remove '$name': $id_problem"
+  fi
   local dir="$SESSIONS/$name" branch
   branch=$(session_branch "$name")
   [ -d "$dir" ] || err "session '$name' does not exist at $dir"
@@ -1271,7 +1326,7 @@ ls_long() {
       [ -e "$wt/.git" ] || continue
       ahead=$(git -C "$wt" rev-list --count "$BASE..HEAD" 2>/dev/null || echo "?")
       behind=$(git -C "$wt" rev-list --count "HEAD..$BASE" 2>/dev/null || echo "?")
-      dirty=$(git -C "$wt" status --porcelain --untracked-files=no 2>/dev/null | wc -l | tr -d ' ')
+      dirty=$(worktree_dirt "$wt" "$([ -z "$s" ] && printf '%s' "$dir")" | wc -l | tr -d ' ')
       last=$(git -C "$wt" log -1 --format='%ad' --date=short 2>/dev/null || echo "")
       if [ -n "$last" ] && [[ "$last" > "$last_activity" ]]; then last_activity="$last"; fi
       marks=""
@@ -1715,10 +1770,32 @@ cmd_doctor() {
   # Worktrees git still believes in, whose folder is gone. They make the next
   # `new` fail with a confusing "already used by worktree" and are invisible
   # from the session side, because the session is precisely what vanished.
+  local repo label wt norm
+  # REPAIR FIRST, before anything is inspected or pruned. A moved canonical leaves
+  # every worktree's back-link broken while the FOLDERS ALL STILL EXIST — so nothing
+  # is "registered but gone", and a repair hung off the stale-registration branch
+  # never runs at all. Every check below is more accurate on a repaired tree, and
+  # repair is idempotent and cannot lose work, which is what earns it a place here.
+  #
+  # Bare `repair` covers the canonical having moved: the recorded gitdir still points
+  # at the worktrees, so git can find and re-link them. It cannot cover a worktree
+  # that itself moved, because there the recorded path is the stale half — for those
+  # the current locations have to be handed over, which is what is on disk.
+  if [ "$fix" -eq 1 ]; then
+    local -a here=()
+    while IFS= read -r wt; do [ -n "$wt" ] && here+=("$wt"); done < <(
+      find "$SESSIONS" -mindepth 1 -maxdepth 2 -name .git 2>/dev/null | sed 's|/\.git$||'
+    )
+    for s in "" ${detected[@]+"${detected[@]}"}; do
+      repo=$(repo_path "$s")
+      git -C "$repo" worktree repair 2>/dev/null || true
+      [ ${#here[@]} -gt 0 ] && git -C "$repo" worktree repair "${here[@]}" 2>/dev/null || true
+    done
+  fi
+
   echo ""
   echo "worktree registrations"
   local -a stale=()
-  local repo label wt norm
   for s in "" ${detected[@]+"${detected[@]}"}; do
     repo=$(repo_path "$s"); label="${s:-root}"
     while IFS= read -r wt; do
@@ -1732,10 +1809,12 @@ cmd_doctor() {
   if [ ${#stale[@]} -eq 0 ]; then
     dr_ok "no stale worktree registrations"
   elif [ "$fix" -eq 1 ]; then
+    # Repair already ran above, so whatever is still stale here genuinely has no
+    # folder to point at and pruning it cannot lose anything.
     for s in "" ${detected[@]+"${detected[@]}"}; do
       git -C "$(repo_path "$s")" worktree prune 2>/dev/null || true
     done
-    dr_ok "pruned ${#stale[@]} stale registration(s)"
+    dr_ok "pruned ${#stale[@]} stale registration(s) that repair could not restore"
   else
     for wt in "${stale[@]}"; do dr_bad "registered but gone — $wt"; done
     dr_note "clear them with: pleach doctor --fix"
@@ -1752,6 +1831,13 @@ cmd_doctor() {
     branch=$(session_branch "$n")
     if [ ! -f "$dir/.session-env" ]; then
       dr_bad "$n: no .session-env — ports and identity unknown (recreate the session, or copy one by hand)"
+      continue
+    fi
+    # A renamed folder makes every name-keyed check look at the wrong branch, so it
+    # is a problem in its own right rather than a detail of the ones below.
+    local id_problem
+    if id_problem=$(session_identity_problem "$n"); then
+      dr_bad "$n: $id_problem"
       continue
     fi
     idx=$(session_env_get "$dir" PLEACH_INDEX)
@@ -1783,7 +1869,15 @@ cmd_doctor() {
       wt="$dir${s:+/$s}"
       [ -e "$wt/.git" ] || continue
       cur=$(git -C "$wt" branch --show-current 2>/dev/null || echo "")
-      [ "$cur" = "$branch" ] || dr_note "$n: ${s:-root} sits on '${cur:-detached HEAD}', not $branch (sync skips it unless --any-branch)"
+      # A broken back-link and a detached HEAD both leave `branch --show-current`
+      # empty. Reporting the first as the second is how a workspace with every repo
+      # answering "fatal: not a git repository" got certified healthy — the one
+      # command whose job is to catch quiet breakage, going quiet.
+      if ! git -C "$wt" rev-parse --git-dir >/dev/null 2>&1; then
+        dr_bad "$n: ${s:-root} is not a usable git worktree — the canonical has probably moved. Repair with: git -C '$(repo_path "$s")' worktree repair '$wt'"
+      else
+        [ "$cur" = "$branch" ] || dr_note "$n: ${s:-root} sits on '${cur:-detached HEAD}', not $branch (sync skips it unless --any-branch)"
+      fi
     done
 
     listeners=$(session_listeners "${port:-}")
@@ -2333,8 +2427,12 @@ Asks out loud everything a multi-repo tool can get wrong quietly:
 Reports by default and exits non-zero when it finds a problem, so it fits in a
 CI step or a shell prompt.
 
-  --fix   Perform the only two repairs that cannot lose work: release a stale
-          lock and prune stale worktree registrations. Nothing else is automatic.
+  --fix   Perform only repairs that cannot lose work: release a stale lock, and
+          run `git worktree repair` before pruning registrations that are still
+          stale afterwards. Repair comes first deliberately — a worktree whose
+          folder MOVED and one whose folder is GONE look identical from the
+          registration side, and pruning the first destroys the link that would
+          have restored it. Nothing else is automatic.
 EOF
     ;;
     version) cat <<'EOF'
