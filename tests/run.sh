@@ -1214,6 +1214,15 @@ assert_true "untracked: the file is still there" [ -f "$SESSIONS/lossy/subA/bran
 run "$PLEACH" prune
 assert_not_contains "untracked: prune does not offer to remove it" "$OUT" "✓ lossy"
 
+# The decisive one: run the destructive path for real. This is the exact command an
+# outsider ran as documented post-merge hygiene, and it took the work with it.
+run "$PLEACH" prune --apply
+assert_true "untracked: prune --apply leaves the session standing" [ -d "$SESSIONS/lossy" ]
+assert_true "untracked: and the only copy of the file is still there" \
+  [ -f "$SESSIONS/lossy/subA/brand-new.js" ]
+assert_eq "untracked: with its contents intact" \
+  "$(cat "$SESSIONS/lossy/subA/brand-new.js")" "the only copy of this"
+
 # The negative that keeps the fix honest: a genuinely empty session must still be
 # removable, or this "fix" would have broken post-merge hygiene for everyone.
 run "$PLEACH" new spotless --no-bootstrap
@@ -1260,6 +1269,7 @@ assert_contains "renamed: doctor names the mismatch" "$OUT" "says 'spotless'"
 mv "$SESSIONS/spotless-renamed" "$SESSIONS/spotless"
 run "$PLEACH" rm spotless --force
 assert_rc "renamed: removable again once the name matches" "$RC" 0
+assert_true "renamed: and the folder is actually gone" [ ! -d "$SESSIONS/spotless" ]
 
 # ---------------------------------------------------------------------------
 header "Test 43: a moved canonical is reported, not certified healthy"
