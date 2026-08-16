@@ -251,7 +251,11 @@ EOF
   while IFS= read -r sub; do
     [ -n "$sub" ] || continue
     [ "$i" -ge 29 ] && { warn "more than 28 sub-repos — ports beyond +28 are not allocated"; break; }
-    var=$(printf '%s' "$sub" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_')
+    # Existing underscores are doubled BEFORE other punctuation becomes one, or
+    # 'api-web' and 'api_web' would both land on PLEACH_PORT_API_WEB — the second
+    # export silently winning and putting two services back on one port, which is
+    # the exact bug this loop exists to fix. Same trick as session_slug.
+    var=$(printf '%s' "$sub" | sed 's/_/__/g' | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_')
     printf 'export PLEACH_PORT_%s=%s\n' "$var" "$((pb + i))" >> "$dir/.session-env"
     i=$((i + 1))
   done < <(session_subs "$dir")
@@ -2216,9 +2220,10 @@ Enters the session (creating it with every sub-repo if it does not exist), loads
   pleach open fix-x codex       any other LLM/command
   pleach open fix-x code        VS Code on the session's multi-root workspace
 
-Only `open` does that sourcing. A shell you opened yourself has NOT: `cd` into a
-session, run your dev server, and it binds whatever default the app has — port
-3000 on top of a colleague. Run `source .session-env` first.
+`open` does that sourcing, and so does `pleach cd` once shell-init is installed.
+A shell you opened yourself has NOT: cd in by hand, run your dev server, and it
+binds whatever default the app has — port 3000 on top of a colleague. Run
+`source .session-env` first.
 
 The block gives the root PORT and every sub-repo its own PLEACH_PORT_<SUB>, so a
 workspace with three services can run all three at once. They read $PORT, so point

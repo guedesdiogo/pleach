@@ -290,17 +290,19 @@ servers that honour `PORT` never collide without any manual step. For the rest,
 made the headline promise half-true: three services all reading `$PORT` meant the second one
 died on `EADDRINUSE` *inside a single session* — exactly the collision this tool claims to
 remove. So the block is fanned out: the root gets `PORT`, and every mounted sub-repo gets its
-own `PLEACH_PORT_<SUB>` at base+1, base+2, and so on. Point each service's dev script at its
-own variable — pleach allocates the ports, it does not start your servers.
+own `PLEACH_PORT_<SUB>` at base+1, base+2, and so on (up to 28 repos, which is where the
+reserved offsets begin). Point each service's dev script at its own variable — pleach
+allocates the ports, it does not start your servers.
 
 ```bash
 source .session-env
-PORT=$PLEACH_PORT_API  (cd api && npm run dev) &
-PORT=$PLEACH_PORT_WEB  (cd web && npm run dev) &
+(cd api && PORT=$PLEACH_PORT_API npm run dev) &
+(cd web && PORT=$PLEACH_PORT_WEB npm run dev) &
 ```
 
-Only `pleach open` sources that file for you. A shell you opened yourself has not, which is
-the quietest way to bind port 3000 on top of a colleague.
+`pleach open` sources that file for you, and so does `pleach cd` once the `shell-init`
+wrapper is installed. A shell you opened yourself has not, which is the quietest way to bind
+port 3000 on top of a colleague.
 
 Ports are only the visible half. Worktrees isolate **files**; they do nothing about the
 shared state around them — the dev database two sessions both migrate, the compose
@@ -424,7 +426,7 @@ session and the canonical by their markers rather than by hardcoded directories:
 ## Tests
 
 ```bash
-tests/run.sh          # 324 assertions across 44 scenarios, in a throwaway sandbox
+tests/run.sh          # 328 assertions across 44 scenarios, in a throwaway sandbox
 tests/no-leaks.sh     # repository hygiene gate
 shellcheck pleach install.sh tests/*.sh examples/*.sh
 ```

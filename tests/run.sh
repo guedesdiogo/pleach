@@ -1359,6 +1359,22 @@ assert_true "ports: neither is the root's PORT" \
 assert_true "ports: both sit inside the block, clear of the reserved offsets" \
   bash -c "[ $PA -gt $PB ] && [ $PA -lt $((PB + 29)) ] && [ $PM -gt $PB ] && [ $PM -lt $((PB + 29)) ]"
 
+# Two repo names that differ only in their punctuation must not land on one
+# variable: the second export would silently win and put both services back on the
+# same port — the exact bug this whole allocation exists to prevent.
+setup_repo "$CANON/pay-api"; setup_repo "$CANON/pay_api"
+for r in pay-api pay_api; do
+  echo "x" > "$CANON/$r/f.txt"
+  git -C "$CANON/$r" add -A && git -C "$CANON/$r" commit -q -m "initial"
+done
+run "$PLEACH" new punct pay-api pay_api --no-bootstrap
+assert_rc "ports: session with punctuation-colliding repo names" "$RC" 0
+P1=$(env_val "$SESSIONS/punct" PLEACH_PORT_PAY_API)
+P2=$(env_val "$SESSIONS/punct" PLEACH_PORT_PAY__API)
+assert_true "ports: 'pay-api' got a variable" [ -n "$P1" ]
+assert_true "ports: 'pay_api' got a DIFFERENT variable" [ -n "$P2" ]
+assert_true "ports: and they are different ports" [ "$P1" != "$P2" ]
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
