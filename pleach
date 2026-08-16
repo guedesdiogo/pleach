@@ -12,7 +12,7 @@
 # shellcheck disable=SC2015  # deliberate idiom: [ -z "$x" ] && x=… || err (err never runs after an assignment)
 set -euo pipefail
 
-PLEACH_VERSION="1.4.0"
+PLEACH_VERSION="1.5.0"
 
 CONF_NAME=".pleach.conf"
 USER_CONF="$HOME/.config/pleach/config"
@@ -242,6 +242,23 @@ export PLEACH_SLUG=$slug
 export PLEACH_DB_NAME=$slug
 export COMPOSE_PROJECT_NAME=$slug
 EOF
+  # One PORT is not enough for a workspace with more than one service. They all read
+  # $PORT, so the second one to start dies on EADDRINUSE — INSIDE a single session,
+  # which is the collision this tool exists to remove. The block is 100 wide; each
+  # mounted repo gets its own slot off the base, deterministic and stable across
+  # runs. WRANGLER_INSPECTOR_PORT sits at +29, so this stays below it.
+  local i=1 sub var
+  while IFS= read -r sub; do
+    [ -n "$sub" ] || continue
+    [ "$i" -ge 29 ] && { warn "more than 28 sub-repos — ports beyond +28 are not allocated"; break; }
+    # Existing underscores are doubled BEFORE other punctuation becomes one, or
+    # 'api-web' and 'api_web' would both land on PLEACH_PORT_API_WEB — the second
+    # export silently winning and putting two services back on one port, which is
+    # the exact bug this loop exists to fix. Same trick as session_slug.
+    var=$(printf '%s' "$sub" | sed 's/_/__/g' | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_')
+    printf 'export PLEACH_PORT_%s=%s\n' "$var" "$((pb + i))" >> "$dir/.session-env"
+    i=$((i + 1))
+  done < <(session_subs "$dir")
 }
 
 backfill_session_env() { # $1 dir, $2 name — adds variables introduced after this session was created
@@ -356,13 +373,25 @@ warn_if_behind() { # $1 repo, $2 label
 # Blocks shared by new/add/repos
 # ---------------------------------------------------------------------------
 add_wt() { # $1 repo, $2 target, $3 branch, [$4 base ref] — new or resumed worktree
-  local from="${4:-$BASE}"
+  local from="${4:-$BASE}" fallback
   if git -C "$1" show-ref --verify --quiet "refs/heads/$3"; then
     info "resuming existing branch $3 in $(basename "$1")"
     git -C "$1" worktree add --quiet "$2" "$3"
-  else
-    git -C "$1" worktree add --quiet -b "$3" "$2" "$from"
+    return
   fi
+  # A repo that does not carry the workspace base is not a broken repo — plenty of
+  # older ones are still on master, and PLEACH_BASE is one value for the whole
+  # workspace, so no setting satisfies both. Cutting from THIS repo's own current
+  # branch turns an adoption blocker into a line of output. Before this, a single
+  # legacy repo meant no session could be created at all, and the error was git's
+  # raw "fatal: invalid reference: main", naming neither the repo nor PLEACH_BASE.
+  if ! git -C "$1" rev-parse --verify --quiet "$from^{commit}" >/dev/null 2>&1; then
+    fallback=$(git -C "$1" symbolic-ref --quiet --short HEAD 2>/dev/null || echo "")
+    [ -n "$fallback" ] || err "$(basename "$1"): has neither '$from' nor a checked-out branch to cut from"
+    warn "$(basename "$1"): no '$from' here — cutting from '$fallback' instead"
+    from="$fallback"
+  fi
+  git -C "$1" worktree add --quiet -b "$3" "$2" "$from"
 }
 
 resolve_from_ref() { # $1 repo, $2 requested, $3 label — echoes the ref to cut from
@@ -574,6 +603,17 @@ cmd_new() {
   local port_base=$((PORT_START + idx * 100))
 
   info "creating session '$name' (index $idx, ports ${port_base}-$((port_base + 99))) at $dir"
+  # A block freed by `rm` is handed out again immediately, and a dev server that
+  # outlived its worktree is still holding it. Silently issuing an occupied block
+  # means the next session's app answers on the previous one's port — worse than
+  # the crash, because it looks like it worked.
+  local squatters
+  squatters=$(session_listeners "$port_base")
+  if [ -n "$squatters" ]; then
+    warn "block ${port_base}-$((port_base + 99)) already has $(printf '%s\n' "$squatters" | wc -l | tr -d ' ') listener(s) — a previous session's processes outlived it:"
+    printf '%s\n' "$squatters" | sed 's/^/      /' >&2
+    warn "kill them before starting anything here, or this session will answer on their ports"
+  fi
   [ -n "$from" ] && info "cutting from '$from' instead of $BASE"
   # from_used separates "I asked for --from x" from "I actually cut from x". If no
   # repo had the ref and every one fell back to the base, recording 'x' as the
@@ -632,7 +672,7 @@ cmd_new() {
   echo "✅ Session '$name' ready:"
   echo "   cd $dir"
   echo "   branch $branch in: root ${subs[*]+${subs[*]}}"
-  echo "   ports: source .session-env  (PORT=$port_base, DB/compose: $(session_slug "$name"))"
+  echo "   ports: source .session-env  (PORT=$port_base, one PLEACH_PORT_<SUB> per repo, DB/compose: $(session_slug "$name"))"
   echo "   VS Code: pleach open $name code  (or: code '$dir.code-workspace')"
   echo "   ⚠ deploys/shared state: from the canonical only — never from here."
 }
@@ -1979,7 +2019,8 @@ copy here would. Go to it rather than assume:
   origin — a PR merged on the remote is invisible until `git fetch`.
 - `pleach ls --json` is the machine surface; the human table is not a contract. There is no
   MCP server, and the shell-out is the interface deliberately.
-- `.session-env` holds `PORT` and the runtime identity (`PLEACH_DB_NAME`,
+- `.session-env` holds `PORT`, one `PLEACH_PORT_<SUB>` per mounted repo (they all read
+  `$PORT`, so point each service at its own), and the runtime identity (`PLEACH_DB_NAME`,
   `COMPOSE_PROJECT_NAME`) — the state git does not isolate. `pleach open` sources it for
   the command it launches; a shell you opened yourself has not.
 
@@ -2178,6 +2219,16 @@ Enters the session (creating it with every sub-repo if it does not exist), loads
   pleach open fix-x claude -r   resume that session's previous conversation
   pleach open fix-x codex       any other LLM/command
   pleach open fix-x code        VS Code on the session's multi-root workspace
+
+`open` does that sourcing, and so does `pleach cd` once shell-init is installed.
+A shell you opened yourself has NOT: cd in by hand, run your dev server, and it
+binds whatever default the app has — port 3000 on top of a colleague. Run
+`source .session-env` first.
+
+The block gives the root PORT and every sub-repo its own PLEACH_PORT_<SUB>, so a
+workspace with three services can run all three at once. They read $PORT, so point
+each one at its own variable (PORT=$PLEACH_PORT_API npm run dev, or a two-line
+dev script) — pleach allocates the ports, it does not start your servers.
 EOF
     ;;
     ls) cat <<'EOF'
@@ -2498,6 +2549,12 @@ EOF
   PLEACH_BASE=main            Base branch for sessions.
   PLEACH_DIR=/path/.sessions  Where sessions live.
   PLEACH_PORT_START=10000     Start of the port blocks (session N gets +N*100).
+                              Inside a block, the root gets PORT (= the base) and
+                              every mounted sub-repo gets PLEACH_PORT_<SUB> at
+                              base+1, base+2, … — because one PORT for a workspace
+                              with three services means the second one dies on
+                              EADDRINUSE inside a single session. Point each
+                              service's dev script at its own variable.
   PLEACH_SECRETS_EXTRA=(...)  Extra relative paths to copy into each session.
   pleach_bootstrap() { ... }  Post-creation hook. $1 = session folder,
                               $2 = sub being mounted (empty = whole session, in
