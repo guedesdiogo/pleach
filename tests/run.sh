@@ -1186,6 +1186,82 @@ run env HOME="$SANDBOX/empty-home" "$PLEACH" doctor
 assert_not_contains "doctor/skill: silent when no skill is installed" "$OUT" "agent skill"
 
 # ---------------------------------------------------------------------------
+header "Test 41: untracked files are pending work — the data-loss case"
+# ---------------------------------------------------------------------------
+# Found by an outsider running the PUBLISHED package against a project this suite
+# had never seen. The pending-work check read --untracked-files=no, so a session
+# whose only content was files never `git add`ed reported as empty: `ls -l` called
+# it "fully integrated — removable" and `rm` deleted it, green tick, exit 0. The
+# content had never entered the object store, so it was simply gone. `git worktree
+# remove` refuses exactly this; pleach was going around it.
+run "$PLEACH" new lossy --no-bootstrap
+assert_rc "untracked: session created" "$RC" 0
+printf 'the only copy of this\n' > "$SESSIONS/lossy/subA/brand-new.js"
+
+run "$PLEACH" ls -l
+assert_contains "untracked: ls -l counts it as a change" "$OUT" "✎1 changes"
+
+# The decisive assertion: it must NOT be advertised as safe to delete.
+LOSSY_BLOCK=$(printf '%s\n' "$OUT" | awk '/^● lossy /{p=1} p&&/^● /&&!/lossy/{p=0} p')
+assert_not_contains "untracked: ls -l does NOT call it removable" \
+  "$LOSSY_BLOCK" "fully integrated"
+
+run "$PLEACH" rm lossy
+assert_rc "untracked: rm refuses" "$RC" 1
+assert_contains "untracked: and says why" "$OUT" "uncommitted or untracked changes"
+assert_true "untracked: the file is still there" [ -f "$SESSIONS/lossy/subA/brand-new.js" ]
+
+run "$PLEACH" prune
+assert_not_contains "untracked: prune does not offer to remove it" "$OUT" "✓ lossy"
+
+# The negative that keeps the fix honest: a genuinely empty session must still be
+# removable, or this "fix" would have broken post-merge hygiene for everyone.
+run "$PLEACH" new spotless --no-bootstrap
+assert_rc "untracked: a clean session was created" "$RC" 0
+run "$PLEACH" ls -l
+SPOTLESS_BLOCK=$(printf '%s\n' "$OUT" | awk '/^● spotless /{p=1} p&&/^● /&&!/spotless/{p=0} p')
+assert_contains "untracked: a clean session is STILL removable" \
+  "$SPOTLESS_BLOCK" "fully integrated"
+
+# .session-env lives inside the root worktree. Without the exclude, a `git add -A`
+# at the session root commits this machine's ports and canonical path onto the
+# branch — and under the rule above it would also make every session permanently
+# dirty, breaking prune for everyone.
+assert_eq "untracked: .session-env does not dirty the session root" \
+  "$(git -C "$SESSIONS/spotless" status --porcelain -- .session-env)" ""
+
+# ---------------------------------------------------------------------------
+header "Test 42: a renamed session folder is refused, not guessed at"
+# ---------------------------------------------------------------------------
+# Identity came from the folder name, so renaming it (the ticket got renamed…)
+# made the branch lookup miss, the session read as empty, and rm deleted it — with
+# committed work surviving only as an orphan branch that nothing lists.
+echo "committed work" > "$SESSIONS/spotless/subA/real-work.js"
+git -C "$SESSIONS/spotless/subA" add -A
+git -C "$SESSIONS/spotless/subA" commit -q -m "work that must not vanish"
+mv "$SESSIONS/spotless" "$SESSIONS/spotless-renamed"
+
+run "$PLEACH" rm spotless-renamed
+assert_rc "renamed: rm refuses" "$RC" 1
+assert_contains "renamed: names both the folder and the record" "$OUT" "says 'spotless'"
+assert_contains "renamed: and how to undo it" "$OUT" "Rename it back"
+assert_true "renamed: nothing was removed" [ -d "$SESSIONS/spotless-renamed" ]
+
+# --force must not override this: the guard rails cannot be evaluated at all, so
+# forcing would mean deleting blind.
+run "$PLEACH" rm spotless-renamed --force
+assert_rc "renamed: --force does not override it either" "$RC" 1
+assert_true "renamed: still nothing removed" [ -d "$SESSIONS/spotless-renamed" ]
+
+run "$PLEACH" doctor
+assert_rc "renamed: doctor reports it" "$RC" 1
+assert_contains "renamed: doctor names the mismatch" "$OUT" "says 'spotless'"
+
+mv "$SESSIONS/spotless-renamed" "$SESSIONS/spotless"
+run "$PLEACH" rm spotless --force
+assert_rc "renamed: removable again once the name matches" "$RC" 0
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
