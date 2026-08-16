@@ -1770,10 +1770,32 @@ cmd_doctor() {
   # Worktrees git still believes in, whose folder is gone. They make the next
   # `new` fail with a confusing "already used by worktree" and are invisible
   # from the session side, because the session is precisely what vanished.
+  local repo label wt norm
+  # REPAIR FIRST, before anything is inspected or pruned. A moved canonical leaves
+  # every worktree's back-link broken while the FOLDERS ALL STILL EXIST — so nothing
+  # is "registered but gone", and a repair hung off the stale-registration branch
+  # never runs at all. Every check below is more accurate on a repaired tree, and
+  # repair is idempotent and cannot lose work, which is what earns it a place here.
+  #
+  # Bare `repair` covers the canonical having moved: the recorded gitdir still points
+  # at the worktrees, so git can find and re-link them. It cannot cover a worktree
+  # that itself moved, because there the recorded path is the stale half — for those
+  # the current locations have to be handed over, which is what is on disk.
+  if [ "$fix" -eq 1 ]; then
+    local -a here=()
+    while IFS= read -r wt; do [ -n "$wt" ] && here+=("$wt"); done < <(
+      find "$SESSIONS" -mindepth 1 -maxdepth 2 -name .git 2>/dev/null | sed 's|/\.git$||'
+    )
+    for s in "" ${detected[@]+"${detected[@]}"}; do
+      repo=$(repo_path "$s")
+      git -C "$repo" worktree repair 2>/dev/null || true
+      [ ${#here[@]} -gt 0 ] && git -C "$repo" worktree repair "${here[@]}" 2>/dev/null || true
+    done
+  fi
+
   echo ""
   echo "worktree registrations"
   local -a stale=()
-  local repo label wt norm
   for s in "" ${detected[@]+"${detected[@]}"}; do
     repo=$(repo_path "$s"); label="${s:-root}"
     while IFS= read -r wt; do
@@ -1787,17 +1809,12 @@ cmd_doctor() {
   if [ ${#stale[@]} -eq 0 ]; then
     dr_ok "no stale worktree registrations"
   elif [ "$fix" -eq 1 ]; then
-    # REPAIR BEFORE PRUNE. A worktree whose folder moved and one whose folder is gone
-    # look identical from the registration side, and pruning the first destroys the
-    # link that would have restored it — the opposite of "repairs that cannot lose
-    # work". `worktree repair` is idempotent and fixes only what it can prove.
-    for s in "" ${detected[@]+"${detected[@]}"}; do
-      git -C "$(repo_path "$s")" worktree repair 2>/dev/null || true
-    done
+    # Repair already ran above, so whatever is still stale here genuinely has no
+    # folder to point at and pruning it cannot lose anything.
     for s in "" ${detected[@]+"${detected[@]}"}; do
       git -C "$(repo_path "$s")" worktree prune 2>/dev/null || true
     done
-    dr_ok "repaired what could be repaired, pruned the rest of ${#stale[@]} registration(s)"
+    dr_ok "pruned ${#stale[@]} stale registration(s) that repair could not restore"
   else
     for wt in "${stale[@]}"; do dr_bad "registered but gone — $wt"; done
     dr_note "clear them with: pleach doctor --fix"

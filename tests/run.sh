@@ -1262,6 +1262,56 @@ run "$PLEACH" rm spotless --force
 assert_rc "renamed: removable again once the name matches" "$RC" 0
 
 # ---------------------------------------------------------------------------
+header "Test 43: a moved canonical is reported, not certified healthy"
+# ---------------------------------------------------------------------------
+# `branch --show-current` returns empty both for a detached HEAD and for a repo git
+# cannot open, and doctor reported the second as the first — printing "✅ no problems
+# found" over a workspace where every repo answered "fatal: not a git repository".
+# Its own folders all still exist, so nothing is "registered but gone" either: the
+# first version of the fix hung repair off the stale-registration branch and never
+# ran at all.
+#
+# A separate mini workspace, because this scenario moves a canonical and the suite's
+# own is pinned by PLEACH_EXPECT_CANONICAL.
+MINI="$SANDBOX/mini"
+mkdir -p "$MINI"
+setup_repo "$MINI/canon"
+echo "root" > "$MINI/canon/f.txt"
+git -C "$MINI/canon" add -A && git -C "$MINI/canon" commit -q -m "initial"
+setup_repo "$MINI/canon/svc"
+echo "svc" > "$MINI/canon/svc/f.txt"
+git -C "$MINI/canon/svc" add -A && git -C "$MINI/canon/svc" commit -q -m "initial"
+
+run bash -c "cd '$MINI/canon' && env PLEACH_CANONICAL='$MINI/canon' PLEACH_EXPECT_CANONICAL='$MINI/canon' '$PLEACH' init"
+assert_rc "moved canonical: mini workspace adopted" "$RC" 0
+run env PLEACH_CANONICAL="$MINI/canon" PLEACH_EXPECT_CANONICAL="$MINI/canon" "$PLEACH" new relocate --no-bootstrap
+assert_rc "moved canonical: session created" "$RC" 0
+
+echo "must survive" > "$MINI/.sessions/relocate/svc/keepme.txt"
+git -C "$MINI/.sessions/relocate/svc" add -A
+git -C "$MINI/.sessions/relocate/svc" commit -q -m "work that must survive the move"
+
+mv "$MINI/canon" "$MINI/canon-moved"
+
+run env PLEACH_CANONICAL="$MINI/canon-moved" PLEACH_EXPECT_CANONICAL="$MINI/canon-moved" "$PLEACH" doctor
+assert_rc "moved canonical: doctor exits non-zero" "$RC" 1
+assert_contains "moved canonical: names it as unusable, not detached" \
+  "$OUT" "not a usable git worktree"
+assert_contains "moved canonical: hands over the repair command" "$OUT" "worktree repair"
+assert_not_contains "moved canonical: does NOT certify it healthy" "$OUT" "no problems found"
+
+run env PLEACH_CANONICAL="$MINI/canon-moved" PLEACH_EXPECT_CANONICAL="$MINI/canon-moved" "$PLEACH" doctor --fix
+assert_rc "moved canonical: --fix repairs it" "$RC" 0
+assert_contains "moved canonical: and says so" "$OUT" "no problems found"
+
+# The point of a repair is what survives it.
+assert_eq "moved canonical: the session's commit survived" \
+  "$(git -C "$MINI/.sessions/relocate/svc" log --oneline -1 --format='%s')" \
+  "work that must survive the move"
+assert_true "moved canonical: and its file is still on disk" \
+  [ -f "$MINI/.sessions/relocate/svc/keepme.txt" ]
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
