@@ -1322,6 +1322,44 @@ assert_true "moved canonical: and its file is still on disk" \
   [ -f "$MINI/.sessions/relocate/svc/keepme.txt" ]
 
 # ---------------------------------------------------------------------------
+header "Test 44: a repo on master still gets a session, and every service gets a port"
+# ---------------------------------------------------------------------------
+# Both from the outsider reports. PLEACH_BASE is one value for the whole workspace,
+# so a single repo still on master meant NO session could be created at all — the
+# error was git's raw "fatal: invalid reference: main", naming neither the repo nor
+# the setting, and it left a half-built session behind. And the block is 100 ports
+# wide but only one PORT was exported, so the second service in a session died on
+# EADDRINUSE: the collision this tool exists to remove, inside a single session.
+setup_repo "$CANON/subM"
+echo "legacy service" > "$CANON/subM/f.txt"
+git -C "$CANON/subM" add -A && git -C "$CANON/subM" commit -q -m "initial"
+git -C "$CANON/subM" branch -m main master
+assert_eq "master: the fixture repo really is on master" \
+  "$(git -C "$CANON/subM" branch --show-current)" "master"
+
+run "$PLEACH" new legacy subA subM --no-bootstrap
+assert_rc "master: the session is created anyway" "$RC" 0
+assert_contains "master: and names the repo that fell back" "$OUT" "cutting from 'master' instead"
+assert_true "master: the legacy repo really got a worktree" [ -e "$SESSIONS/legacy/subM/.git" ]
+assert_eq "master: on the session branch like every other repo" \
+  "$(git -C "$SESSIONS/legacy/subM" branch --show-current)" "session/legacy"
+assert_true "master: the session is complete, not half-built" \
+  [ -f "$SESSIONS/legacy/.session-env" ]
+
+PB=$(env_val "$SESSIONS/legacy" PLEACH_PORT_BASE)
+PA=$(env_val "$SESSIONS/legacy" PLEACH_PORT_SUBA)
+PM=$(env_val "$SESSIONS/legacy" PLEACH_PORT_SUBM)
+assert_true "ports: subA got its own" [ -n "$PA" ]
+assert_true "ports: subM got its own" [ -n "$PM" ]
+assert_true "ports: the two services do not share one" [ "$PA" != "$PM" ]
+assert_true "ports: neither is the root's PORT" \
+  bash -c "[ '$PA' != '$PB' ] && [ '$PM' != '$PB' ]"
+# Below +29, where WRANGLER_INSPECTOR_PORT lives — otherwise the fix would collide
+# with offsets that were already reserved.
+assert_true "ports: both sit inside the block, clear of the reserved offsets" \
+  bash -c "[ $PA -gt $PB ] && [ $PA -lt $((PB + 29)) ] && [ $PM -gt $PB ] && [ $PM -lt $((PB + 29)) ]"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
