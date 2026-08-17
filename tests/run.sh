@@ -123,6 +123,14 @@ setup_repo() { # $1 = directory to initialise as a fresh git repo
   git -C "$1" config user.name "test"
 }
 
+# The lock pleach takes is a SYMLINK whose target names its owner, so a lock is
+# present in either of two shapes: that symlink, or a directory left by an older
+# version. `-d` alone silently stops testing — it is false for a symlink, so
+# `[ ! -d ]` would pass over a lock that had leaked. `-e` alone is not enough
+# either: the symlink's target ("<pid> <host>") does not exist, so it dangles.
+lock_held()  { [ -L "$SESSIONS/.pleach.lock" ] || [ -e "$SESSIONS/.pleach.lock" ]; }
+lock_clear() { ! lock_held; }
+
 setup_fixture() {
   setup_repo "$CANON"
   echo "# canon" > "$CANON/README.md"
@@ -945,8 +953,7 @@ assert_true "concurrent new: the two port blocks differ ($PB_A vs $PB_B)" \
 run "$PLEACH" doctor
 assert_not_contains "concurrent new: doctor finds no duplicate index or block" \
   "$OUT" "is already taken by another session"
-assert_true "concurrent new: the lock was released by both runs" \
-  [ ! -d "$SESSIONS/.pleach.lock" ]
+assert_true "concurrent new: the lock was released by both runs" lock_clear
 
 # ---------------------------------------------------------------------------
 header "Test 36: a run killed mid-creation leaves a lock doctor can name and --fix can clear"
@@ -998,29 +1005,37 @@ for attempt in 1 2 3; do
   "$PLEACH" new "crashy$attempt" --no-bootstrap >/dev/null 2>&1 &
   CRASHY=$!
   for _ in $(seq 1 400); do
-    [ -d "$SESSIONS/.pleach.lock" ] && break
+    lock_held && break
     sleep 0.05
   done
-  if [ -d "$SESSIONS/.pleach.lock" ] && kill -0 "$CRASHY" 2>/dev/null; then
+  if lock_held && kill -0 "$CRASHY" 2>/dev/null; then
     kill -9 "$CRASHY" 2>/dev/null || true
     wait "$CRASHY" 2>/dev/null || true
     # It only counts if the lock outlived it — SIGKILL runs no EXIT trap.
-    [ -d "$SESSIONS/.pleach.lock" ] && { CAUGHT=1; break; }
+    lock_held && { CAUGHT=1; break; }
   else
     wait "$CRASHY" 2>/dev/null || true
   fi
 done
 
 assert_eq "killed run: caught a run holding the lock, within 3 attempts" "$CAUGHT" "1"
-assert_true "killed run: the lock outlived the process (SIGKILL runs no EXIT trap)" \
-  [ -d "$SESSIONS/.pleach.lock" ]
+assert_true "killed run: the lock outlived the process (SIGKILL runs no EXIT trap)" lock_held
+
+# The whole point of the symlink: taking the lock and recording who holds it are
+# ONE step, so a lock that exists always names an owner — whenever the kill lands.
+# When they were two steps (mkdir, then write `owner`, with a fork in between) a
+# kill inside that window left an owner-less lock, which doctor must refuse to
+# clear and --fix declined; every later `new` in the suite then failed behind it,
+# five tests away from the cause. That is the "intermittent" failure, ~1 in 9.
+assert_true "killed run: the orphaned lock still names its owner" \
+  bash -c "[ -n \"\$(readlink '$SESSIONS/.pleach.lock' 2>/dev/null)\" ]"
 
 run "$PLEACH" doctor
 assert_rc "killed run: doctor exits non-zero" "$RC" 1
 assert_contains "killed run: doctor names the dead owner" "$OUT" "no longer running"
 
 run "$PLEACH" doctor --fix
-assert_true "killed run: --fix released the lock" [ ! -d "$SESSIONS/.pleach.lock" ]
+assert_true "killed run: --fix released the lock" lock_clear
 
 # The point of a repair is that the workspace works again afterwards.
 run "$PLEACH" new after-crash --no-bootstrap
@@ -1374,6 +1389,101 @@ P2=$(env_val "$SESSIONS/punct" PLEACH_PORT_PAY__API)
 assert_true "ports: 'pay-api' got a variable" [ -n "$P1" ]
 assert_true "ports: 'pay_api' got a DIFFERENT variable" [ -n "$P2" ]
 assert_true "ports: and they are different ports" [ "$P1" != "$P2" ]
+
+# ---------------------------------------------------------------------------
+header "Test 45: inside a session, the session is not the canonical"
+# ---------------------------------------------------------------------------
+# `pleach init` writes a .pleach.conf that does NOT set PLEACH_CANONICAL, and that
+# file is meant to be committed — it carries PLEACH_SUBS for the team. So every
+# session's root worktree receives a copy, and resolve_canonical tested
+# .pleach.conf BEFORE .session-env at the same level: the conf named no canonical,
+# so the session folder itself became one. In a shell that had not sourced
+# .session-env — a fresh terminal, or any agent running `pleach ls` in a session
+# cwd — `ls` lost the very session it stood in, `rm` could not find it, `new` built
+# a nested .sessions/.sessions with worktrees cut from the session instead of the
+# canonical (and a DB/compose slug of `inner_*`), and `doctor` printed "no problems
+# found" over all of it. The right answer was one line further down the same
+# directory, in a file pleach wrote itself.
+NOHOME="$SANDBOX/nohome"   # so a failed resolution cannot reach the real ~/.config
+mkdir -p "$SANDBOX/nested" "$NOHOME"
+# Collapsed on purpose: on macOS $TMPDIR ends in a slash, so $SANDBOX carries a
+# doubled one — while the paths pleach prints come from $PWD, which the shell
+# collapses. Comparing the two forms makes every path assertion below pass
+# vacuously, which is how the first version of this test certified the defect.
+MINI2=$(cd "$SANDBOX/nested" && pwd)
+setup_repo "$MINI2/canon"
+echo "root" > "$MINI2/canon/f.txt"
+git -C "$MINI2/canon" add -A && git -C "$MINI2/canon" commit -q -m "initial"
+setup_repo "$MINI2/canon/api"
+echo "api" > "$MINI2/canon/api/f.txt"
+git -C "$MINI2/canon/api" add -A && git -C "$MINI2/canon/api" commit -q -m "initial"
+
+PIN2="env PLEACH_CANONICAL=$MINI2/canon PLEACH_EXPECT_CANONICAL=$MINI2/canon"
+run bash -c "cd '$MINI2/canon' && $PIN2 '$PLEACH' init"
+assert_rc "nested: mini workspace adopted" "$RC" 0
+# The precondition of the whole bug: what init writes names no canonical.
+assert_true "nested: the conf init writes sets no canonical of its own" \
+  bash -c "! grep -q '^[[:space:]]*PLEACH_CANONICAL=' '$MINI2/canon/.pleach.conf'"
+git -C "$MINI2/canon" add -A && git -C "$MINI2/canon" commit -q -m "adopt pleach"
+
+run bash -c "$PIN2 '$PLEACH' new inner --no-bootstrap"
+assert_rc "nested: session created" "$RC" 0
+# And the carrier: the committed conf travels into the session's root worktree.
+assert_true "nested: the session carries a copy of the committed conf" \
+  [ -f "$MINI2/.sessions/inner/.pleach.conf" ]
+assert_true "nested: and its .session-env records the real canonical" \
+  bash -c "grep -q '^export PLEACH_CANONICAL=\"$MINI2/canon\"' '$MINI2/.sessions/inner/.session-env'"
+
+# From here on: a clean shell inside the session. Nothing sourced, nothing pinned.
+BARE="env -u PLEACH_CANONICAL -u PLEACH_EXPECT_CANONICAL HOME=$NOHOME"
+
+run bash -c "cd '$MINI2/.sessions/inner' && $BARE '$PLEACH' ls"
+assert_rc "nested: ls from inside the session works" "$RC" 0
+assert_contains "nested: and it still sees the session it stands in" "$OUT" "inner"
+assert_not_contains "nested: no doubled sessions directory" "$OUT" ".sessions/.sessions"
+
+run bash -c "cd '$MINI2/.sessions/inner/api' && $BARE '$PLEACH' ls"
+assert_rc "nested: ls from a sub-repo of the session works" "$RC" 0
+assert_contains "nested: and sees the session from there too" "$OUT" "inner"
+
+run bash -c "cd '$MINI2/.sessions/inner' && $BARE '$PLEACH' doctor"
+assert_contains "nested: doctor resolves the real canonical" "$OUT" "canonical: $MINI2/canon"
+assert_not_contains "nested: not the session it was run from" \
+  "$OUT" "canonical: $MINI2/.sessions/inner"
+
+# The write path is what makes this more than a display problem.
+run bash -c "cd '$MINI2/.sessions/inner' && $BARE '$PLEACH' new sibling --no-bootstrap"
+assert_rc "nested: new from inside a session succeeds" "$RC" 0
+assert_true "nested: and lands beside the session, not under it" \
+  [ -f "$MINI2/.sessions/sibling/.session-env" ]
+assert_true "nested: nothing was built in a doubled sessions directory" \
+  [ ! -d "$MINI2/.sessions/.sessions" ]
+assert_eq "nested: its branch was cut from the canonical, not from the session" \
+  "$(git -C "$MINI2/.sessions/sibling" branch --show-current)" "session/sibling"
+# The runtime identity the git layer cannot isolate: DB names and compose projects.
+# Doubled underscore by design, not a typo — sanitize_ident doubles the ones already
+# present so that 'fix-login' and 'fix_login' cannot share a database, and the
+# separator between canonical and session name goes through the same pass.
+assert_eq "nested: the runtime slug names the canonical, not the sibling session" \
+  "$(env_val "$MINI2/.sessions/sibling" PLEACH_SLUG)" "canon__sibling"
+
+# Asserted, not assumed: without this the removal assertion below passes vacuously
+# whenever creation failed — a green tick over a session that never existed.
+SIB_BEFORE=no
+[ -d "$MINI2/.sessions/sibling" ] && SIB_BEFORE=yes
+assert_eq "nested: the sibling session exists before the removal" "$SIB_BEFORE" "yes"
+
+run bash -c "cd '$MINI2/.sessions/sibling' && $BARE '$PLEACH' rm sibling --force"
+assert_rc "nested: and rm can find the session it is standing in" "$RC" 0
+assert_true "nested: which is really gone" [ ! -d "$MINI2/.sessions/sibling" ]
+
+# Defence in depth: even with the order right, a canonical that is itself a session
+# is a misresolution, and doctor's job is to refuse rather than certify it. This is
+# the assertion that would have caught the original defect on its own.
+run bash -c "$BARE PLEACH_CANONICAL='$MINI2/.sessions/inner' '$PLEACH' doctor"
+assert_rc "nested: doctor refuses a canonical that is itself a session" "$RC" 1
+assert_contains "nested: and says exactly that" "$OUT" "is itself a session"
+assert_not_contains "nested: without certifying it healthy" "$OUT" "no problems found"
 
 # ---------------------------------------------------------------------------
 # Summary
