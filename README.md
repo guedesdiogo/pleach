@@ -238,10 +238,14 @@ A bash file, sourced, at the canonical's root. Everything optional:
 | `PLEACH_SECRETS_EXTRA=(…)` | `(.claude/settings.local.json)` | Extra relative paths to copy into each session |
 | `pleach_bootstrap() {…}` | `bun install` where a `package.json` is | Post-creation hook: `npm ci`, `go mod download`, `make setup`, whatever the project needs |
 
-The canonical is resolved in order: the `PLEACH_CANONICAL` env var, then `.pleach.conf`
-walking up from the cwd, then `.session-env` walking up (you are inside a session), then
+The canonical is resolved in order: the `PLEACH_CANONICAL` env var, then `.session-env`
+walking up from the cwd (you are inside a session), then `.pleach.conf` walking up, then
 `~/.config/pleach/config`. With a machine default recorded, `pleach ls`/`new` work from
 anywhere.
+
+`.session-env` before `.pleach.conf` on purpose: both files sit in a session's root
+worktree, since the conf is meant to be committed and travels with the branch. Reading
+the conf first made a session its own canonical.
 
 ## Daily use
 

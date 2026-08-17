@@ -2623,9 +2623,12 @@ EOF
 
 Canonical resolution, in order:
   1. env PLEACH_CANONICAL
-  2. .pleach.conf walking up from the cwd (may redirect via PLEACH_CANONICAL)
-  3. .session-env walking up (we are inside a session)
+  2. .session-env walking up from the cwd (we are inside a session)
+  3. .pleach.conf walking up (may redirect via PLEACH_CANONICAL)
   4. ~/.config/pleach/config -> PLEACH_DEFAULT_CANONICAL
+
+  2 before 3 on purpose: both files sit in a session's root worktree, because
+  the conf is meant to be committed. .session-env is the more specific answer.
 
 Guard rail for automation/harnesses (env, not conf):
   PLEACH_EXPECT_CANONICAL=/path   If the RESOLVED canonical differs from this
