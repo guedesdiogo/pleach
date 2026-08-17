@@ -426,7 +426,7 @@ session and the canonical by their markers rather than by hardcoded directories:
 ## Tests
 
 ```bash
-tests/run.sh          # 328 assertions across 44 scenarios, in a throwaway sandbox
+tests/run.sh          # 352 assertions across 45 scenarios, in a throwaway sandbox
 tests/no-leaks.sh     # repository hygiene gate
 shellcheck pleach install.sh tests/*.sh examples/*.sh
 ```
@@ -439,7 +439,8 @@ pattern-matched), `path`/`cd`/`shell-init`/`completions` (the emitted scripts ar
 checked), `doctor` against a planted stale lock and a planted conf/disk drift, `conflicts` against both a real
 conflict and a mere overlap (the decisive assertion is that a file two sessions edit in
 *distant regions* is reported as an overlap and **not** as a conflict — the exact case the
-old heuristic got wrong), `new --from` stacking a session on another's unmerged commits,
+old heuristic got wrong), every command run from *inside* a session with nothing sourced (the
+shape an agent arrives in), `new --from` stacking a session on another's unmerged commits,
 help coverage for every command, the emitted agent skill (frontmatter, its
 character budget, all three install destinations and the anti-drift check), and that `open`
 really runs inside the session.
@@ -463,6 +464,15 @@ its owner: precisely the "run that died mid-way" `doctor` promises to detect. It
 `doctor` exits non-zero and names the dead owner, that `--fix` releases it, and — the part
 that matters — that a session can be created again afterwards. A repair whose only evidence
 is its own success message is not a repair.
+
+That scenario earned its keep. It failed about one run in nine, and the failure it reported
+was five scenarios downstream of its cause — which is what made it look like flakiness worth
+waiting out. It was not: taking the lock and recording its owner were two steps with a `fork`
+between them, and a kill landing in that window left a lock with no owner. An owner-less lock
+is the one shape `doctor` must refuse to clear, because it cannot be told from a live run's,
+so `--fix` declined and every later creation queued behind it. The lock is now a symlink whose
+target *is* the owner, created in one atomic step, and the scenario asserts that a lock which
+exists always names who holds it.
 
 Catching a run mid-lock is inherently a race, and on a loaded machine it is lost: the run
 finishes before the kill lands and four assertions fail in a cascade that says nothing about
