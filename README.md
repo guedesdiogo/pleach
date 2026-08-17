@@ -238,10 +238,14 @@ A bash file, sourced, at the canonical's root. Everything optional:
 | `PLEACH_SECRETS_EXTRA=(…)` | `(.claude/settings.local.json)` | Extra relative paths to copy into each session |
 | `pleach_bootstrap() {…}` | `bun install` where a `package.json` is | Post-creation hook: `npm ci`, `go mod download`, `make setup`, whatever the project needs |
 
-The canonical is resolved in order: the `PLEACH_CANONICAL` env var, then `.pleach.conf`
-walking up from the cwd, then `.session-env` walking up (you are inside a session), then
+The canonical is resolved in order: the `PLEACH_CANONICAL` env var, then `.session-env`
+walking up from the cwd (you are inside a session), then `.pleach.conf` walking up, then
 `~/.config/pleach/config`. With a machine default recorded, `pleach ls`/`new` work from
 anywhere.
+
+`.session-env` before `.pleach.conf` on purpose: both files sit in a session's root
+worktree, since the conf is meant to be committed and travels with the branch. Reading
+the conf first made a session its own canonical.
 
 ## Daily use
 
@@ -426,7 +430,7 @@ session and the canonical by their markers rather than by hardcoded directories:
 ## Tests
 
 ```bash
-tests/run.sh          # 328 assertions across 44 scenarios, in a throwaway sandbox
+tests/run.sh          # 353 assertions across 45 scenarios, in a throwaway sandbox
 tests/no-leaks.sh     # repository hygiene gate
 shellcheck pleach install.sh tests/*.sh examples/*.sh
 ```
@@ -439,7 +443,8 @@ pattern-matched), `path`/`cd`/`shell-init`/`completions` (the emitted scripts ar
 checked), `doctor` against a planted stale lock and a planted conf/disk drift, `conflicts` against both a real
 conflict and a mere overlap (the decisive assertion is that a file two sessions edit in
 *distant regions* is reported as an overlap and **not** as a conflict — the exact case the
-old heuristic got wrong), `new --from` stacking a session on another's unmerged commits,
+old heuristic got wrong), every command run from *inside* a session with nothing sourced (the
+shape an agent arrives in), `new --from` stacking a session on another's unmerged commits,
 help coverage for every command, the emitted agent skill (frontmatter, its
 character budget, all three install destinations and the anti-drift check), and that `open`
 really runs inside the session.
@@ -463,6 +468,22 @@ its owner: precisely the "run that died mid-way" `doctor` promises to detect. It
 `doctor` exits non-zero and names the dead owner, that `--fix` releases it, and — the part
 that matters — that a session can be created again afterwards. A repair whose only evidence
 is its own success message is not a repair.
+
+That scenario earned its keep. It failed about one run in nine, and the failure it reported
+was five scenarios downstream of its cause — which is what made it look like flakiness worth
+waiting out. It was not: taking the lock and recording its owner were two steps with a `fork`
+between them, and a kill landing in that window left a lock with no owner. An owner-less lock
+is the one shape `doctor` must refuse to clear, because it cannot be told from a live run's,
+so `--fix` declined and every later creation queued behind it. The owner line is now composed
+in a scratch file and **hard-linked** into place, so the lock is complete at the instant it
+begins to exist, and the scenario asserts that a lock which exists always names who holds it.
+
+A symlink carrying the owner in its target is atomic too, and was the first fix — the Windows
+job rejected it. Under Git Bash as CI runs it, `ln -s` did not produce a link `[ -L ]` would
+recognise, so `pleach new` failed outright and the next one sat out the full 120-second lock
+timeout. Real symlinks there depend on `MSYS=winsymlinks:nativestrict` plus the privilege to
+create them, which is not something a tool can assume of the shell it is invoked from. Hard
+links need no such opt-in.
 
 Catching a run mid-lock is inherently a race, and on a loaded machine it is lost: the run
 finishes before the kill lands and four assertions fail in a cascade that says nothing about

@@ -12,7 +12,7 @@
 # shellcheck disable=SC2015  # deliberate idiom: [ -z "$x" ] && x=… || err (err never runs after an assignment)
 set -euo pipefail
 
-PLEACH_VERSION="1.5.0"
+PLEACH_VERSION="1.5.1"
 
 CONF_NAME=".pleach.conf"
 USER_CONF="$HOME/.config/pleach/config"
@@ -39,14 +39,24 @@ resolve_canonical() {
   fi
   local d="$PWD" c
   while [ "$d" != "/" ]; do
+    # .session-env BEFORE .pleach.conf, and the order is the whole point: inside a
+    # session both files sit in the same directory. The conf is meant to be
+    # committed — it carries PLEACH_SUBS for the team — so a copy travels into
+    # every session's root worktree, and the conf `init` writes names no canonical.
+    # Testing it first therefore fell through to `CANONICAL="$d"` and made the
+    # session its own canonical: `ls` lost the session it stood in, `new` built a
+    # nested .sessions/.sessions off the session's own worktrees, the runtime slug
+    # (DB and compose names) was cut from the wrong basename, and doctor certified
+    # the lot. .session-env is both the more specific answer and the one pleach
+    # wrote itself, so it wins.
+    if [ -f "$d/.session-env" ]; then
+      c=$(grep -m1 '^export PLEACH_CANONICAL=' "$d/.session-env" 2>/dev/null | cut -d= -f2- | tr -d '"') || c=""
+      [ -n "$c" ] && { CANONICAL="$c"; return 0; }
+    fi
     if [ -f "$d/$CONF_NAME" ]; then
       c=$(bash -c "PLEACH_CANONICAL=''; source '$d/$CONF_NAME' 2>/dev/null; printf '%s' \"\${PLEACH_CANONICAL:-}\"") || c=""
       CANONICAL="${c:-$d}"
       return 0
-    fi
-    if [ -f "$d/.session-env" ]; then
-      c=$(grep -m1 '^export PLEACH_CANONICAL=' "$d/.session-env" 2>/dev/null | cut -d= -f2- | tr -d '"') || c=""
-      [ -n "$c" ] && { CANONICAL="$c"; return 0; }
     fi
     d=$(dirname "$d")
   done
@@ -106,29 +116,65 @@ load_config() {
 # Simple lock (mkdir is atomic; flock is absent from a base macOS) — serializes
 # worktree creation/removal across concurrent invocations.
 # ---------------------------------------------------------------------------
-LOCK_DIR=""
+LOCK_PATH=""
+LOCK_OWNER=""   # "<pid> <host>" — the contents of the lock file
+LOCK_SCRATCH="" # where that line is composed before it is linked into place
 TMPFILE=""   # see cmd_conflicts: an EXIT trap outlives any local it might reference
+lock_try() { # 0 = we now hold the lock
+  # A directory lock is what versions before this one used, and `ln A somedir` does
+  # not fail — it creates somedir/A. Wait such a lock out rather than link into it.
+  if [ -d "$LOCK_PATH" ]; then
+    return 1
+  fi
+  # The owner line is written to a scratch file FIRST and hard-linked into place,
+  # so the lock is complete at the instant it begins to exist: there is no moment
+  # at which a held lock names nobody. Both paths live under $SESSIONS, so the link
+  # cannot fail across filesystems. (A symlink whose target carried the owner would
+  # be atomic too, but Git Bash does not give us real symlinks.)
+  printf '%s\n' "$LOCK_OWNER" > "$LOCK_SCRATCH" 2>/dev/null || return 1
+  if ln "$LOCK_SCRATCH" "$LOCK_PATH" 2>/dev/null && [ -f "$LOCK_PATH" ]; then
+    rm -f "$LOCK_SCRATCH" 2>/dev/null || true
+    return 0
+  fi
+  # Either someone else holds it, or a legacy directory appeared between the check
+  # above and the link, in which case we have just linked INTO it. Undo both.
+  rm -f "$LOCK_PATH/$(basename "$LOCK_SCRATCH")" 2>/dev/null || true
+  rm -f "$LOCK_SCRATCH" 2>/dev/null || true
+  return 1
+}
 lock() {
-  LOCK_DIR="$SESSIONS/.pleach.lock"
-  local tries=0
-  until mkdir "$LOCK_DIR" 2>/dev/null; do
+  LOCK_PATH="$SESSIONS/.pleach.lock"
+  LOCK_SCRATCH="$SESSIONS/.pleach.lock.$$"
+  # Who owns the lock has to be recorded BY the act of taking it, not after it.
+  # It used to be two steps — mkdir, then write an `owner` file — with a fork for
+  # `uname` sitting between them. A run killed inside that window left a lock with
+  # no owner, and an owner-less lock is the one shape doctor must refuse to clear
+  # (it cannot be told apart from a live run's), so --fix declined and the whole
+  # workspace stayed wedged behind a manual rmdir.
+  local host tries=0
+  host=$(uname -n 2>/dev/null || echo '?')   # forked BEFORE the loop, never inside it
+  LOCK_OWNER="$$ $host"
+  until lock_try; do
     tries=$((tries + 1))
-    [ "$tries" -gt 120 ] && err "could not acquire the lock at $LOCK_DIR (an earlier creation wedged? remove the dir by hand)"
+    [ "$tries" -gt 120 ] && err "could not acquire the lock at $LOCK_PATH (an earlier creation wedged? inspect and release it with: pleach doctor --fix)"
     sleep 1
   done
-  # Who owns it. Without this, doctor cannot tell a stale lock from a LIVE one,
-  # and --fix would pull it out from under a run in progress — leaving two
-  # invocations creating worktrees at once, which is precisely what the lock
-  # exists to prevent.
-  printf '%s %s\n' "$$" "$(uname -n 2>/dev/null || echo '?')" > "$LOCK_DIR/owner" 2>/dev/null || true
   trap 'unlock' EXIT
 }
 unlock() {
-  if [ -n "$LOCK_DIR" ]; then
-    rm -f "$LOCK_DIR/owner" 2>/dev/null || true   # rmdir needs the dir empty
-    rmdir "$LOCK_DIR" 2>/dev/null || true
+  if [ -n "$LOCK_PATH" ]; then
+    if [ -d "$LOCK_PATH" ]; then
+      rm -f "$LOCK_PATH/owner" 2>/dev/null || true   # a directory lock from an older version
+      rmdir "$LOCK_PATH" 2>/dev/null || true
+    else
+      rm -f "$LOCK_PATH" 2>/dev/null || true
+    fi
   fi
-  LOCK_DIR=""
+  # Killed between composing the scratch line and linking it, a run leaves that one
+  # file behind. It is inert — `ls` walks directories, and nothing reads it — so
+  # doctor does not chase it; the trap covers every exit that runs code at all.
+  [ -n "$LOCK_SCRATCH" ] && rm -f "$LOCK_SCRATCH" 2>/dev/null || true
+  LOCK_PATH=""
   trap - EXIT
 }
 
@@ -1032,7 +1078,7 @@ cmd_repos() {
     fi
   done < <(session_names)
   [ "$found" -eq 0 ] && echo "  (no sessions)"
-  [ "$do_sync" -eq 1 ] && [ -n "$LOCK_DIR" ] && unlock
+  [ "$do_sync" -eq 1 ] && [ -n "$LOCK_PATH" ] && unlock
 
   echo ""
   if [ "$do_sync" -eq 1 ]; then
@@ -1760,7 +1806,15 @@ cmd_doctor() {
 
   local s
   echo "workspace"
-  dr_ok "canonical: $CANONICAL"
+  # A canonical that is itself a session is always a misresolution, whatever led to
+  # it — a stale PLEACH_CANONICAL, a copied folder, a resolution order that changed.
+  # Saying so beats certifying it: doctor used to print "no problems found" over a
+  # workspace whose canonical was one of its own sessions.
+  if [ -f "$CANONICAL/.session-env" ]; then
+    dr_bad "the resolved canonical is itself a session ($CANONICAL) — every path below is derived from it, so nothing here can be trusted. Run from the canonical, or set PLEACH_CANONICAL to it"
+  else
+    dr_ok "canonical: $CANONICAL"
+  fi
   if [ -f "$CANONICAL/$CONF_NAME" ]; then
     dr_ok "$CONF_NAME present"
   else
@@ -1778,28 +1832,44 @@ cmd_doctor() {
     dr_ok "${#detected[@]} sub-repo(s) on disk, all resolvable"
   fi
 
-  if [ -d "$SESSIONS/.pleach.lock" ]; then
+  # -e, not -f or -d: the lock is a file now and was a directory before, and being
+  # blind to either shape means reporting "no lock held" over a held lock.
+  if [ -e "$SESSIONS/.pleach.lock" ]; then
     # A lock whose owner is ALIVE on this machine is not dirt — it is ordinary
     # concurrency, and tearing it down would lose work. --fix only removes what
     # can be shown to be abandoned.
     local lock_pid="" lock_host="" this_host
     this_host=$(uname -n 2>/dev/null || echo '?')
-    if [ -f "$SESSIONS/.pleach.lock/owner" ]; then
+    if [ -f "$SESSIONS/.pleach.lock" ]; then
+      # The lock IS the owner line, hard-linked into place complete.
+      read -r lock_pid lock_host < "$SESSIONS/.pleach.lock" 2>/dev/null || true
+    elif [ -f "$SESSIONS/.pleach.lock/owner" ]; then
       read -r lock_pid lock_host < "$SESSIONS/.pleach.lock/owner" 2>/dev/null || true
     fi
+    # A pid is a number or it is not a pid: `kill -0` on anything else is an error
+    # about the wrong thing. Treat unparseable as unknown.
+    case "$lock_pid" in ''|*[!0-9]*) lock_pid="" ;; esac
     if [ -z "$lock_pid" ]; then
-      # No owner recorded: either a lock from a version before owners existed —
-      # possibly held by a run that is very much alive — or plain dirt. We cannot
-      # tell, and guessing wrong tears down a live run. Unknown is never removed
-      # automatically; the manual escape hatch is printed instead.
-      dr_bad "lock held at $SESSIONS/.pleach.lock with no owner recorded — it may belong to a live run (older version?); --fix will not touch it. If you are sure nothing is running: rmdir '$SESSIONS/.pleach.lock'"
+      # No owner recorded. Since the lock became a file that carries its owner from
+      # the instant it exists, this can only be a directory lock from an older
+      # version — possibly held by a run of that version which is very much alive.
+      # We cannot tell, and guessing wrong tears down a live run, so unknown is
+      # never removed automatically.
+      dr_bad "lock held at $SESSIONS/.pleach.lock with no owner recorded — it may belong to a live run of an older version; --fix will not touch it. If you are sure nothing is running: rm -rf '$SESSIONS/.pleach.lock'"
     elif [ "$lock_host" = "$this_host" ] && kill -0 "$lock_pid" 2>/dev/null; then
       dr_note "lock is LIVE (pid $lock_pid, on this machine) — another run is mid-way; --fix leaves it alone"
     elif [ "$fix" -eq 1 ]; then
-      rm -f "$SESSIONS/.pleach.lock/owner" 2>/dev/null || true
-      rmdir "$SESSIONS/.pleach.lock" 2>/dev/null \
-        && dr_ok "stale lock released (its owner was pid $lock_pid, which no longer exists)" \
-        || dr_bad "lock at $SESSIONS/.pleach.lock could not be released — remove the directory by hand"
+      if [ -d "$SESSIONS/.pleach.lock" ]; then
+        rm -f "$SESSIONS/.pleach.lock/owner" 2>/dev/null || true
+        rmdir "$SESSIONS/.pleach.lock" 2>/dev/null || true
+      else
+        rm -f "$SESSIONS/.pleach.lock" 2>/dev/null || true
+      fi
+      if [ -L "$SESSIONS/.pleach.lock" ] || [ -e "$SESSIONS/.pleach.lock" ]; then
+        dr_bad "lock at $SESSIONS/.pleach.lock could not be released — remove it by hand"
+      else
+        dr_ok "stale lock released (its owner was pid $lock_pid, which no longer exists)"
+      fi
     else
       dr_bad "lock held at $SESSIONS/.pleach.lock (pid $lock_pid, no longer running) — release with: pleach doctor --fix"
     fi
@@ -2563,9 +2633,12 @@ EOF
 
 Canonical resolution, in order:
   1. env PLEACH_CANONICAL
-  2. .pleach.conf walking up from the cwd (may redirect via PLEACH_CANONICAL)
-  3. .session-env walking up (we are inside a session)
+  2. .session-env walking up from the cwd (we are inside a session)
+  3. .pleach.conf walking up (may redirect via PLEACH_CANONICAL)
   4. ~/.config/pleach/config -> PLEACH_DEFAULT_CANONICAL
+
+  2 before 3 on purpose: both files sit in a session's root worktree, because
+  the conf is meant to be committed. .session-env is the more specific answer.
 
 Guard rail for automation/harnesses (env, not conf):
   PLEACH_EXPECT_CANONICAL=/path   If the RESOLVED canonical differs from this
