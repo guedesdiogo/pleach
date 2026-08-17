@@ -116,54 +116,65 @@ load_config() {
 # Simple lock (mkdir is atomic; flock is absent from a base macOS) — serializes
 # worktree creation/removal across concurrent invocations.
 # ---------------------------------------------------------------------------
-LOCK_DIR=""
-LOCK_OWNER=""   # "<pid> <host>" — the lock symlink's target
+LOCK_PATH=""
+LOCK_OWNER=""   # "<pid> <host>" — the contents of the lock file
+LOCK_SCRATCH="" # where that line is composed before it is linked into place
 TMPFILE=""   # see cmd_conflicts: an EXIT trap outlives any local it might reference
 lock_try() { # 0 = we now hold the lock
-  # `ln -s X somedir` does NOT fail — it creates somedir/X. So a directory lock,
-  # which is what versions before this one used, would be walked straight through
-  # instead of respected. Wait it out while it is there; and if a mixed-version
-  # race means we linked INTO one anyway, undo that and keep waiting.
-  if [ -d "$LOCK_DIR" ] && [ ! -L "$LOCK_DIR" ]; then
+  # A directory lock is what versions before this one used, and `ln A somedir` does
+  # not fail — it creates somedir/A. Wait such a lock out rather than link into it.
+  if [ -d "$LOCK_PATH" ]; then
     return 1
   fi
-  ln -s "$LOCK_OWNER" "$LOCK_DIR" 2>/dev/null || return 1
-  if [ -L "$LOCK_DIR" ]; then
+  # The owner line is written to a scratch file FIRST and hard-linked into place,
+  # so the lock is complete at the instant it begins to exist: there is no moment
+  # at which a held lock names nobody. Both paths live under $SESSIONS, so the link
+  # cannot fail across filesystems. (A symlink whose target carried the owner would
+  # be atomic too, but Git Bash does not give us real symlinks.)
+  printf '%s\n' "$LOCK_OWNER" > "$LOCK_SCRATCH" 2>/dev/null || return 1
+  if ln "$LOCK_SCRATCH" "$LOCK_PATH" 2>/dev/null && [ -f "$LOCK_PATH" ]; then
+    rm -f "$LOCK_SCRATCH" 2>/dev/null || true
     return 0
   fi
-  rm -f "$LOCK_DIR/$LOCK_OWNER" 2>/dev/null || true
+  # Either someone else holds it, or a legacy directory appeared between the check
+  # above and the link, in which case we have just linked INTO it. Undo both.
+  rm -f "$LOCK_PATH/$(basename "$LOCK_SCRATCH")" 2>/dev/null || true
+  rm -f "$LOCK_SCRATCH" 2>/dev/null || true
   return 1
 }
 lock() {
-  LOCK_DIR="$SESSIONS/.pleach.lock"
+  LOCK_PATH="$SESSIONS/.pleach.lock"
+  LOCK_SCRATCH="$SESSIONS/.pleach.lock.$$"
   # Who owns the lock has to be recorded BY the act of taking it, not after it.
   # It used to be two steps — mkdir, then write an `owner` file — with a fork for
   # `uname` sitting between them. A run killed inside that window left a lock with
   # no owner, and an owner-less lock is the one shape doctor must refuse to clear
   # (it cannot be told apart from a live run's), so --fix declined and the whole
-  # workspace stayed wedged behind a manual rmdir. A symlink closes the window:
-  # it is created atomically and its TARGET carries the owner, so a lock that
-  # exists always says who holds it.
+  # workspace stayed wedged behind a manual rmdir.
   local host tries=0
   host=$(uname -n 2>/dev/null || echo '?')   # forked BEFORE the loop, never inside it
   LOCK_OWNER="$$ $host"
   until lock_try; do
     tries=$((tries + 1))
-    [ "$tries" -gt 120 ] && err "could not acquire the lock at $LOCK_DIR (an earlier creation wedged? inspect and release it with: pleach doctor --fix)"
+    [ "$tries" -gt 120 ] && err "could not acquire the lock at $LOCK_PATH (an earlier creation wedged? inspect and release it with: pleach doctor --fix)"
     sleep 1
   done
   trap 'unlock' EXIT
 }
 unlock() {
-  if [ -n "$LOCK_DIR" ]; then
-    if [ -L "$LOCK_DIR" ]; then
-      rm -f "$LOCK_DIR" 2>/dev/null || true
+  if [ -n "$LOCK_PATH" ]; then
+    if [ -d "$LOCK_PATH" ]; then
+      rm -f "$LOCK_PATH/owner" 2>/dev/null || true   # a directory lock from an older version
+      rmdir "$LOCK_PATH" 2>/dev/null || true
     else
-      rm -f "$LOCK_DIR/owner" 2>/dev/null || true   # a directory lock from an older version
-      rmdir "$LOCK_DIR" 2>/dev/null || true
+      rm -f "$LOCK_PATH" 2>/dev/null || true
     fi
   fi
-  LOCK_DIR=""
+  # Killed between composing the scratch line and linking it, a run leaves that one
+  # file behind. It is inert — `ls` walks directories, and nothing reads it — so
+  # doctor does not chase it; the trap covers every exit that runs code at all.
+  [ -n "$LOCK_SCRATCH" ] && rm -f "$LOCK_SCRATCH" 2>/dev/null || true
+  LOCK_PATH=""
   trap - EXIT
 }
 
@@ -1067,7 +1078,7 @@ cmd_repos() {
     fi
   done < <(session_names)
   [ "$found" -eq 0 ] && echo "  (no sessions)"
-  [ "$do_sync" -eq 1 ] && [ -n "$LOCK_DIR" ] && unlock
+  [ "$do_sync" -eq 1 ] && [ -n "$LOCK_PATH" ] && unlock
 
   echo ""
   if [ "$do_sync" -eq 1 ]; then
@@ -1821,19 +1832,17 @@ cmd_doctor() {
     dr_ok "${#detected[@]} sub-repo(s) on disk, all resolvable"
   fi
 
-  if [ -L "$SESSIONS/.pleach.lock" ] || [ -d "$SESSIONS/.pleach.lock" ]; then
+  # -e, not -f or -d: the lock is a file now and was a directory before, and being
+  # blind to either shape means reporting "no lock held" over a held lock.
+  if [ -e "$SESSIONS/.pleach.lock" ]; then
     # A lock whose owner is ALIVE on this machine is not dirt — it is ordinary
     # concurrency, and tearing it down would lose work. --fix only removes what
     # can be shown to be abandoned.
-    local lock_pid="" lock_host="" this_host tgt
+    local lock_pid="" lock_host="" this_host
     this_host=$(uname -n 2>/dev/null || echo '?')
-    if [ -L "$SESSIONS/.pleach.lock" ]; then
-      # The owner IS the symlink's target — written atomically with the lock.
-      tgt=$(readlink "$SESSIONS/.pleach.lock" 2>/dev/null || true)
-      if [ -n "$tgt" ]; then
-        lock_pid="${tgt%% *}"
-        [ "$tgt" != "$lock_pid" ] && lock_host="${tgt#* }"
-      fi
+    if [ -f "$SESSIONS/.pleach.lock" ]; then
+      # The lock IS the owner line, hard-linked into place complete.
+      read -r lock_pid lock_host < "$SESSIONS/.pleach.lock" 2>/dev/null || true
     elif [ -f "$SESSIONS/.pleach.lock/owner" ]; then
       read -r lock_pid lock_host < "$SESSIONS/.pleach.lock/owner" 2>/dev/null || true
     fi
@@ -1841,19 +1850,20 @@ cmd_doctor() {
     # about the wrong thing. Treat unparseable as unknown.
     case "$lock_pid" in ''|*[!0-9]*) lock_pid="" ;; esac
     if [ -z "$lock_pid" ]; then
-      # No owner recorded. Since the lock became a symlink carrying its owner this
-      # can only be a directory lock from an older version — possibly held by a run
-      # of that version which is very much alive. We cannot tell, and guessing
-      # wrong tears down a live run, so unknown is never removed automatically.
+      # No owner recorded. Since the lock became a file that carries its owner from
+      # the instant it exists, this can only be a directory lock from an older
+      # version — possibly held by a run of that version which is very much alive.
+      # We cannot tell, and guessing wrong tears down a live run, so unknown is
+      # never removed automatically.
       dr_bad "lock held at $SESSIONS/.pleach.lock with no owner recorded — it may belong to a live run of an older version; --fix will not touch it. If you are sure nothing is running: rm -rf '$SESSIONS/.pleach.lock'"
     elif [ "$lock_host" = "$this_host" ] && kill -0 "$lock_pid" 2>/dev/null; then
       dr_note "lock is LIVE (pid $lock_pid, on this machine) — another run is mid-way; --fix leaves it alone"
     elif [ "$fix" -eq 1 ]; then
-      if [ -L "$SESSIONS/.pleach.lock" ]; then
-        rm -f "$SESSIONS/.pleach.lock" 2>/dev/null || true
-      else
+      if [ -d "$SESSIONS/.pleach.lock" ]; then
         rm -f "$SESSIONS/.pleach.lock/owner" 2>/dev/null || true
         rmdir "$SESSIONS/.pleach.lock" 2>/dev/null || true
+      else
+        rm -f "$SESSIONS/.pleach.lock" 2>/dev/null || true
       fi
       if [ -L "$SESSIONS/.pleach.lock" ] || [ -e "$SESSIONS/.pleach.lock" ]; then
         dr_bad "lock at $SESSIONS/.pleach.lock could not be released — remove it by hand"

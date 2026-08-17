@@ -123,12 +123,11 @@ setup_repo() { # $1 = directory to initialise as a fresh git repo
   git -C "$1" config user.name "test"
 }
 
-# The lock pleach takes is a SYMLINK whose target names its owner, so a lock is
-# present in either of two shapes: that symlink, or a directory left by an older
-# version. `-d` alone silently stops testing — it is false for a symlink, so
-# `[ ! -d ]` would pass over a lock that had leaked. `-e` alone is not enough
-# either: the symlink's target ("<pid> <host>") does not exist, so it dangles.
-lock_held()  { [ -L "$SESSIONS/.pleach.lock" ] || [ -e "$SESSIONS/.pleach.lock" ]; }
+# The lock pleach takes is a FILE whose single line names its owner, so a lock is
+# present in either of two shapes: that file, or a directory left by an older
+# version. `-d` alone silently stops testing — it is false for a file, so
+# `[ ! -d ]` would pass over a lock that had leaked.
+lock_held()  { [ -e "$SESSIONS/.pleach.lock" ]; }
 lock_clear() { ! lock_held; }
 
 setup_fixture() {
@@ -1021,14 +1020,15 @@ done
 assert_eq "killed run: caught a run holding the lock, within 3 attempts" "$CAUGHT" "1"
 assert_true "killed run: the lock outlived the process (SIGKILL runs no EXIT trap)" lock_held
 
-# The whole point of the symlink: taking the lock and recording who holds it are
-# ONE step, so a lock that exists always names an owner — whenever the kill lands.
-# When they were two steps (mkdir, then write `owner`, with a fork in between) a
-# kill inside that window left an owner-less lock, which doctor must refuse to
-# clear and --fix declined; every later `new` in the suite then failed behind it,
-# five tests away from the cause. That is the "intermittent" failure, ~1 in 9.
+# The whole point of composing the owner line first and hard-linking it into place:
+# taking the lock and recording who holds it are ONE step, so a lock that exists
+# always names an owner — wherever the kill lands. When they were two steps (mkdir,
+# then write `owner`, with a fork in between) a kill inside that window left an
+# owner-less lock, which doctor must refuse to clear and --fix declined; every later
+# `new` in the suite then failed behind it, five scenarios away from the cause.
+# That is the "intermittent" failure, about one run in nine.
 assert_true "killed run: the orphaned lock still names its owner" \
-  bash -c "[ -n \"\$(readlink '$SESSIONS/.pleach.lock' 2>/dev/null)\" ]"
+  [ -s "$SESSIONS/.pleach.lock" ]
 
 run "$PLEACH" doctor
 assert_rc "killed run: doctor exits non-zero" "$RC" 1
@@ -1041,6 +1041,10 @@ assert_true "killed run: --fix released the lock" lock_clear
 run "$PLEACH" new after-crash --no-bootstrap
 assert_rc "killed run: a session can be created after the repair" "$RC" 0
 assert_true "killed run: that session really exists" [ -d "$SESSIONS/after-crash" ]
+# A clean run composes the owner line in a scratch file and links it into place;
+# nothing of that may survive the run it belongs to.
+assert_true "killed run: the scratch line leaves no litter behind a clean run" \
+  bash -c "! ls '$SESSIONS'/.pleach.lock.* >/dev/null 2>&1"
     ;;
 esac
 

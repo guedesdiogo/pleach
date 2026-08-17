@@ -430,7 +430,7 @@ session and the canonical by their markers rather than by hardcoded directories:
 ## Tests
 
 ```bash
-tests/run.sh          # 352 assertions across 45 scenarios, in a throwaway sandbox
+tests/run.sh          # 353 assertions across 45 scenarios, in a throwaway sandbox
 tests/no-leaks.sh     # repository hygiene gate
 shellcheck pleach install.sh tests/*.sh examples/*.sh
 ```
@@ -474,9 +474,13 @@ was five scenarios downstream of its cause — which is what made it look like f
 waiting out. It was not: taking the lock and recording its owner were two steps with a `fork`
 between them, and a kill landing in that window left a lock with no owner. An owner-less lock
 is the one shape `doctor` must refuse to clear, because it cannot be told from a live run's,
-so `--fix` declined and every later creation queued behind it. The lock is now a symlink whose
-target *is* the owner, created in one atomic step, and the scenario asserts that a lock which
-exists always names who holds it.
+so `--fix` declined and every later creation queued behind it. The owner line is now composed
+in a scratch file and **hard-linked** into place, so the lock is complete at the instant it
+begins to exist, and the scenario asserts that a lock which exists always names who holds it.
+
+A symlink carrying the owner in its target is atomic too, and was the first fix — Windows
+rejected it. Git Bash has no real symlinks, so `pleach new` failed outright and the next one
+sat out the full 120-second lock timeout. Hard links work on both.
 
 Catching a run mid-lock is inherently a race, and on a loaded machine it is lost: the run
 finishes before the kill lands and four assertions fail in a cascade that says nothing about
