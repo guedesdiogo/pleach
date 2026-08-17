@@ -478,9 +478,12 @@ so `--fix` declined and every later creation queued behind it. The owner line is
 in a scratch file and **hard-linked** into place, so the lock is complete at the instant it
 begins to exist, and the scenario asserts that a lock which exists always names who holds it.
 
-A symlink carrying the owner in its target is atomic too, and was the first fix — Windows
-rejected it. Git Bash has no real symlinks, so `pleach new` failed outright and the next one
-sat out the full 120-second lock timeout. Hard links work on both.
+A symlink carrying the owner in its target is atomic too, and was the first fix — the Windows
+job rejected it. Under Git Bash as CI runs it, `ln -s` did not produce a link `[ -L ]` would
+recognise, so `pleach new` failed outright and the next one sat out the full 120-second lock
+timeout. Real symlinks there depend on `MSYS=winsymlinks:nativestrict` plus the privilege to
+create them, which is not something a tool can assume of the shell it is invoked from. Hard
+links need no such opt-in.
 
 Catching a run mid-lock is inherently a race, and on a loaded machine it is lost: the run
 finishes before the kill lands and four assertions fail in a cascade that says nothing about
