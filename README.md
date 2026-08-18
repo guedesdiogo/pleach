@@ -275,6 +275,7 @@ pleach repos --sync                  # adopt a new workspace repo across ALL ses
 
 pleach conflicts                     # what sessions would break in each other at merge
 pleach each 'git log --oneline -1'   # run a command in the canonical + every session
+pleach each --repos 'git status -s'  # ...and inside every mounted sub-repo
 pleach clean fix-x --apply           # delete git-ignored artifacts (node_modules, builds)
 pleach rm fix-x --reap               # remove the session; --reap kills leftover listeners
 pleach prune --apply                 # remove every fully integrated session
@@ -430,7 +431,7 @@ session and the canonical by their markers rather than by hardcoded directories:
 ## Tests
 
 ```bash
-tests/run.sh          # 385 assertions across 46 scenarios, in a throwaway sandbox
+tests/run.sh          # 408 assertions across 47 scenarios, in a throwaway sandbox
 tests/no-leaks.sh     # repository hygiene gate
 shellcheck pleach install.sh tests/*.sh examples/*.sh
 ```
@@ -468,6 +469,29 @@ its owner: precisely the "run that died mid-way" `doctor` promises to detect. It
 `doctor` exits non-zero and names the dead owner, that `--fix` releases it, and — the part
 that matters — that a session can be created again afterwards. A repair whose only evidence
 is its own success message is not a repair.
+
+`conflicts` reports the change, not just the file. A filename cannot tell two edits to
+adjacent lines from a rewrite, so the reader had to go and look anyway — while the merged
+tree, conflict markers and all, was already in the object store: `merge-tree --write-tree`
+writes it, and the command printed its id and discarded it. It now reads it back and shows
+how many conflicting regions there are, where each begins, and what both sides put in the
+first one.
+
+And a verdict expires with the conflict it describes. The pair check compared session tip
+against session tip and never consulted the base, so a session whose work had already landed
+kept conflicting with everyone for as long as its folder existed — while the overlap table
+directly below it, which does diff against the base, had already gone quiet about the same
+file. Landed sessions are now skipped. That is exact for a true merge, where the branch
+becomes an ancestor of the base; after a **squash** it is not, and the fallback (branch and
+base holding identical content) stops being true once the base moves on. A squash-landed
+session can still be reported — remove it with `pleach rm`. Said here rather than left to be
+discovered.
+
+`each --repos` descends into every mounted sub-repo. Without it, `pleach each 'git status'`
+in a composite workspace answers for the root worktrees only, which is not where most of the
+work lives. It is opt-in on purpose: `each` runs *your* command, so widening where it lands
+is a change of blast radius. The commands that always descend — `sync`, `ls -l`, `doctor` —
+are running operations pleach itself defines.
 
 A creation that is interrupted no longer looks finished. `new` records a marker beside the
 session and removes it only on success, so a run that is killed — or that fails partway —

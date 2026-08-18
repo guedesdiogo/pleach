@@ -12,7 +12,7 @@
 # shellcheck disable=SC2015  # deliberate idiom: [ -z "$x" ] && x=… || err (err never runs after an assignment)
 set -euo pipefail
 
-PLEACH_VERSION="1.5.2"
+PLEACH_VERSION="1.6.0"
 
 CONF_NAME=".pleach.conf"
 USER_CONF="$HOME/.config/pleach/config"
@@ -1378,17 +1378,54 @@ run_in_dir() { # $1 dir; rest = command (1 arg → bash -c; N args → literal)
   if [ $# -eq 1 ]; then ( cd "$d" && bash -c "$1" ); else ( cd "$d" && "$@" ); fi
 }
 
-cmd_each() { # runs a command in the canonical and in the root of every session
-  [ $# -ge 1 ] || err "usage: pleach each '<command>'  (or: pleach each cmd arg …)"
+cmd_each() { # runs a command in the canonical and in every session
+  # `each` had no flag parsing at all, so anything starting with a dash was handed
+  # to bash -c as a command. `--` keeps the escape hatch for a command that really
+  # does start with one.
+  local repos=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repos) repos=1 ;;
+      --)      shift; break ;;
+      -*)      err "unknown flag: $1 (usage: pleach each [--repos] '<command>')" ;;
+      *)       break ;;
+    esac
+    shift
+  done
+  [ $# -ge 1 ] || err "usage: pleach each [--repos] '<command>'  (or: pleach each cmd arg …)"
   load_config
-  local rc=0 n
-  local -a names=()
-  while IFS= read -r n; do [ -n "$n" ] && names+=("$n"); done < <(session_names)
-  echo "● canonical  ($CANONICAL)"
-  run_in_dir "$CANONICAL" "$@" || { rc=1; warn "canonical: the command returned an error"; }
-  for n in ${names[@]+"${names[@]}"}; do
-    echo "● $n  ($SESSIONS/$n)"
-    run_in_dir "$SESSIONS/$n" "$@" || { rc=1; warn "$n: the command returned an error"; }
+
+  # The targets are built first so the order is stated in one place: the canonical
+  # before the sessions, and within each, the root before its sub-repos — the order
+  # sync, ls -l and doctor already use.
+  local n s
+  local -a labels=() dirs=()
+  if [ "$repos" -eq 1 ]; then
+    labels+=("canonical · root"); dirs+=("$CANONICAL")
+    while IFS= read -r s; do
+      [ -n "$s" ] || continue
+      labels+=("canonical · $s"); dirs+=("$CANONICAL/$s")
+    done < <(detect_subs)
+  else
+    labels+=("canonical"); dirs+=("$CANONICAL")
+  fi
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    if [ "$repos" -eq 1 ]; then
+      labels+=("$n · root"); dirs+=("$SESSIONS/$n")
+      while IFS= read -r s; do
+        [ -n "$s" ] || continue
+        labels+=("$n · $s"); dirs+=("$SESSIONS/$n/$s")
+      done < <(session_subs "$SESSIONS/$n")
+    else
+      labels+=("$n"); dirs+=("$SESSIONS/$n")
+    fi
+  done < <(session_names)
+
+  local rc=0 i
+  for ((i = 0; i < ${#labels[@]}; i++)); do
+    echo "● ${labels[$i]}  (${dirs[$i]})"
+    run_in_dir "${dirs[$i]}" "$@" || { rc=1; warn "${labels[$i]}: the command returned an error"; }
   done
   return "$rc"
 }
@@ -1616,6 +1653,50 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+session_landed() { # 0 when $2's work is already in $BASE, judged inside repo $1
+  # Two shapes, and only one of them is exact. A true merge makes the branch an
+  # ancestor of the base, which is decidable. A squash or a rebase does not, and
+  # then the only evidence left is that branch and base now hold the same content
+  # — true right after the landing, and no longer true once the base moves on.
+  # The residual is stated in `help conflicts` rather than implied by silence.
+  git -C "$1" show-ref --verify --quiet "refs/heads/$BASE" || return 1
+  git -C "$1" merge-base --is-ancestor "$2" "$BASE" 2>/dev/null && return 0
+  git -C "$1" diff --quiet "$BASE" "$2" 2>/dev/null
+}
+
+conflict_detail() { # $1 repo, $2 merged tree, $3 path, $4 session a, $5 session b
+  # merge-tree --write-tree already WROTE the merged blobs into the object store,
+  # conflict markers and all, and this command printed the tree id and discarded
+  # it. Reading them back is the whole difference between naming the file and
+  # naming the change: a path cannot tell two edits to adjacent lines from a
+  # rewrite, so the reader had to go and look anyway.
+  local body
+  body=$(git -C "$1" show "$2:$3" 2>/dev/null | awk -v P="$3" -v A="$4" -v B="$5" '
+    /^<<<<<<< / { r++; if (r <= 3) locs = locs (locs ? ", " : "") NR; side = 1; next }
+    /^=======$/ { if (side == 1) { side = 2; next } }
+    /^>>>>>>> / { if (side)      { side = 0; next } }
+    {
+      if (side == 1 && r == 1 && na < 3) a[++na] = $0
+      else if (side == 2 && r == 1 && nb < 3) b[++nb] = $0
+    }
+    END {
+      if (r == 0) exit
+      printf "        %s   %d region%s, at line%s %s%s\n", \
+        P, r, (r == 1 ? "" : "s"), (r == 1 ? "" : "s"), locs, (r > 3 ? ", …" : "")
+      for (i = 1; i <= na; i++) printf "            %s │ %s\n", A, a[i]
+      for (i = 1; i <= nb; i++) printf "            %s │ %s\n", B, b[i]
+      if (na >= 3 || nb >= 3) print "            …"
+    }
+  ') || body=""
+  if [ -n "$body" ]; then
+    printf '%s\n' "$body"
+  else
+    # Nothing to read back: a rename/delete conflict, or a binary file. The path
+    # alone is still the honest answer there.
+    printf '        %s\n' "$3"
+  fi
+}
+
 git_supports_merge_tree() {
   # `merge-tree --write-tree` landed in git 2.38. Below that only the overlap
   # heuristic is available, and conflicts says so rather than quietly reporting
@@ -1675,6 +1756,14 @@ cmd_conflicts() {
           [ -e "$repo/.git" ] || continue
           git -C "$repo" show-ref --verify --quiet "refs/heads/$ba" || continue
           git -C "$repo" show-ref --verify --quiet "refs/heads/$bb" || continue
+          # A session whose work has LANDED conflicts with nobody, and saying it
+          # does is how a command earns being ignored. The pair check compares tip
+          # against tip and never consulted the base, so a merged session kept
+          # conflicting for as long as its folder existed — while the overlap
+          # section below, which does diff against the base, had already gone quiet
+          # about the same file.
+          session_landed "$repo" "$ba" && continue
+          session_landed "$repo" "$bb" && continue
           # --write-tree builds the merged tree in the object store and prints its
           # id; the working tree, the index and every branch stay untouched.
           mt_rc=0
@@ -1696,7 +1785,14 @@ cmd_conflicts() {
           fi
           real=$((real + 1))
           printf '  %s <-> %s   (%s)\n' "$a" "$b" "$label"
-          printf '%s\n' "$files" | sed 's/^/        /'
+          local tree cf
+          tree=$(printf '%s\n' "$out" | head -1)
+          while IFS= read -r cf; do
+            [ -n "$cf" ] || continue
+            conflict_detail "$repo" "$tree" "$cf" "$a" "$b"
+          done <<EOF
+$files
+EOF
         done
       done
     done
@@ -2137,9 +2233,11 @@ session is invisible to yours by construction.
   name, the same port hardcoded twice: all merge clean and none of them show up
   here. A green answer from a check whose scope does not cover your question is
   not evidence.
-- `pleach each '<command>'` — runs it in the canonical and in every session. Use it
-  before claiming any workspace-wide identifier: a migration number, an RFC number,
-  a port, a feature-flag name. What your worktree lists is not evidence it is free.
+- `pleach each '<command>'` — runs it in the canonical and in every session ROOT.
+  Add `--repos` to descend into every mounted sub-repo as well; without it, a
+  composite workspace answers for the root worktree only. Use it before claiming any
+  workspace-wide identifier: a migration number, an RFC number, a port, a
+  feature-flag name. What your worktree lists is not evidence it is free.
 
 ## What the tool already says — read it there
 
@@ -2290,7 +2388,7 @@ Sessions
   rm <name> [--force] [--reap]  Remove the session. Refuses when work is pending.
   prune [--apply]           List (and with --apply remove) fully integrated sessions.
   clean [<session>]         Delete git-ignored artifacts (node_modules, builds…).
-  each '<command>'          Run a command in the canonical and in each session root.
+  each [--repos] '<cmd>'    Run a command in the canonical and in every session.
   conflicts                 Report what parallel sessions would break in each other at merge.
 
 Workspace
@@ -2473,19 +2571,27 @@ Inside a session the name is inferred. Targets: node_modules .next .open-next
 EOF
     ;;
     each) cat <<'EOF'
-pleach each '<command>'
-pleach each <cmd> <arg> ...
+pleach each [--repos] '<command>'
+pleach each [--repos] <cmd> <arg> ...
 
-Runs the command in the CANONICAL and in the root of EVERY session, with a header
-per target. A single argument goes through bash -c (pipes and globs work); several
-arguments are executed literally. The exit code aggregates (non-zero if any
-failed).
+Runs the command in the CANONICAL and in EVERY session, with a header per target.
+A single argument goes through bash -c (pipes and globs work); several arguments
+are executed literally. The exit code aggregates (non-zero if any failed).
+
+  --repos   Descend into every mounted sub-repo as well, not just the roots.
+            Targets are labelled "<session> · <repo>", the root first.
+
+Without --repos only the roots are entered, and that is the default deliberately:
+each runs YOUR command, so where it lands is part of what you asked for. The
+commands that always descend — sync, ls -l, doctor — are running operations pleach
+itself defines. Use `--` before a command that starts with a dash.
 
 Typical use: cross-session visibility — parallel work in other sessions is
 invisible to your worktree until it merges. e.g.:
 
   pleach each 'ls docs/rfcs'                RFC numbers taken EVERYWHERE
   pleach each 'git log --oneline -1'        last commit in each root
+  pleach each --repos 'git status -s'       uncommitted work in every repo
 EOF
     ;;
     conflicts) cat <<'EOF'
@@ -2502,6 +2608,21 @@ serious:
                    only loose objects enter the object store. Needs
                    git >= 2.38; below that the check is skipped and says so.
 
+                   It reports the CHANGE, not just the file: how many conflicting
+                   regions, where each begins, and what both sides put in the
+                   first one. A filename cannot tell two edits to adjacent lines
+                   from a rewrite. The content is read back out of the merged
+                   tree merge-tree has just written.
+
+                   A session whose work has already LANDED is skipped, so a
+                   verdict expires with the conflict it describes. Landing is
+                   decidable when it was a true merge: the branch becomes an
+                   ancestor of the base. After a SQUASH or a rebase it is not,
+                   and the fallback - branch and base holding identical content -
+                   stops being true once the base moves on. A squash-landed
+                   session can therefore still be reported; remove it with
+                   `pleach rm`.
+
   ALSO TOUCHED     the same file appears in more than one session but git merges
                    it cleanly today -- or the work is not committed yet, so no
                    merge can be decided. Worth knowing, not worth stopping for.
@@ -2513,8 +2634,10 @@ serious:
                    shared namespace living inside the filename, and nothing in
                    git models it. Covers the NNNN_name / NNN-name convention.
 
-All three cover every repo of every session, counting committed work since the
-session branched as well as uncommitted changes.
+ALSO TOUCHED and SAME SLOT cover every repo of every session, counting committed
+work since the session branched as well as uncommitted changes. WOULD CONFLICT
+reads the branch refs, so it sees committed work only -- an uncommitted
+resolution is invisible to it.
 
 Worktrees move collisions from the working tree to merge time, which is the
 point. The side effect is that they also HIDE them until then: parallel work in
