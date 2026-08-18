@@ -170,6 +170,22 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 5. pleach's own artefacts must not be tracked in pleach's repo
+# ---------------------------------------------------------------------------
+# `pleach init` writes .pleach.conf into $PWD, and a test that ran it without
+# cd'ing first wrote one here — which a `git add -A` then committed to main. It
+# carried an absolute path from the machine that generated it. Nothing pleach
+# GENERATES belongs in the repository that ships pleach.
+STRAY=0
+for artefact in .pleach.conf .session-env panorama.code-workspace; do
+  if grep -qxF "$artefact" "$FILES_LIST"; then
+    report "$artefact is tracked — pleach generated it, it does not belong in the repo"
+    STRAY=1
+  fi
+done
+[ "$STRAY" -eq 0 ] && pass "no generated pleach artefacts are tracked"
+
+# ---------------------------------------------------------------------------
 echo ""
 echo "===================================="
 if [ "$FAILS" -eq 0 ]; then
