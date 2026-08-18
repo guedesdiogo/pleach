@@ -1375,7 +1375,9 @@ cmd_clean() { # purge rematerialized build/dependency artifacts (dry run by defa
 run_in_dir() { # $1 dir; rest = command (1 arg → bash -c; N args → literal)
   local d="$1"
   shift
-  if [ $# -eq 1 ]; then ( cd "$d" && bash -c "$1" ); else ( cd "$d" && "$@" ); fi
+  # `--` or bash parses a leading dash as its OWN option and the command never runs,
+  # which would make `pleach each -- '-x …'` an escape hatch that does not escape.
+  if [ $# -eq 1 ]; then ( cd "$d" && bash -c -- "$1" ); else ( cd "$d" && "$@" ); fi
 }
 
 cmd_each() { # runs a command in the canonical and in every session
@@ -1402,10 +1404,14 @@ cmd_each() { # runs a command in the canonical and in every session
   local -a labels=() dirs=()
   if [ "$repos" -eq 1 ]; then
     labels+=("canonical · root"); dirs+=("$CANONICAL")
-    while IFS= read -r s; do
+    # SUBS, not detect_subs: it is the resolved list — the conf's PLEACH_SUBS when
+    # it declares one, auto-detection otherwise. Walking the disk instead would
+    # enter a vendored or unrelated repo the workspace deliberately left out.
+    for s in ${SUBS[@]+"${SUBS[@]}"}; do
       [ -n "$s" ] || continue
+      [ -e "$CANONICAL/$s/.git" ] || continue
       labels+=("canonical · $s"); dirs+=("$CANONICAL/$s")
-    done < <(detect_subs)
+    done
   else
     labels+=("canonical"); dirs+=("$CANONICAL")
   fi
@@ -1653,6 +1659,34 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+report_conflict() { # $1 repo, $2 label, $3 refA, $4 refB, $5 nameA, $6 nameB
+                    # echoes the block on stdout; rc 0 only when it reported one
+  local out mt_rc=0 files tree cf
+  # --write-tree builds the merged tree in the object store and prints its id; the
+  # working tree, the index and every branch stay untouched.
+  out=$(git -C "$1" merge-tree --write-tree --name-only "$3" "$4" 2>/dev/null) || mt_rc=$?
+  [ "$mt_rc" -eq 0 ] && return 1
+  # rc 1 means conflict, which is the answer we want. Anything else is a git ERROR
+  # (no common ancestor, say) — stepping over it in silence would be another blind
+  # spot inside the command meant to remove them.
+  if [ "$mt_rc" -gt 1 ]; then
+    warn "$2: merge-tree failed (rc $mt_rc) between $3 and $4 — this was NOT checked"
+    return 1
+  fi
+  # Line 1 is the tree id; the conflicted paths follow, up to a blank line.
+  files=$(printf '%s\n' "$out" | awk 'NR > 1 { if ($0 == "") exit; print }')
+  [ -n "$files" ] || return 1
+  printf '  %s <-> %s   (%s)\n' "$5" "$6" "$2"
+  tree=$(printf '%s\n' "$out" | head -1)
+  while IFS= read -r cf; do
+    [ -n "$cf" ] || continue
+    conflict_detail "$1" "$tree" "$cf" "$5" "$6"
+  done <<EOF
+$files
+EOF
+  return 0
+}
+
 session_landed() { # 0 when $2's work is already in $BASE, judged inside repo $1
   # Two shapes, and only one of them is exact. A true merge makes the branch an
   # ancestor of the base, which is decidable. A squash or a rebase does not, and
@@ -1735,7 +1769,7 @@ cmd_conflicts() {
   # -------------------------------------------------------------------------
   local real=0 degraded=0
   if [ ${#names[@]} -ge 2 ] && git_supports_merge_tree; then
-    local i j a b repo label s ba bb out files mt_rc
+    local i j a b repo label s ba bb block
     local -a subs_a=() subs_b=() pair=()
     for ((i = 0; i < ${#names[@]}; i++)); do
       for ((j = i + 1; j < ${#names[@]}; j++)); do
@@ -1764,40 +1798,50 @@ cmd_conflicts() {
           # about the same file.
           session_landed "$repo" "$ba" && continue
           session_landed "$repo" "$bb" && continue
-          # --write-tree builds the merged tree in the object store and prints its
-          # id; the working tree, the index and every branch stay untouched.
-          mt_rc=0
-          out=$(git -C "$repo" merge-tree --write-tree --name-only "$ba" "$bb" 2>/dev/null) || mt_rc=$?
-          [ "$mt_rc" -eq 0 ] && continue
-          # rc 1 means conflict, which is the answer we want. Anything else is a
-          # git ERROR (no common ancestor, say) — stepping over it in silence
-          # would be another blind spot inside the command meant to remove them.
-          if [ "$mt_rc" -gt 1 ]; then
-            warn "$label: merge-tree failed (rc $mt_rc) between $ba and $bb — this pair was NOT checked"
-            continue
+          if block=$(report_conflict "$repo" "$label" "$ba" "$bb" "$a" "$b"); then
+            if [ "$real" -eq 0 ]; then
+              echo "WOULD CONFLICT — git's own three-way merge says these cannot both land as they are:"
+              echo ""
+            fi
+            real=$((real + 1))
+            printf '%s\n' "$block"
           fi
-          # Line 1 is the tree id; the conflicted paths follow, up to a blank line.
-          files=$(printf '%s\n' "$out" | awk 'NR > 1 { if ($0 == "") exit; print }')
-          [ -n "$files" ] || continue
-          if [ "$real" -eq 0 ]; then
-            echo "WOULD CONFLICT — git's own three-way merge says these cannot both land as they are:"
-            echo ""
-          fi
-          real=$((real + 1))
-          printf '  %s <-> %s   (%s)\n' "$a" "$b" "$label"
-          local tree cf
-          tree=$(printf '%s\n' "$out" | head -1)
-          while IFS= read -r cf; do
-            [ -n "$cf" ] || continue
-            conflict_detail "$repo" "$tree" "$cf" "$a" "$b"
-          done <<EOF
-$files
-EOF
         done
       done
     done
   elif [ ${#names[@]} -ge 2 ]; then
     degraded=1
+  fi
+
+  # A pair check answers "can these two land TOGETHER". It never answered "can this
+  # one land AT ALL" — and once a session's counterpart has landed, that is the only
+  # question left. Skipping landed sessions without asking it turned a stale
+  # WOULD CONFLICT into "No file is being edited in more than one session" over a
+  # session git flatly refuses to merge: a nuisance traded for a false all-clear.
+  if [ ${#names[@]} -ge 1 ] && git_supports_merge_tree; then
+    local bn repo_b label_b sb block_b
+    local -a subs_n=()
+    for bn in ${names[@]+"${names[@]}"}; do
+      subs_n=()
+      while IFS= read -r sb; do [ -n "$sb" ] && subs_n+=("$sb"); done < <(session_subs "$SESSIONS/$bn")
+      for sb in "" ${subs_n[@]+"${subs_n[@]}"}; do
+        repo_b=$(repo_path "$sb"); label_b="${sb:-root}"
+        [ -e "$repo_b/.git" ] || continue
+        git -C "$repo_b" show-ref --verify --quiet "refs/heads/$(session_branch "$bn")" || continue
+        git -C "$repo_b" show-ref --verify --quiet "refs/heads/$BASE" || continue
+        session_landed "$repo_b" "$(session_branch "$bn")" && continue
+        # The session is the FIRST ref as well as the first name: refs and names are
+        # positional, and crossing them attributes each side's content to the other.
+        if block_b=$(report_conflict "$repo_b" "$label_b" "$(session_branch "$bn")" "$BASE" "$bn" "$BASE"); then
+          if [ "$real" -eq 0 ]; then
+            echo "WOULD CONFLICT — git's own three-way merge says these cannot both land as they are:"
+            echo ""
+          fi
+          real=$((real + 1))
+          printf '%s\n' "$block_b"
+        fi
+      done
+    done
   fi
   [ "$real" -gt 0 ] && echo ""
 
@@ -2613,6 +2657,10 @@ serious:
                    first one. A filename cannot tell two edits to adjacent lines
                    from a rewrite. The content is read back out of the merged
                    tree merge-tree has just written.
+
+                   Every session is also merged against the BASE on its own, so
+                   "can this one land at all" is answered even when every other
+                   session has gone. Those read <session> <-> <base>.
 
                    A session whose work has already LANDED is skipped, so a
                    verdict expires with the conflict it describes. Landing is

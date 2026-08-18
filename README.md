@@ -431,7 +431,7 @@ session and the canonical by their markers rather than by hardcoded directories:
 ## Tests
 
 ```bash
-tests/run.sh          # 408 assertions across 47 scenarios, in a throwaway sandbox
+tests/run.sh          # 416 assertions across 47 scenarios, in a throwaway sandbox
 tests/no-leaks.sh     # repository hygiene gate
 shellcheck pleach install.sh tests/*.sh examples/*.sh
 ```
@@ -476,6 +476,11 @@ tree, conflict markers and all, was already in the object store: `merge-tree --w
 writes it, and the command printed its id and discarded it. It now reads it back and shows
 how many conflicting regions there are, where each begins, and what both sides put in the
 first one.
+
+Every session is also merged against the base on its own, reported as
+`<session> <-> <base>`. A pair check answers *can these two land together*; it never answered
+*can this one land at all*, and once a session's counterpart has landed that is the only
+question left.
 
 And a verdict expires with the conflict it describes. The pair check compared session tip
 against session tip and never consulted the base, so a session whose work had already landed

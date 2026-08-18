@@ -380,6 +380,33 @@ assert_contains "each: and names it" "$OUT" "unknown flag"
 run "$PLEACH" each -- 'echo dashed'
 assert_rc "each: -- ends flag parsing" "$RC" 0
 assert_contains "each: and the command still runs" "$OUT" "dashed"
+# `--` is only an escape hatch if what follows really escapes: `bash -c "$1"` parses
+# a leading dash as a bash OPTION, so the command pleach was handed never ran.
+run "$PLEACH" each -- '-x 2>/dev/null || echo dash-led-command-ran'
+assert_contains "each: a command starting with a dash reaches the shell, not bash's flags" \
+  "$OUT" "dash-led-command-ran"
+
+# --repos must honour an explicit PLEACH_SUBS. Listing what is on DISK would enter a
+# vendored or unrelated repo the workspace deliberately left out — and `each` runs
+# the caller's command, so that is not a longer report, it is a wider blast radius.
+# Its own workspace: adding a repo to the shared fixture would move the sub-repo
+# counts every later scenario asserts.
+MINIE=$(cd "$SANDBOX" && mkdir -p eachsubs && cd eachsubs && pwd)
+setup_repo "$MINIE/canon"
+echo root > "$MINIE/canon/f.txt"
+git -C "$MINIE/canon" add -A && git -C "$MINIE/canon" commit -q -m "initial"
+for r in mine vendored; do
+  setup_repo "$MINIE/canon/$r"
+  echo "$r" > "$MINIE/canon/$r/f.txt"
+  git -C "$MINIE/canon/$r" add -A && git -C "$MINIE/canon/$r" commit -q -m "initial"
+done
+printf 'PLEACH_SUBS=(mine)\n' > "$MINIE/canon/.pleach.conf"
+# shellcheck disable=SC2016  # expands inside pleach's bash -c, not here
+run bash -c "env PLEACH_CANONICAL='$MINIE/canon' PLEACH_EXPECT_CANONICAL='$MINIE/canon' '$PLEACH' each --repos 'echo visited-\$(basename \"\$PWD\")'"
+assert_rc "each --repos: runs in a workspace with a declared subset" "$RC" 0
+assert_contains "each --repos: visits the declared sub-repo" "$OUT" "visited-mine"
+assert_not_contains "each --repos: but not the one left out of PLEACH_SUBS" \
+  "$OUT" "visited-vendored"
 
 # ---------------------------------------------------------------------------
 header "Test 16: add mounts a new sub-repo into an existing session"
@@ -1699,6 +1726,20 @@ run bash -c "$PIN4 '$PLEACH' conflicts"
 assert_rc "expiry: still exits 0" "$RC" 0
 assert_not_contains "expiry: the landed session is no longer in conflict with anyone" \
   "$OUT" "alpha <-> beta"
+# But beta still cannot merge: main now carries alpha's line 1. A pair check answers
+# "can these two land together"; once the counterpart has landed, the only question
+# left is "can this one land at all". Skipping landed sessions WITHOUT asking that
+# turned a stale report into "No file is being edited in more than one session" over
+# a session git refuses to merge — trading a nuisance for a false all-clear.
+assert_contains "expiry: the surviving session is checked against the base itself" \
+  "$OUT" "beta <-> main"
+# Refs and names are positional: crossing them attributes each side's content to the
+# other, which reads as a coherent report and is a lie. beta's line is BETA.
+assert_contains "expiry: and each side's content is attributed to the side that wrote it" \
+  "$OUT" "beta │ BETA"
+assert_contains "expiry: including the base's own" "$OUT" "main │ ALPHA"
+assert_not_contains "expiry: and the run is not called clean" \
+  "$OUT" "No file is being edited"
 
 # And it must not have gone blind in the process: a pair that genuinely conflicts
 # is still reported after the sweep.
