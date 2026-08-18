@@ -705,14 +705,19 @@ cmd_new() {
     fi
   done
 
-  unlock
-
   info "copying secrets (.env*, .dev.vars*, extras from the conf)…"
   copy_secrets "$dir" 1 ${subs[@]+"${subs[@]}"}
 
   local recorded_ref="$BASE"
   if [ -n "$from" ] && [ "$from_used" -eq 1 ]; then recorded_ref="$from"; fi
   write_session_env "$dir" "$name" "$idx" "$port_base" "$recorded_ref"
+  # The lock is held until the index is RECORDED, not merely chosen. free_index
+  # reads .session-env files, so releasing between the choice and the write left a
+  # window — the width of copy_secrets — in which a second `new` saw no claim on
+  # this index and picked it too: two sessions on one port block, which is the
+  # collision the index exists to prevent. Bootstrap stays outside; it is the slow
+  # part and it reserves nothing.
+  unlock
   # .session-env lives INSIDE the root worktree, so `git add -A` at the session root
   # would commit this machine's port block, DB name and absolute canonical path onto
   # the branch — and from there into main, where every session's copy then conflicts
@@ -1980,9 +1985,14 @@ cmd_doctor() {
       # session's index and port block — the collision the design exists to prevent.
       # A free index and a fresh file is a repair, so --fix does it.
       if [ "$fix" -eq 1 ]; then
+        # Under the same lock `new` takes, and for the same reason: free_index reads
+        # the .session-env files, so choosing and recording have to be one critical
+        # section or a concurrent creation hands out this index too.
         local lost_idx
+        lock
         lost_idx=$(free_index)
         write_session_env "$dir" "$n" "$lost_idx" "$((PORT_START + lost_idx * 100))"
+        unlock
         dr_ok "$n: .session-env restored (index $lost_idx, ports $((PORT_START + lost_idx * 100))+)"
       else
         dr_bad "$n: no .session-env — ports and identity unknown; restore it with: pleach doctor --fix"

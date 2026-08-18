@@ -1577,6 +1577,28 @@ assert_true "incomplete: which is not the one already taken" \
 assert_eq "incomplete: and the identity matches the session it belongs to" \
   "$(env_val "$S3/lost" PLEACH_NAME)" "lost"
 
+# Two sessions that both lost their .session-env, restored in ONE --fix pass. The
+# second free_index has to see the first restore already written, or both are handed
+# the same index and the same block of 100 ports — the collision the index exists to
+# prevent, arriving through the repair that was supposed to end it.
+run bash -c "$PIN3 '$PLEACH' new twina --no-bootstrap"
+assert_rc "incomplete: first twin created" "$RC" 0
+run bash -c "$PIN3 '$PLEACH' new twinb --no-bootstrap"
+assert_rc "incomplete: second twin created" "$RC" 0
+rm -f "$S3/twina/.session-env" "$S3/twinb/.session-env"
+run bash -c "$PIN3 '$PLEACH' doctor --fix"
+assert_rc "incomplete: one --fix pass restores both" "$RC" 0
+TA=$(env_val "$S3/twina" PLEACH_INDEX); TB=$(env_val "$S3/twinb" PLEACH_INDEX)
+PA=$(env_val "$S3/twina" PLEACH_PORT_BASE); PB=$(env_val "$S3/twinb" PLEACH_PORT_BASE)
+assert_true "incomplete: both twins got an index" bash -c "[ -n '$TA' ] && [ -n '$TB' ]"
+assert_true "incomplete: and they are not the same index" [ "$TA" != "$TB" ]
+assert_true "incomplete: nor the same port block" [ "$PA" != "$PB" ]
+# doctor is the independent judge: it checks for duplicates without knowing how
+# the indexes were assigned.
+run bash -c "$PIN3 '$PLEACH' doctor"
+assert_not_contains "incomplete: no session ends up sharing an index or a block" \
+  "$OUT" "is already taken by another session"
+
 # --- the real interruption, POSIX only --------------------------------------
 case "$(uname -s 2>/dev/null)" in
   MINGW*|MSYS*|CYGWIN*)
