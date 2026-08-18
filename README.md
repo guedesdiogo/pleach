@@ -330,6 +330,16 @@ worse daily cost than a collision nobody has hit; rename one of the directories 
 in that position. pleach does not create the database for you — it hands your tooling a
 name, which is the part that has to be decided centrally.
 
+A `.session-env` pleach cannot read is treated as a claim it cannot verify, not as an
+absence. If a session directory holds one with no `PLEACH_INDEX` — a file another tool
+wrote, or one edited by hand — then the block that session is serving on cannot be named,
+so no other block can be certified free either. `pleach new` refuses before it writes
+anything and names the file; `doctor` reports it instead of ticking it. This is not
+hypothetical: adopting pleach over sessions a previous tool had created handed the new
+session the exact block a live one was already serving on, and the same `doctor` run
+closed with `no problems found`, printing `✓ alpha: index , ports +` — the empty values
+rendered as a tick.
+
 Sockets also outlive worktrees: a dev server started in a session keeps its port after
 the session is removed. `pleach rm` reports any process still listening in the freed
 block, and `--reap` kills them. Reporting is the default, because a cleanup command
@@ -385,6 +395,16 @@ pleach skill --dir <path>    # any other runtime's skills folder
 pleach skill                 # just print it: pipe into any tool, any model
 ```
 
+`--project` also leaves a short pointer in an `AGENTS.md` or `CLAUDE.md` that the repo
+**already has**, between `<!-- pleach:begin -->` and `<!-- pleach:end -->`. It never creates
+either file — whether a project should have one is the team's call, not a side effect of
+adopting a tool — and everything outside the markers is copied through untouched, so
+re-running after an upgrade refreshes the block instead of stacking copies of it. Removing
+pleach is deleting the block. The pointer exists because the skill file only reaches
+harnesses that read `.claude/skills`: a workspace this was measured on had seven harness
+directories and an `AGENTS.md`, and the harnesses reading that file saw neither the skill
+nor the conf — nothing told them the workspace had sessions at all.
+
 `pleach skill` emits a Markdown skill, frontmatter and all. It carries what `--help` cannot:
 that removing the session you stand in pulls the ground from under you — and that
 `pleach prune --apply` will do it for you once the work has landed; that shipping from
@@ -431,7 +451,7 @@ session and the canonical by their markers rather than by hardcoded directories:
 ## Tests
 
 ```bash
-tests/run.sh          # 416 assertions across 47 scenarios, in a throwaway sandbox
+tests/run.sh          # 448 assertions across 49 scenarios, in a throwaway sandbox
 tests/no-leaks.sh     # repository hygiene gate
 shellcheck pleach install.sh tests/*.sh examples/*.sh
 ```
