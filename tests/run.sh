@@ -354,6 +354,59 @@ run "$PLEACH" each 'echo ping-$(basename "$PWD")'
 assert_rc "each: rc 0" "$RC" 0
 assert_contains "each: canonical header" "$OUT" "canonical  ("
 assert_contains "each: ran inside session s3" "$OUT" "ping-s3"
+# The default must not descend. `each` runs the CALLER's command, so widening where
+# it lands is a change of blast radius, not a richer report — every other command
+# that always descends is running an operation pleach itself defines.
+assert_not_contains "each: the default does not descend into sub-repos" "$OUT" "ping-subA"
+
+# --repos: the sub-repos are where most of the work actually lives, and without
+# this `pleach each 'git status'` answered for the root worktree only.
+# shellcheck disable=SC2016  # same as above: expands inside pleach's bash -c
+run "$PLEACH" each --repos 'echo ping-$(basename "$PWD")'
+assert_rc "each --repos: rc 0" "$RC" 0
+assert_contains "each --repos: reaches a session's sub-repo" "$OUT" "ping-subA"
+assert_contains "each --repos: labels it session · repo" "$OUT" "s3 · subA"
+assert_contains "each --repos: the root is still visited, and named" "$OUT" "s3 · root"
+# The canonical had the same blind spot: only its own root was ever entered.
+assert_contains "each --repos: the canonical's sub-repos too" "$OUT" "canonical · subA"
+assert_contains "each --repos: and its root" "$OUT" "canonical · root"
+
+# `each` had no flag parsing at all: `pleach each --repos` used to reach bash -c as
+# a command. Anything unknown must say so rather than be run.
+run "$PLEACH" each --bogus 'true'
+assert_rc "each: an unknown flag is an error" "$RC" 1
+assert_contains "each: and names it" "$OUT" "unknown flag"
+# ...without taking the escape hatch away from a command that starts with a dash.
+run "$PLEACH" each -- 'echo dashed'
+assert_rc "each: -- ends flag parsing" "$RC" 0
+assert_contains "each: and the command still runs" "$OUT" "dashed"
+# `--` is only an escape hatch if what follows really escapes: `bash -c "$1"` parses
+# a leading dash as a bash OPTION, so the command pleach was handed never ran.
+run "$PLEACH" each -- '-x 2>/dev/null || echo dash-led-command-ran'
+assert_contains "each: a command starting with a dash reaches the shell, not bash's flags" \
+  "$OUT" "dash-led-command-ran"
+
+# --repos must honour an explicit PLEACH_SUBS. Listing what is on DISK would enter a
+# vendored or unrelated repo the workspace deliberately left out — and `each` runs
+# the caller's command, so that is not a longer report, it is a wider blast radius.
+# Its own workspace: adding a repo to the shared fixture would move the sub-repo
+# counts every later scenario asserts.
+MINIE=$(cd "$SANDBOX" && mkdir -p eachsubs && cd eachsubs && pwd)
+setup_repo "$MINIE/canon"
+echo root > "$MINIE/canon/f.txt"
+git -C "$MINIE/canon" add -A && git -C "$MINIE/canon" commit -q -m "initial"
+for r in mine vendored; do
+  setup_repo "$MINIE/canon/$r"
+  echo "$r" > "$MINIE/canon/$r/f.txt"
+  git -C "$MINIE/canon/$r" add -A && git -C "$MINIE/canon/$r" commit -q -m "initial"
+done
+printf 'PLEACH_SUBS=(mine)\n' > "$MINIE/canon/.pleach.conf"
+# shellcheck disable=SC2016  # expands inside pleach's bash -c, not here
+run bash -c "env PLEACH_CANONICAL='$MINIE/canon' PLEACH_EXPECT_CANONICAL='$MINIE/canon' '$PLEACH' each --repos 'echo visited-\$(basename \"\$PWD\")'"
+assert_rc "each --repos: runs in a workspace with a declared subset" "$RC" 0
+assert_contains "each --repos: visits the declared sub-repo" "$OUT" "visited-mine"
+assert_not_contains "each --repos: but not the one left out of PLEACH_SUBS" \
+  "$OUT" "visited-vendored"
 
 # ---------------------------------------------------------------------------
 header "Test 16: add mounts a new sub-repo into an existing session"
@@ -649,6 +702,13 @@ assert_contains "conflicts: reports a real conflict" "$OUT" "WOULD CONFLICT"
 assert_contains "conflicts: the same-region file IS in the conflict section" "$BLOCK" "wide.txt"
 assert_contains "conflicts: names both sessions" "$BLOCK" "s3 <-> s4"
 assert_contains "conflicts: names the repo it is in" "$BLOCK" "(subB)"
+# Naming the file is not naming the change: a filename cannot tell two edits to
+# adjacent lines from a rewrite, so the reader has to go and look anyway. The
+# merged tree with the conflict markers is already in the object store — the
+# command wrote it and threw the id away.
+assert_contains "conflicts: says WHERE in the file" "$BLOCK" "line 1"
+assert_contains "conflicts: and shows what each session put there" "$BLOCK" "CLASH-s3"
+assert_contains "conflicts: from both sides" "$BLOCK" "CLASH-s4"
 
 # ---------------------------------------------------------------------------
 header "Test 28: new --from stacks a session on another one's unmerged work"
@@ -1625,6 +1685,71 @@ case "$(uname -s 2>/dev/null)" in
     assert_contains "incomplete: naming that session" "$OUT" "slow: creation never finished"
     ;;
 esac
+
+# ---------------------------------------------------------------------------
+header "Test 47: a conflict verdict expires when the conflict does"
+# ---------------------------------------------------------------------------
+# The pair check compares session tip against session tip and never consults the
+# base, so a session whose work had already LANDED kept conflicting with everyone
+# for as long as its folder existed. The overlap section below it did expire — it
+# diffs against $BASE — so one run could report "WOULD CONFLICT s3 <-> s4" while
+# saying nothing about that file in the overlap table it sat above.
+#
+# Its own mini workspace: this merges a session branch into the base, which the
+# shared fixture's canonical has checked out.
+MINI4=$(cd "$SANDBOX" && mkdir -p expiry && cd expiry && pwd)
+setup_repo "$MINI4/canon"
+printf 'one\ntwo\nthree\n' > "$MINI4/canon/shared.txt"
+git -C "$MINI4/canon" add -A && git -C "$MINI4/canon" commit -q -m "initial"
+PIN4="env PLEACH_CANONICAL=$MINI4/canon PLEACH_EXPECT_CANONICAL=$MINI4/canon"
+S4D="$MINI4/.sessions"
+
+# No `init` here: PLEACH_CANONICAL is pinned, so there is nothing for a conf to say.
+run bash -c "$PIN4 '$PLEACH' new alpha --no-bootstrap"
+assert_rc "expiry: alpha created" "$RC" 0
+run bash -c "$PIN4 '$PLEACH' new beta --no-bootstrap"
+assert_rc "expiry: beta created" "$RC" 0
+
+printf 'ALPHA\ntwo\nthree\n' > "$S4D/alpha/shared.txt"
+git -C "$S4D/alpha" commit -q -am "alpha takes line 1"
+printf 'BETA\ntwo\nthree\n' > "$S4D/beta/shared.txt"
+git -C "$S4D/beta" commit -q -am "beta takes line 1"
+
+run bash -c "$PIN4 '$PLEACH' conflicts"
+assert_contains "expiry: while both are open, it is a real conflict" "$OUT" "WOULD CONFLICT"
+assert_contains "expiry: naming the pair" "$OUT" "alpha <-> beta"
+
+# alpha lands. Nothing about beta changed, and nothing about alpha's tip changed
+# either — which is exactly why the old check could not tell.
+git -C "$MINI4/canon" merge --no-ff --no-edit -q session/alpha
+run bash -c "$PIN4 '$PLEACH' conflicts"
+assert_rc "expiry: still exits 0" "$RC" 0
+assert_not_contains "expiry: the landed session is no longer in conflict with anyone" \
+  "$OUT" "alpha <-> beta"
+# But beta still cannot merge: main now carries alpha's line 1. A pair check answers
+# "can these two land together"; once the counterpart has landed, the only question
+# left is "can this one land at all". Skipping landed sessions WITHOUT asking that
+# turned a stale report into "No file is being edited in more than one session" over
+# a session git refuses to merge — trading a nuisance for a false all-clear.
+assert_contains "expiry: the surviving session is checked against the base itself" \
+  "$OUT" "beta <-> main"
+# Refs and names are positional: crossing them attributes each side's content to the
+# other, which reads as a coherent report and is a lie. beta's line is BETA.
+assert_contains "expiry: and each side's content is attributed to the side that wrote it" \
+  "$OUT" "beta │ BETA"
+assert_contains "expiry: including the base's own" "$OUT" "main │ ALPHA"
+assert_not_contains "expiry: and the run is not called clean" \
+  "$OUT" "No file is being edited"
+
+# And it must not have gone blind in the process: a pair that genuinely conflicts
+# is still reported after the sweep.
+run bash -c "$PIN4 '$PLEACH' new gamma --no-bootstrap"
+assert_rc "expiry: gamma created" "$RC" 0
+printf 'GAMMA\ntwo\nthree\n' > "$S4D/gamma/shared.txt"
+git -C "$S4D/gamma" commit -q -am "gamma takes line 1 as well"
+run bash -c "$PIN4 '$PLEACH' conflicts"
+assert_contains "expiry: a live pair is still reported" "$OUT" "WOULD CONFLICT"
+assert_contains "expiry: and it is the live one" "$OUT" "beta <-> gamma"
 
 # ---------------------------------------------------------------------------
 # Summary
