@@ -1752,6 +1752,107 @@ assert_contains "expiry: a live pair is still reported" "$OUT" "WOULD CONFLICT"
 assert_contains "expiry: and it is the live one" "$OUT" "beta <-> gamma"
 
 # ---------------------------------------------------------------------------
+# Test 48: a .session-env pleach cannot read is not a free port block
+# ---------------------------------------------------------------------------
+# Measured while moving a real workspace over from another tool. Its sessions
+# already had a .session-env, in a shape pleach does not read; free_index looked
+# for `export PLEACH_INDEX=`, found none in any of them, concluded index 1 was
+# free, and handed the new session the exact port block a live session was
+# already serving on. `doctor` then printed "✓ alpha: index , ports +" — the
+# empty values rendered as a tick — and closed with "no problems found".
+# Both halves are one defect: reading "I could not parse it" as "nothing is there".
+MINI4=$(cd "$SANDBOX" && mkdir -p unreadable && cd unreadable && pwd)
+setup_repo "$MINI4/canon"
+echo root > "$MINI4/canon/f.txt"
+git -C "$MINI4/canon" add -A && git -C "$MINI4/canon" commit -q -m initial
+printf 'PLEACH_SUBS=()\npleach_bootstrap() { :; }\n' > "$MINI4/canon/.pleach.conf"
+PIN4="env PLEACH_CANONICAL=$MINI4/canon PLEACH_EXPECT_CANONICAL=$MINI4/canon"
+S4="$MINI4/.sessions"
+
+run bash -c "$PIN4 '$PLEACH' new alpha --no-bootstrap"
+assert_rc "unreadable: alpha created" "$RC" 0
+ALPHA_PORTS=$(env_val "$S4/alpha" PLEACH_PORT_BASE)
+
+# Unreadable the way a foreign tool leaves it: every other line intact, and no
+# line pleach recognises as the index.
+grep -v '^export PLEACH_INDEX=' "$S4/alpha/.session-env" > "$S4/alpha/.env.tmp"
+mv "$S4/alpha/.env.tmp" "$S4/alpha/.session-env"
+
+run bash -c "$PIN4 '$PLEACH' doctor"
+assert_rc "unreadable: doctor exits non-zero" "$RC" 1
+assert_contains "unreadable: naming what it could not read" "$OUT" "no PLEACH_INDEX"
+assert_contains "unreadable: and the session it belongs to" "$OUT" "alpha"
+assert_not_contains "unreadable: without certifying the workspace healthy" \
+  "$OUT" "no problems found"
+assert_not_contains "unreadable: nor a tick over empty values" "$OUT" "index , ports"
+
+run bash -c "$PIN4 '$PLEACH' new beta --no-bootstrap"
+assert_rc "unreadable: new refuses rather than guess a port block" "$RC" 1
+assert_contains "unreadable: saying which session blocks it" "$OUT" "alpha"
+assert_contains "unreadable: and saying what is wrong with it" "$OUT" "no PLEACH_INDEX"
+# It read "alphahas a .session-env" once: a one-name list has no trailing
+# separator, so splicing it mid-sentence glued it to the next word.
+assert_not_contains "unreadable: without gluing the name to the next word" "$OUT" "alphahas"
+assert_true "unreadable: and leaves no half-made session behind" [ ! -d "$S4/beta" ]
+
+printf 'export PLEACH_INDEX=1\n' >> "$S4/alpha/.session-env"
+run bash -c "$PIN4 '$PLEACH' new beta --no-bootstrap"
+assert_rc "unreadable: once readable again, new works" "$RC" 0
+assert_true "unreadable: and beta did not land on alpha's block" \
+  [ "$(env_val "$S4/beta" PLEACH_PORT_BASE)" != "$ALPHA_PORTS" ]
+
+# ---------------------------------------------------------------------------
+# Test 49: the skill leaves a pointer in the instruction file that already exists
+# ---------------------------------------------------------------------------
+# `skill --project` writes .claude/skills/pleach/SKILL.md, which only the
+# harnesses reading that directory ever see. The workspace this was measured on
+# had seven harness directories and an AGENTS.md — and an AGENTS.md-based harness
+# reads neither the skill nor the conf, so nothing told it the workspace had
+# sessions at all. The pointer is the only part it does see. A marked block,
+# because that is the shape that survives re-running: replaced, not stacked, and
+# removing pleach is deleting it.
+MINI5=$(cd "$SANDBOX" && mkdir -p skillptr && cd skillptr && pwd)
+setup_repo "$MINI5/canon"
+printf '# Acme\n\nRules the team already had.\n' > "$MINI5/canon/AGENTS.md"
+git -C "$MINI5/canon" add -A && git -C "$MINI5/canon" commit -q -m initial
+printf 'PLEACH_SUBS=()\n' > "$MINI5/canon/.pleach.conf"
+
+run bash -c "cd '$MINI5/canon' && '$PLEACH' skill --project"
+assert_rc "pointer: skill --project runs" "$RC" 0
+assert_true "pointer: the skill file is written" \
+  [ -f "$MINI5/canon/.claude/skills/pleach/SKILL.md" ]
+assert_true "pointer: AGENTS.md gains the block" \
+  grep -q 'pleach:begin' "$MINI5/canon/AGENTS.md"
+assert_true "pointer: what the team already wrote survives" \
+  grep -q 'Rules the team already had' "$MINI5/canon/AGENTS.md"
+assert_contains "pointer: and it names where the boundary is" \
+  "$(cat "$MINI5/canon/AGENTS.md")" ".session-env"
+
+run bash -c "cd '$MINI5/canon' && '$PLEACH' skill --project"
+assert_rc "pointer: a second run is fine" "$RC" 0
+assert_eq "pointer: and does not stack a second copy" \
+  "$(grep -c 'pleach:begin' "$MINI5/canon/AGENTS.md" || true)" "1"
+assert_eq "pointer: the team's own text is still there once" \
+  "$(grep -c 'Rules the team already had' "$MINI5/canon/AGENTS.md" || true)" "1"
+
+# A file that is absent stays absent: pleach does not decide that a workspace
+# ought to have a CLAUDE.md.
+assert_true "pointer: no instruction file is invented" [ ! -f "$MINI5/canon/CLAUDE.md" ]
+
+# One that exists gets it too — different harnesses read different files.
+printf '# Claude\n' > "$MINI5/canon/CLAUDE.md"
+run bash -c "cd '$MINI5/canon' && '$PLEACH' skill --project"
+assert_true "pointer: an existing CLAUDE.md gets it as well" \
+  grep -q 'pleach:begin' "$MINI5/canon/CLAUDE.md"
+
+# And init hands over the command, instead of leaving it to be discovered.
+MINI6=$(cd "$SANDBOX" && mkdir -p initskill && cd initskill && pwd)
+setup_repo "$MINI6/canon"
+run bash -c "cd '$MINI6/canon' && env -u PLEACH_CANONICAL -u PLEACH_EXPECT_CANONICAL '$PLEACH' init"
+assert_rc "pointer: init runs" "$RC" 0
+assert_contains "pointer: and init names the skill command" "$OUT" "pleach skill"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

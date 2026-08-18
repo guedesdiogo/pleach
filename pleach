@@ -12,7 +12,7 @@
 # shellcheck disable=SC2015  # deliberate idiom: [ -z "$x" ] && x=… || err (err never runs after an assignment)
 set -euo pipefail
 
-PLEACH_VERSION="1.6.0"
+PLEACH_VERSION="1.7.0"
 
 CONF_NAME=".pleach.conf"
 USER_CONF="$HOME/.config/pleach/config"
@@ -408,6 +408,7 @@ repo_path() { # $1 = "" (root) or a sub name
 }
 
 free_index() { # lowest index no session's .session-env claims -> its port block
+  refuse_unreadable_sessions
   local idx=1 used d
   while :; do
     used=0
@@ -420,6 +421,39 @@ free_index() { # lowest index no session's .session-env claims -> its port block
     [ "$idx" -gt 98 ] && err "no free index left (98 sessions?!)"
   done
   printf '%s' "$idx"
+}
+
+session_env_unreadable() { # $1 dir — a .session-env is there, but not one pleach reads
+  [ -f "$1/.session-env" ] || return 1
+  grep -q '^export PLEACH_INDEX=' "$1/.session-env" && return 1
+  return 0
+}
+
+unreadable_sessions() { # names of the sessions whose .session-env cannot be read
+  local d
+  for d in "$SESSIONS"/*/; do
+    [ -d "$d" ] || continue
+    if session_env_unreadable "${d%/}"; then basename "${d%/}"; fi
+  done
+}
+
+refuse_unreadable_sessions() { # every port-block allocation goes through here
+  # "I could not read it" is not "there is nothing there". A session directory
+  # holding a .session-env with no PLEACH_INDEX is serving a block of ports that
+  # cannot be named, so no other index can be certified free either. Allocating
+  # anyway is how a workspace ends up with two sessions on one block, and the
+  # symptom — a second dev server dying on EADDRINUSE, or worse, a browser
+  # talking to the other session's server — does not point back here. This was
+  # measured, not imagined: adopting pleach over sessions another tool had
+  # created handed the new one the exact block a live session was serving on,
+  # and `doctor` closed the same run with "no problems found".
+  local names first
+  names=$(unreadable_sessions) || true
+  [ -n "$names" ] || return 0
+  first=$(printf '%s\n' "$names" | head -1)
+  # The list goes last on purpose: spliced mid-sentence it came out as "alphahas
+  # a .session-env", because a one-name list has no trailing separator to join on.
+  err "cannot allocate a port block — a session is holding one that cannot be named (its .session-env has no PLEACH_INDEX). Convert it or remove it: rm '$SESSIONS/$first/.session-env'. Affected: $(printf '%s' "$names" | tr '\n' ' ')"
 }
 
 session_incomplete() { # 0 when a creation started for $1 and never finished
@@ -607,6 +641,7 @@ EOF
     info "recorded as this machine's default project in $USER_CONF"
   fi
   echo "Next: review the $CONF_NAME, then 'pleach new <name>' or 'pleach open <name>'."
+  echo "      and teach your agents about it: pleach skill --project"
 }
 
 # ---------------------------------------------------------------------------
@@ -635,6 +670,10 @@ cmd_new() {
   local dir="$SESSIONS/$name" branch
   branch=$(session_branch "$name")
   [ -e "$dir" ] && err "session '$name' already exists at $dir"
+
+  # Before a single byte is written: refusing here leaves no half-made session,
+  # which is the difference between a message and a mess to clean up.
+  refuse_unreadable_sessions
 
   mkdir -p "$SESSIONS"
   touch "$SESSIONS/.metadata_never_index" # macOS: keep Spotlight out of sessions
@@ -2139,6 +2178,13 @@ cmd_doctor() {
         continue
       fi
     fi
+    if session_env_unreadable "$dir"; then
+      # Reported before the index/port checks below, because those read the very
+      # values that are missing: they used to print "index , ports +" behind a
+      # tick, and a reader scanning ticks saw a healthy session.
+      dr_bad "$n: .session-env has no PLEACH_INDEX — the port block it holds cannot be named, so no new session can be given one that is certainly free; convert it or remove it: rm '$dir/.session-env'"
+      continue
+    fi
     # A renamed folder makes every name-keyed check look at the wrong branch, so it
     # is a problem in its own right rather than a detail of the ones below.
     local id_problem
@@ -2324,13 +2370,70 @@ away, and the baseline agents this skill was tested against all reached for it f
 PLEACH_SKILL_EOF
 }
 
+POINTER_BEGIN='<!-- pleach:begin -->'
+POINTER_END='<!-- pleach:end -->'
+
+pointer_block() { # the few lines an agent needs before it does anything else
+  cat <<EOF
+$POINTER_BEGIN
+## Parallel sessions (pleach)
+
+Work in this workspace happens in **sessions**: one git worktree per repo on branch
+\`session/<name>\`, each with an exclusive block of 100 ports and its own runtime
+identity (database name, compose project name) — the state git does not isolate.
+
+- A \`.session-env\` at or above the working directory means you are INSIDE a session.
+  A \`.pleach.conf\` and no \`.session-env\` means the canonical checkout.
+- Deploys, publishes and anything else touching shared state run from the canonical
+  only. Two sessions collide in the environment, and git cannot merge that.
+- Before claiming a workspace-wide identifier — a migration number, a port, a feature
+  flag — check every session with \`pleach each --repos '<command>'\`. What your own
+  worktree lists is not evidence the name is free.
+- Commands and flags: \`pleach help\`, \`pleach help <command>\`, \`pleach help config\`.
+
+Generated by \`pleach skill --project\`; edit outside the markers.
+$POINTER_END
+EOF
+}
+
+write_pointer() { # $1 = an instruction file that ALREADY exists
+  # Only ever a file the project already has: whether a workspace should have an
+  # AGENTS.md or a CLAUDE.md is the team's decision, not a side effect of adopting
+  # a tool. Everything outside the markers is copied through untouched, and a
+  # previous block is replaced rather than appended to, so re-running after an
+  # upgrade refreshes the pointer instead of stacking copies of it.
+  [ -f "$1" ] || return 1
+  local nb ne tmp
+  nb=$(grep -cxF "$POINTER_BEGIN" "$1" || true)
+  ne=$(grep -cxF "$POINTER_END" "$1" || true)
+  if [ "$nb" != "$ne" ]; then
+    # Swallowing from an opening marker to end-of-file would delete the team's
+    # text, so a hand-broken pair is left for a human rather than guessed at.
+    warn "$1 has $nb opening and $ne closing pleach markers — leaving it alone; pair them by hand"
+    return 1
+  fi
+  tmp=$(mktemp) || return 1
+  # Second pass drops the blank lines left dangling at the end by the removal;
+  # without it the file grows by one blank line on every run.
+  awk -v b="$POINTER_BEGIN" -v e="$POINTER_END" '
+    $0 == b { skip = 1; next }
+    $0 == e { skip = 0; next }
+    !skip   { print }
+  ' "$1" \
+    | awk '/^[[:space:]]*$/ { blanks++; next } { while (blanks > 0) { print ""; blanks-- } print }' \
+    > "$tmp" || { rm -f "$tmp"; return 1; }
+  { printf '\n'; pointer_block; } >> "$tmp" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$1" || { rm -f "$tmp"; return 1; }
+  return 0
+}
+
 cmd_skill() {
-  local dest="" chosen="" flag
+  local dest="" chosen="" flag project=0
   while [ $# -gt 0 ]; do
     flag="$1"
     case "$1" in
       --install)  dest="$HOME/.claude/skills/pleach" ;;
-      --project)  dest="$PWD/.claude/skills/pleach" ;;
+      --project)  dest="$PWD/.claude/skills/pleach"; project=1 ;;
       --dir)      shift
                   [ $# -gt 0 ] && [ -n "$1" ] || err "--dir needs a path"
                   # A following flag is a typo, not a directory: without this,
@@ -2354,6 +2457,21 @@ cmd_skill() {
   skill_doc > "$dest/SKILL.md"
   info "skill written to $dest/SKILL.md"
   info "it is a copy, not a link — re-run this after upgrading pleach"
+  # The skill file only reaches harnesses that read .claude/skills. The ones that
+  # read AGENTS.md or CLAUDE.md see neither it nor the conf, so without a pointer
+  # nothing tells them the workspace has sessions at all.
+  if [ "$project" -eq 1 ]; then
+    local f touched=""
+    for f in AGENTS.md CLAUDE.md; do
+      [ -f "$PWD/$f" ] || continue
+      write_pointer "$PWD/$f" && touched="$touched $f"
+    done
+    if [ -n "$touched" ]; then
+      info "pointer block updated in:$touched"
+    else
+      info "no AGENTS.md or CLAUDE.md here — agents that read those will not learn about pleach from them"
+    fi
+  fi
 }
 
 # ---------------------------------------------------------------------------
