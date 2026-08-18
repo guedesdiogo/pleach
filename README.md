@@ -430,7 +430,7 @@ session and the canonical by their markers rather than by hardcoded directories:
 ## Tests
 
 ```bash
-tests/run.sh          # 353 assertions across 45 scenarios, in a throwaway sandbox
+tests/run.sh          # 378 assertions across 46 scenarios, in a throwaway sandbox
 tests/no-leaks.sh     # repository hygiene gate
 shellcheck pleach install.sh tests/*.sh examples/*.sh
 ```
@@ -468,6 +468,18 @@ its owner: precisely the "run that died mid-way" `doctor` promises to detect. It
 `doctor` exits non-zero and names the dead owner, that `--fix` releases it, and — the part
 that matters — that a session can be created again afterwards. A repair whose only evidence
 is its own success message is not a repair.
+
+A creation that is interrupted no longer looks finished. `new` records a marker beside the
+session and removes it only on success, so a run that is killed — or that fails partway —
+leaves evidence. Without it, a session killed during bootstrap was indistinguishable from a
+complete one: `doctor` reported `✓ during: index 2, ports 10200+, 3 repo(s)` and `ls -l`
+called it *fully integrated — removable* over dependencies that were never installed. Both
+now name it, and name the two commands that finish the job.
+
+`doctor --fix` also writes a fresh `.session-env` for a session that lost one, taking a free
+index. The advice it printed before was two things that do not work: `new` refuses a name
+whose folder already exists, and copying another session's file hands this one that session's
+port block — the collision the whole design exists to prevent.
 
 That scenario earned its keep. It failed about one run in nine, and the failure it reported
 was five scenarios downstream of its cause — which is what made it look like flakiness worth
