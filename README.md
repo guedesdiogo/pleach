@@ -15,8 +15,9 @@ essentially zero disk cost.
 ![runtime deps](https://img.shields.io/badge/runtime%20deps-git%20%2B%20bash-lightgrey)
 
 ```bash
-pleach open fix-login              # create an isolated session and start working in it
-pleach open feat-search codex      # a second session, a different agent, at the same time
+pleach new fix-login               # an isolated session: a worktree per repo, its own ports
+pleach open fix-login              # start working in it, with your tool of choice
+pleach new feat-search && pleach open feat-search codex   # a second one, a different agent
 pleach ls                          # what exists, which ports, how many repos
 pleach sync fix-login              # bring the session up to date with main
 pleach rm fix-login                # safe cleanup after the merge
@@ -218,7 +219,7 @@ From the root of your workspace's canonical checkout:
 ```bash
 pleach init                    # detects first-level sub-repos, writes .pleach.conf
 pleach init --default          # and records this project as the machine default
-pleach open first-session
+pleach new first-session       # then: pleach open first-session
 ```
 
 **Single-repo projects work too** — without sub-repos, pleach is a worktree manager with
@@ -250,8 +251,12 @@ the conf first made a session its own canonical.
 ## Daily use
 
 ```bash
-pleach open fix-x                    # create if needed + open your tool inside
+pleach open fix-x                    # open your tool inside an existing session
 pleach open fix-x claude -r          # resume that session's previous conversation
+# `open` opens: it does not create. A name that does not exist is answered with the
+# `new` command to run — and, when it is one edit away from a session you have, with
+# a "did you mean". Creating on any unknown name turned a typo into a whole session:
+# worktrees, a branch, a port block and the dependency bootstrap, then a `rm` to undo.
 pleach open fix-x code               # VS Code on the session's multi-root workspace
 
 pleach new fix-x api web             # a focused session: only these sub-repos
@@ -451,7 +456,7 @@ session and the canonical by their markers rather than by hardcoded directories:
 ## Tests
 
 ```bash
-tests/run.sh          # 448 assertions across 49 scenarios, in a throwaway sandbox
+tests/run.sh          # 462 assertions across 50 scenarios, in a throwaway sandbox
 tests/no-leaks.sh     # repository hygiene gate
 shellcheck pleach install.sh tests/*.sh examples/*.sh
 ```

@@ -12,7 +12,7 @@
 # shellcheck disable=SC2015  # deliberate idiom: [ -z "$x" ] && x=… || err (err never runs after an assignment)
 set -euo pipefail
 
-PLEACH_VERSION="1.7.0"
+PLEACH_VERSION="2.0.0"
 
 CONF_NAME=".pleach.conf"
 USER_CONF="$HOME/.config/pleach/config"
@@ -652,7 +652,7 @@ EOF
     echo "PLEACH_DEFAULT_CANONICAL=\"$PWD\"" >> "$USER_CONF"
     info "recorded as this machine's default project in $USER_CONF"
   fi
-  echo "Next: review the $CONF_NAME, then 'pleach new <name>' or 'pleach open <name>'."
+  echo "Next: review the $CONF_NAME, then 'pleach new <name>' and 'pleach open <name>'."
   echo "      and teach your agents about it: pleach skill --project"
 }
 
@@ -803,6 +803,31 @@ cmd_new() {
 }
 
 # ---------------------------------------------------------------------------
+suggest_session() { # $1 = a name that does not exist -> the closest one that does
+  # Edit distance, because the mistake this answers is a typo. The tolerance
+  # scales with length: at four characters or fewer almost everything is one edit
+  # from everything else, and a confident wrong suggestion is worse than none.
+  [ -d "$SESSIONS" ] || return 1
+  local best
+  best=$(for d in "$SESSIONS"/*/; do [ -d "$d" ] && basename "$d"; done | awk -v want="$1" '
+    function mn(a, b, c) { return a < b ? (a < c ? a : c) : (b < c ? b : c) }
+    {
+      m = length(want); k = length($0)
+      for (i = 0; i <= m; i++) d[i, 0] = i
+      for (j = 0; j <= k; j++) d[0, j] = j
+      for (i = 1; i <= m; i++)
+        for (j = 1; j <= k; j++)
+          d[i, j] = mn(d[i-1, j] + 1, d[i, j-1] + 1,
+                       d[i-1, j-1] + (substr(want, i, 1) == substr($0, j, 1) ? 0 : 1))
+      dist = d[m, k]
+      lim = (m <= 4 ? 1 : 2)
+      if (dist <= lim && (best == "" || dist < bd)) { best = $0; bd = dist }
+    }
+    END { if (best != "") print best }') || return 1
+  [ -n "$best" ] || return 1
+  printf '%s' "$best"
+}
+
 cmd_open() {
   local name="${1:-}"
   [ -n "$name" ] || err "usage: pleach open <name> [command ...] (default: claude)"
@@ -810,8 +835,21 @@ cmd_open() {
   load_config
   local dir="$SESSIONS/$name"
   if [ ! -d "$dir" ]; then
-    info "session '$name' does not exist — creating it with every sub-repo…"
-    cmd_new "$name"
+    # Creating here turned a typo into a whole session — worktrees, a branch, a
+    # port block and the dependency bootstrap, all for a slip of the fingers, and
+    # then a `pleach rm` to undo it. Creating is what `new` is for.
+    local hint="" suffix=""
+    hint=$(suggest_session "$name") || hint=""
+    if [ -n "$hint" ]; then suffix=" — did you mean '$hint'?"; fi
+    err "session '$name' does not exist$suffix
+       create it with: pleach new $name"
+  fi
+  # An interrupted creation leaves worktrees or dependencies missing, and the build
+  # that then fails looks like the code's fault. A warning rather than a refusal:
+  # `open` is also how you get in to look at the state, and the marker cannot tell
+  # "being created right now" from "interrupted yesterday".
+  if session_incomplete "$name"; then
+    warn "session '$name': creation never finished — repos or dependencies may be missing (finish it with: pleach add $name --all && pleach clean $name --bootstrap)"
   fi
   cd "$dir"
   # Backfill: sessions created by older versions lack the newer artefacts.
@@ -2557,7 +2595,7 @@ Usage: pleach <command> [arguments]
 
 Sessions
   new <name> [sub …]        Create a session: one git worktree per repo on branch session/<name>.
-  open <name> [command …]   Open the session (creating it if needed). Default command: claude.
+  open <name> [command …]   Open an existing session. Default command: claude.
   ls [-l|--json]            List sessions. With -l, detail each one's repos; --json to script it.
   cd [<session>]            Change into the session (needs: eval "$(pleach shell-init)").
   path [<session>]          Print where a session lives (--canonical for the canonical).
@@ -2583,7 +2621,7 @@ Tool
   version                   Print the installed version.
   help [command]            Detailed help for a command (and `help config`).
 
-e.g. pleach open fix-login          create/open and get to work
+e.g. pleach new fix-login           create the session, then: pleach open fix-login
      pleach repos --sync            adopt a new workspace repo (e.g. payments)
      pleach sync fix-login          bring the session up to date with main
      pleach skill --install         teach your LLM to drive pleach
@@ -2621,7 +2659,7 @@ EOF
     open) cat <<'EOF'
 pleach open <name> [command ...]
 
-Enters the session (creating it with every sub-repo if it does not exist), loads
+Enters the session, loads
 .session-env (ports, identity) and runs the command in there. Default: claude.
 
   pleach open fix-x             claude inside the session
