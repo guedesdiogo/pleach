@@ -12,7 +12,7 @@
 # shellcheck disable=SC2015  # deliberate idiom: [ -z "$x" ] && x=… || err (err never runs after an assignment)
 set -euo pipefail
 
-PLEACH_VERSION="2.0.0"
+PLEACH_VERSION="2.1.0"
 
 CONF_NAME=".pleach.conf"
 USER_CONF="$HOME/.config/pleach/config"
@@ -362,6 +362,17 @@ $folders
   ]
 }
 EOF
+}
+
+generated_workspace_file() { # $1 = the .code-workspace, $2 = the name it carries
+  # pleach's own file lists that session as its first folder. Requiring the
+  # signature before deleting keeps --fix off a workspace file somebody wrote by
+  # hand and left here: .code-workspace is a generic name, the sessions folder is
+  # somewhere people do leave things, and a generated file is replaceable while a
+  # hand-written one is not.
+  local want
+  want="    { \"path\": \"$(json_escape "$2")\" }"
+  grep -qxF "$want" "$1" 2>/dev/null || grep -qxF "$want," "$1" 2>/dev/null
 }
 
 refresh_vscode_workspace() { # $1 name, $2 dir — regenerates with the subs present
@@ -2060,9 +2071,10 @@ EOF
 
 # ---------------------------------------------------------------------------
 DOCTOR_PROBLEMS=0
+DOCTOR_NOTES=0
 dr_bad()  { echo "  ✗ $*"; DOCTOR_PROBLEMS=$((DOCTOR_PROBLEMS + 1)); }
 dr_ok()   { echo "  ✓ $*"; }
-dr_note() { echo "  · $*"; }
+dr_note() { echo "  · $*"; DOCTOR_NOTES=$((DOCTOR_NOTES + 1)); }
 
 cmd_doctor() {
   # Everything a multi-repo tool can silently get wrong, asked out loud. Reports
@@ -2308,6 +2320,86 @@ cmd_doctor() {
   done < <(session_names)
   [ "$found" -eq 0 ] && dr_note "(no sessions)"
 
+  echo ""
+  echo "sessions folder"
+  # `session_names` requires a .git at the root, so everything else living here is
+  # invisible to every command that lists sessions — which is how a workspace ends
+  # up with stale files and stray folders while doctor reports it healthy.
+  local leftover base found=0
+  for leftover in "$SESSIONS"/*/; do
+    [ -d "$leftover" ] || continue
+    leftover="${leftover%/}"
+    [ -e "$leftover/.git" ] && continue
+    base=$(basename "$leftover")
+    found=1
+    if [ -f "$leftover/.session-env" ]; then
+      # Not "not a session" — a broken one. It still holds the port block its
+      # .session-env names, and no listing will show it to you.
+      dr_bad "$base: a .session-env but no worktree at its root — it still holds a port block, and every command that lists sessions skips it (drop it with: pleach rm $base --force)"
+    else
+      dr_note "$base: a directory in the sessions folder that is not a session (no worktree, no .session-env) — pleach ignores it, and --fix will not touch it either"
+    fi
+  done
+  # Generated files outlive the session they were named for when the folder is
+  # removed by hand. `pleach rm` clears both; nothing clears them after an rm -rf.
+  for leftover in "$SESSIONS"/*.code-workspace; do
+    [ -f "$leftover" ] || continue
+    base=$(basename "$leftover" .code-workspace)
+    [ "$base" = "panorama" ] && continue
+    [ -d "$SESSIONS/$base" ] && continue
+    found=1
+    if ! generated_workspace_file "$leftover" "$base"; then
+      dr_note "$base.code-workspace: a workspace file with no session of that name — pleach did not write it, so --fix leaves it alone"
+    elif [ "$fix" -eq 1 ]; then
+      if rm -f "$leftover"; then
+        dr_ok "$base.code-workspace: removed (generated, and its session is gone)"
+      else
+        dr_bad "$base.code-workspace: could not be removed — by hand: rm '$leftover'"
+      fi
+    else
+      dr_note "$base.code-workspace: a generated workspace file whose session is gone (clear it with: pleach doctor --fix)"
+    fi
+  done
+  for leftover in "$SESSIONS"/.pleach-building.*; do
+    [ -f "$leftover" ] || continue
+    base=${leftover##*/.pleach-building.}
+    [ -d "$SESSIONS/$base" ] && continue
+    found=1
+    if [ "$fix" -eq 1 ]; then
+      if rm -f "$leftover"; then
+        dr_ok ".pleach-building.$base: removed (marker for a session that is gone)"
+      else
+        dr_bad ".pleach-building.$base: could not be removed — by hand: rm '$leftover'"
+      fi
+    else
+      dr_note ".pleach-building.$base: a creation marker for a session that is gone (clear it with: pleach doctor --fix)"
+    fi
+  done
+  # The lock composes its owner line in a scratch file before linking it into
+  # place; a run killed inside that window leaves it behind, and nothing removed
+  # it — `rm` never saw it, and --fix releases the lock and walks past its
+  # scratch. Only a dead pid is cleared: a live run's scratch exists for a moment
+  # by design, and deleting it would break the run that is holding it.
+  local scratch_pid
+  for leftover in "$SESSIONS"/.pleach.lock.*; do
+    [ -f "$leftover" ] || continue
+    scratch_pid=${leftover##*/.pleach.lock.}
+    case "$scratch_pid" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$scratch_pid" 2>/dev/null && continue
+    found=1
+    if [ "$fix" -eq 1 ]; then
+      if rm -f "$leftover"; then
+        dr_ok ".pleach.lock.$scratch_pid: removed (scratch line from a run that is gone)"
+      else
+        dr_bad ".pleach.lock.$scratch_pid: could not be removed — by hand: rm '$leftover'"
+      fi
+    else
+      dr_note ".pleach.lock.$scratch_pid: a lock scratch line left by a run that is gone (clear it with: pleach doctor --fix)"
+    fi
+  done
+  [ "$found" -eq 0 ] && dr_ok "nothing in it but sessions and their own files"
+
+  echo ""
   # An installed agent skill is a COPY, so it ages the moment pleach is upgraded —
   # silently, which is the worst way for guidance to be wrong. Reported, never
   # repaired: the file is generated, but it is also editable, and --fix is
@@ -2326,7 +2418,14 @@ cmd_doctor() {
 
   echo ""
   if [ "$DOCTOR_PROBLEMS" -eq 0 ]; then
-    echo "✅ no problems found."
+    # The verdict is the line people read. A bare "no problems found" under a list
+    # of notes swallows them, which is the same reader-scanning-the-ticks failure
+    # as certifying a session that was reported broken two lines above.
+    if [ "$DOCTOR_NOTES" -gt 0 ]; then
+      echo "✅ no problems found — $DOCTOR_NOTES note(s) above."
+    else
+      echo "✅ no problems found."
+    fi
     return 0
   fi
   echo "$DOCTOR_PROBLEMS problem(s) found."
