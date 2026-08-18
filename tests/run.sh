@@ -1801,6 +1801,35 @@ assert_rc "unreadable: once readable again, new works" "$RC" 0
 assert_true "unreadable: and beta did not land on alpha's block" \
   [ "$(env_val "$S4/beta" PLEACH_PORT_BASE)" != "$ALPHA_PORTS" ]
 
+# Present but unusable is the same defect in a narrower form: `PLEACH_INDEX=` with
+# nothing after it satisfies "the line is there" and then reports as a blank, which
+# is the "index , ports +" tick all over again. Two declarations are worse than
+# none: pleach reads the first and `source .session-env` exports the last, so the
+# block it reports and the block the dev server binds are different numbers.
+ALPHA_ENV="$S4/alpha/.session-env"
+cp "$ALPHA_ENV" "$S4/alpha/env.good"
+break_index() { # $1 = the PLEACH_INDEX line(s) that replace the good one
+  grep -v '^export PLEACH_INDEX=' "$S4/alpha/env.good" > "$ALPHA_ENV"
+  printf '%s\n' "$1" >> "$ALPHA_ENV"
+}
+
+break_index "export PLEACH_INDEX="
+run bash -c "$PIN4 '$PLEACH' doctor"
+assert_rc "unreadable: an empty index is not a readable one" "$RC" 1
+assert_contains "unreadable: and is reported as unreadable" "$OUT" "no PLEACH_INDEX"
+
+break_index "export PLEACH_INDEX=abc"
+run bash -c "$PIN4 '$PLEACH' doctor"
+assert_rc "unreadable: nor is one that is not a number" "$RC" 1
+
+break_index "$(printf 'export PLEACH_INDEX=1\nexport PLEACH_INDEX=7')"
+run bash -c "$PIN4 '$PLEACH' doctor"
+assert_rc "unreadable: nor two of them disagreeing" "$RC" 1
+
+cp "$S4/alpha/env.good" "$ALPHA_ENV"
+run bash -c "$PIN4 '$PLEACH' doctor"
+assert_rc "unreadable: and the workspace is healthy again once it is" "$RC" 0
+
 # ---------------------------------------------------------------------------
 # Test 49: the skill leaves a pointer in the instruction file that already exists
 # ---------------------------------------------------------------------------
@@ -1844,6 +1873,16 @@ printf '# Claude\n' > "$MINI5/canon/CLAUDE.md"
 run bash -c "cd '$MINI5/canon' && '$PLEACH' skill --project"
 assert_true "pointer: an existing CLAUDE.md gets it as well" \
   grep -q 'pleach:begin' "$MINI5/canon/CLAUDE.md"
+
+# Equal counts are not a valid pair. A closing marker sitting before an opening one
+# passes a count check, and the rewrite then deletes from the opening marker to the
+# end of the file — taking the team's text with it.
+printf '# Acme\n<!-- pleach:end -->\n<!-- pleach:begin -->\nKeep me.\n' \
+  > "$MINI5/canon/AGENTS.md"
+run bash -c "cd '$MINI5/canon' && '$PLEACH' skill --project"
+assert_true "pointer: a closing marker before an opening one is left alone" \
+  grep -q 'Keep me' "$MINI5/canon/AGENTS.md"
+assert_contains "pointer: and the file is named as needing a human" "$OUT" "markers"
 
 # And init hands over the command, instead of leaving it to be discovered.
 MINI6=$(cd "$SANDBOX" && mkdir -p initskill && cd initskill && pwd)

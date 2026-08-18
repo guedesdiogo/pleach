@@ -424,9 +424,21 @@ free_index() { # lowest index no session's .session-env claims -> its port block
 }
 
 session_env_unreadable() { # $1 dir — a .session-env is there, but not one pleach reads
+  # Readable means exactly one PLEACH_INDEX declaration carrying a number. The near
+  # misses are not pedantry: an empty value satisfies "the line is there" and then
+  # reports as a blank — the "index , ports +" tick this guard exists to stop — and
+  # two declarations disagree by construction, because pleach reads the first while
+  # `source .session-env` exports the last, so the block reported and the block
+  # actually bound are different numbers.
   [ -f "$1/.session-env" ] || return 1
-  grep -q '^export PLEACH_INDEX=' "$1/.session-env" && return 1
-  return 0
+  local lines idx
+  lines=$(grep -c '^export PLEACH_INDEX=' "$1/.session-env" || true)
+  [ "$lines" = "1" ] || return 0
+  idx=$(grep -m1 '^export PLEACH_INDEX=' "$1/.session-env" | cut -d= -f2-)
+  case "$idx" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  return 1
 }
 
 unreadable_sessions() { # names of the sessions whose .session-env cannot be read
@@ -2403,13 +2415,17 @@ write_pointer() { # $1 = an instruction file that ALREADY exists
   # previous block is replaced rather than appended to, so re-running after an
   # upgrade refreshes the pointer instead of stacking copies of it.
   [ -f "$1" ] || return 1
-  local nb ne tmp
-  nb=$(grep -cxF "$POINTER_BEGIN" "$1" || true)
-  ne=$(grep -cxF "$POINTER_END" "$1" || true)
-  if [ "$nb" != "$ne" ]; then
-    # Swallowing from an opening marker to end-of-file would delete the team's
-    # text, so a hand-broken pair is left for a human rather than guessed at.
-    warn "$1 has $nb opening and $ne closing pleach markers — leaving it alone; pair them by hand"
+  local tmp
+  # Counting the markers is not enough: one of each, closing first, counts equal and
+  # is still malformed — the rewrite below would then swallow from the opening marker
+  # to the end of the file, taking the team's text with it. Order and nesting are what
+  # matter, so they are what is checked.
+  if ! awk -v b="$POINTER_BEGIN" -v e="$POINTER_END" '
+    $0 == b { if (inside) bad = 1; inside = 1; next }
+    $0 == e { if (!inside) bad = 1; inside = 0; next }
+    END     { exit (bad || inside) }
+  ' "$1"; then
+    warn "$1 has malformed pleach markers (out of order, nested or unclosed) — leaving it alone; pair them by hand"
     return 1
   fi
   tmp=$(mktemp) || return 1
