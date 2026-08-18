@@ -12,7 +12,7 @@
 # shellcheck disable=SC2015  # deliberate idiom: [ -z "$x" ] && x=… || err (err never runs after an assignment)
 set -euo pipefail
 
-PLEACH_VERSION="1.5.1"
+PLEACH_VERSION="1.5.2"
 
 CONF_NAME=".pleach.conf"
 USER_CONF="$HOME/.config/pleach/config"
@@ -407,6 +407,25 @@ repo_path() { # $1 = "" (root) or a sub name
   if [ -z "$1" ]; then echo "$CANONICAL"; else echo "$CANONICAL/$1"; fi
 }
 
+free_index() { # lowest index no session's .session-env claims -> its port block
+  local idx=1 used d
+  while :; do
+    used=0
+    for d in "$SESSIONS"/*/.session-env; do
+      [ -f "$d" ] || continue
+      grep -q "^export PLEACH_INDEX=$idx\$" "$d" && { used=1; break; }
+    done
+    [ "$used" -eq 0 ] && break
+    idx=$((idx + 1))
+    [ "$idx" -gt 98 ] && err "no free index left (98 sessions?!)"
+  done
+  printf '%s' "$idx"
+}
+
+session_incomplete() { # 0 when a creation started for $1 and never finished
+  [ -e "$SESSIONS/.pleach-building.$1" ]
+}
+
 warn_if_behind() { # $1 repo, $2 label
   local behind
   behind=$(git -C "$1" rev-list --count "$BASE..origin/$BASE" 2>/dev/null || echo 0)
@@ -635,18 +654,19 @@ cmd_new() {
   lock
 
   # Session index → a deterministic, collision-free block of 100 ports.
-  local idx=1 used d
-  while :; do
-    used=0
-    for d in "$SESSIONS"/*/.session-env; do
-      [ -f "$d" ] || continue
-      grep -q "^export PLEACH_INDEX=$idx\$" "$d" && { used=1; break; }
-    done
-    [ "$used" -eq 0 ] && break
-    idx=$((idx + 1))
-    [ "$idx" -gt 98 ] && err "no free index left (98 sessions?!)"
-  done
-  local port_base=$((PORT_START + idx * 100))
+  local idx port_base
+  idx=$(free_index)
+  port_base=$((PORT_START + idx * 100))
+
+  # From here on the session exists on disk but is not yet usable. The marker sits
+  # BESIDE it, because everything inside is a worktree and a file there would show
+  # up in `git status` on the branch. Only the success path at the bottom removes
+  # it: a run that is killed, or that fails partway, leaves it as the evidence that
+  # this session was never finished — which nothing else records once .session-env
+  # exists, since from that point a half-built session has every artefact a
+  # finished one has.
+  local marker="$SESSIONS/.pleach-building.$name"
+  : > "$marker"
 
   info "creating session '$name' (index $idx, ports ${port_base}-$((port_base + 99))) at $dir"
   # A block freed by `rm` is handed out again immediately, and a dev server that
@@ -685,14 +705,19 @@ cmd_new() {
     fi
   done
 
-  unlock
-
   info "copying secrets (.env*, .dev.vars*, extras from the conf)…"
   copy_secrets "$dir" 1 ${subs[@]+"${subs[@]}"}
 
   local recorded_ref="$BASE"
   if [ -n "$from" ] && [ "$from_used" -eq 1 ]; then recorded_ref="$from"; fi
   write_session_env "$dir" "$name" "$idx" "$port_base" "$recorded_ref"
+  # The lock is held until the index is RECORDED, not merely chosen. free_index
+  # reads .session-env files, so releasing between the choice and the write left a
+  # window — the width of copy_secrets — in which a second `new` saw no claim on
+  # this index and picked it too: two sessions on one port block, which is the
+  # collision the index exists to prevent. Bootstrap stays outside; it is the slow
+  # part and it reserves nothing.
+  unlock
   # .session-env lives INSIDE the root worktree, so `git add -A` at the session root
   # would commit this machine's port block, DB name and absolute canonical path onto
   # the branch — and from there into main, where every session's copy then conflicts
@@ -713,6 +738,9 @@ cmd_new() {
   else
     info "bootstrap skipped (--no-bootstrap)"
   fi
+
+  # Everything the session needs is in place; only now is it not "being built".
+  rm -f "$marker" 2>/dev/null || true
 
   echo ""
   echo "✅ Session '$name' ready:"
@@ -1208,6 +1236,7 @@ cmd_rm() {
   git -C "$CANONICAL" worktree prune
   rm -rf "$dir"
   rm -f "$dir.code-workspace"
+  rm -f "$SESSIONS/.pleach-building.$name"   # the session is gone; its marker cannot outlive it
   unlock
 
   # Branches: delete only the ones fully integrated into $BASE; keep the rest.
@@ -1422,7 +1451,12 @@ ls_long() {
       if [ "${ahead:-0}" != "0" ] || [ "${dirty:-0}" != "0" ]; then clean=0; fi
       echo "    ${s:-root}: $(git -C "$wt" branch --show-current 2>/dev/null)${marks}"
     done
-    if [ "$clean" -eq 1 ]; then
+    # "fully integrated — removable" reads as "your work is merged, this is safe to
+    # drop". Over a session whose creation was interrupted it describes nothing:
+    # there was never any work, and what is missing is repos or dependencies.
+    if session_incomplete "$n"; then
+      echo "    ⚠ creation never finished — pleach add $n --all && pleach clean $n --bootstrap"
+    elif [ "$clean" -eq 1 ]; then
       echo "    ✓ fully integrated — removable (pleach prune)${last_activity:+ · last activity: $last_activity}"
     elif [ -n "$last_activity" ]; then
       echo "    (last activity: $last_activity)"
@@ -1939,9 +1973,31 @@ cmd_doctor() {
     found=1
     dir="$SESSIONS/$n"
     branch=$(session_branch "$n")
+    # A creation that never finished. Once .session-env is written a half-built
+    # session carries every artefact a finished one does, so without this marker
+    # doctor certified it and `ls -l` offered it up as removable.
+    if session_incomplete "$n"; then
+      dr_bad "$n: creation never finished — it may be missing repos or dependencies. Finish it with: pleach add $n --all && pleach clean $n --bootstrap  (or drop it: pleach rm $n --force)"
+    fi
     if [ ! -f "$dir/.session-env" ]; then
-      dr_bad "$n: no .session-env — ports and identity unknown (recreate the session, or copy one by hand)"
-      continue
+      # The old advice named two things that do not work: `new` refuses a name whose
+      # folder exists, and copying another session's file would hand this one that
+      # session's index and port block — the collision the design exists to prevent.
+      # A free index and a fresh file is a repair, so --fix does it.
+      if [ "$fix" -eq 1 ]; then
+        # Under the same lock `new` takes, and for the same reason: free_index reads
+        # the .session-env files, so choosing and recording have to be one critical
+        # section or a concurrent creation hands out this index too.
+        local lost_idx
+        lock
+        lost_idx=$(free_index)
+        write_session_env "$dir" "$n" "$lost_idx" "$((PORT_START + lost_idx * 100))"
+        unlock
+        dr_ok "$n: .session-env restored (index $lost_idx, ports $((PORT_START + lost_idx * 100))+)"
+      else
+        dr_bad "$n: no .session-env — ports and identity unknown; restore it with: pleach doctor --fix"
+        continue
+      fi
     fi
     # A renamed folder makes every name-keyed check look at the wrong branch, so it
     # is a problem in its own right rather than a detail of the ones below.
@@ -1994,7 +2050,14 @@ cmd_doctor() {
     if [ -n "$listeners" ]; then
       dr_note "$n: $(printf '%s\n' "$listeners" | wc -l | tr -d ' ') process(es) listening in its block $port-$((port + 99))"
     fi
-    dr_ok "$n: index $idx, ports $port+, $(( ${#present[@]} + 1 )) repo(s)"
+    # A green summary line directly under "✗ creation never finished" contradicts
+    # it, and a reader scanning for ✓/✗ sees whichever comes last. The facts still
+    # help, so they stay — as a note, not a verdict.
+    if session_incomplete "$n"; then
+      dr_note "$n: index $idx, ports $port+, $(( ${#present[@]} + 1 )) repo(s) — but see above"
+    else
+      dr_ok "$n: index $idx, ports $port+, $(( ${#present[@]} + 1 )) repo(s)"
+    fi
   done < <(session_names)
   [ "$found" -eq 0 ] && dr_note "(no sessions)"
 
@@ -2541,6 +2604,8 @@ Asks out loud everything a multi-repo tool can get wrong quietly:
   - a lock left behind by a run that died mid-way;
   - worktrees git still believes in whose folder is gone (these make the next
     `new` fail with a confusing "already used by worktree");
+  - sessions whose creation never finished — killed or failed partway, they carry
+    every artefact a finished one has, so nothing else tells them apart;
   - sessions with no .session-env, duplicate indexes or overlapping port blocks;
   - worktrees sitting on a branch other than session/<name>;
   - processes still listening inside a session's port block.
@@ -2548,12 +2613,15 @@ Asks out loud everything a multi-repo tool can get wrong quietly:
 Reports by default and exits non-zero when it finds a problem, so it fits in a
 CI step or a shell prompt.
 
-  --fix   Perform only repairs that cannot lose work: release a stale lock, and
-          run `git worktree repair` before pruning registrations that are still
-          stale afterwards. Repair comes first deliberately — a worktree whose
-          folder MOVED and one whose folder is GONE look identical from the
-          registration side, and pruning the first destroys the link that would
-          have restored it. Nothing else is automatic.
+  --fix   Perform only repairs that cannot lose work: release a stale lock, write
+          a fresh .session-env for a session that lost one (with a free index, so
+          it never inherits another session's port block), and run
+          `git worktree repair` before pruning registrations that are still stale
+          afterwards. Repair comes first deliberately — a worktree whose folder
+          MOVED and one whose folder is GONE look identical from the registration
+          side, and pruning the first destroys the link that would have restored
+          it. Nothing else is automatic: finishing an interrupted creation may
+          install dependencies, so it stays a command you choose to run.
 EOF
     ;;
     version) cat <<'EOF'

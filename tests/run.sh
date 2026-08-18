@@ -900,8 +900,11 @@ mkdir -p "$SANDBOX/nowhere"
 run bash -c "cd \"$SANDBOX/nowhere\" && env -u PLEACH_CANONICAL -u PLEACH_EXPECT_CANONICAL \"$PLEACH\" skill"
 assert_rc "skill: works with no workspace and no config" "$RC" 0
 
-env_val() { # <session dir> <variable> -> its value in .session-env
-  grep "^export $2=" "$1/.session-env" | head -1 | cut -d= -f2-
+env_val() { # <session dir> <variable> -> its value in .session-env, empty if absent
+  # Tolerant on purpose: under `set -euo pipefail` a missing file here aborts the
+  # whole run instead of failing one assertion, and a suite that dies reports less
+  # than a suite that fails.
+  grep "^export $2=" "$1/.session-env" 2>/dev/null | head -1 | cut -d= -f2- || true
 }
 
 # ---------------------------------------------------------------------------
@@ -1488,6 +1491,140 @@ run bash -c "$BARE PLEACH_CANONICAL='$MINI2/.sessions/inner' '$PLEACH' doctor"
 assert_rc "nested: doctor refuses a canonical that is itself a session" "$RC" 1
 assert_contains "nested: and says exactly that" "$OUT" "is itself a session"
 assert_not_contains "nested: without certifying it healthy" "$OUT" "no problems found"
+
+# ---------------------------------------------------------------------------
+header "Test 46: a creation that never finished says so, and can be recovered"
+# ---------------------------------------------------------------------------
+# Measured by killing `new` for real at two points. Killed once .session-env is
+# written but during bootstrap, the session is indistinguishable from a finished
+# one: doctor said "✓ during: index 2, ports 10200+, 3 repo(s)" and `ls -l` called
+# it "fully integrated — removable" over half-installed dependencies. Killed
+# earlier, before .session-env, doctor did notice — and handed over advice that
+# does not work: "recreate the session" is refused ("already exists"), and "copy
+# one by hand" would duplicate another session's index and port block, which is
+# the collision the whole design exists to prevent.
+MINI3=$(cd "$SANDBOX" && mkdir -p incomplete && cd incomplete && pwd)
+setup_repo "$MINI3/canon"
+echo "root" > "$MINI3/canon/f.txt"
+git -C "$MINI3/canon" add -A && git -C "$MINI3/canon" commit -q -m "initial"
+setup_repo "$MINI3/canon/api"
+echo "api" > "$MINI3/canon/api/f.txt"
+git -C "$MINI3/canon/api" add -A && git -C "$MINI3/canon/api" commit -q -m "initial"
+cat > "$MINI3/canon/.pleach.conf" <<'CONF'
+PLEACH_SUBS=(api)
+pleach_bootstrap() { sleep 25; }
+CONF
+PIN3="env PLEACH_CANONICAL=$MINI3/canon PLEACH_EXPECT_CANONICAL=$MINI3/canon"
+S3="$MINI3/.sessions"
+mark_of() { printf '%s' "$S3/.pleach-building.$1"; }
+
+run bash -c "$PIN3 '$PLEACH' new finished --no-bootstrap"
+assert_rc "incomplete: a session that finishes is created" "$RC" 0
+assert_true "incomplete: and a finished creation leaves no marker behind" \
+  [ ! -e "$(mark_of finished)" ]
+
+# Planted from here, so the reporting is asserted on every platform; the real
+# SIGKILL that produces this state is exercised further down, POSIX only.
+: > "$(mark_of finished)"
+
+run bash -c "$PIN3 '$PLEACH' doctor"
+assert_rc "incomplete: doctor exits non-zero over an unfinished creation" "$RC" 1
+assert_contains "incomplete: and names it as unfinished" "$OUT" "creation never finished"
+assert_contains "incomplete: handing over the command that resumes it" \
+  "$OUT" "pleach clean finished --bootstrap"
+assert_not_contains "incomplete: without certifying the workspace healthy" \
+  "$OUT" "no problems found"
+# It used to print "✗ finished: creation never finished" and then, two lines down,
+# "✓ finished: index 1, ports 10100+, 2 repo(s)" — a verdict contradicting itself,
+# and a reader scanning the ticks sees whichever came last.
+assert_not_contains "incomplete: and without a green verdict on the same session" \
+  "$OUT" "✓ finished: index"
+
+run bash -c "$PIN3 '$PLEACH' ls -l"
+assert_contains "incomplete: ls -l flags it" "$OUT" "creation never finished"
+# The decisive one: "fully integrated — removable" reads as "your work is merged,
+# this is safe to drop". Over a session whose dependencies were never installed it
+# is not a description of anything.
+assert_not_contains "incomplete: and does NOT call it fully integrated" \
+  "$OUT" "fully integrated"
+
+run bash -c "$PIN3 '$PLEACH' rm finished --force"
+assert_rc "incomplete: rm removes it" "$RC" 0
+assert_true "incomplete: and the marker goes with it, not left as litter" \
+  [ ! -e "$(mark_of finished)" ]
+
+# --- a missing .session-env is repaired, not merely reported -----------------
+run bash -c "$PIN3 '$PLEACH' new keeper --no-bootstrap"
+assert_rc "incomplete: a second session for the index check" "$RC" 0
+run bash -c "$PIN3 '$PLEACH' new lost --no-bootstrap"
+assert_rc "incomplete: the session that will lose its .session-env" "$RC" 0
+KEEPER_IDX=$(env_val "$S3/keeper" PLEACH_INDEX)
+rm -f "$S3/lost/.session-env"
+
+run bash -c "$PIN3 '$PLEACH' doctor"
+assert_rc "incomplete: doctor reports the missing .session-env" "$RC" 1
+assert_contains "incomplete: with advice that is a command" "$OUT" "pleach doctor --fix"
+assert_not_contains "incomplete: not one that is refused when you try it" \
+  "$OUT" "recreate the session"
+
+run bash -c "$PIN3 '$PLEACH' doctor --fix"
+assert_rc "incomplete: --fix restores it" "$RC" 0
+assert_true "incomplete: .session-env is back" [ -f "$S3/lost/.session-env" ]
+LOST_IDX=$(env_val "$S3/lost" PLEACH_INDEX)
+assert_true "incomplete: with an index of its own" [ -n "$LOST_IDX" ]
+assert_true "incomplete: which is not the one already taken" \
+  [ "$LOST_IDX" != "$KEEPER_IDX" ]
+assert_eq "incomplete: and the identity matches the session it belongs to" \
+  "$(env_val "$S3/lost" PLEACH_NAME)" "lost"
+
+# Two sessions that both lost their .session-env, restored in ONE --fix pass. The
+# second free_index has to see the first restore already written, or both are handed
+# the same index and the same block of 100 ports — the collision the index exists to
+# prevent, arriving through the repair that was supposed to end it.
+run bash -c "$PIN3 '$PLEACH' new twina --no-bootstrap"
+assert_rc "incomplete: first twin created" "$RC" 0
+run bash -c "$PIN3 '$PLEACH' new twinb --no-bootstrap"
+assert_rc "incomplete: second twin created" "$RC" 0
+rm -f "$S3/twina/.session-env" "$S3/twinb/.session-env"
+run bash -c "$PIN3 '$PLEACH' doctor --fix"
+assert_rc "incomplete: one --fix pass restores both" "$RC" 0
+TA=$(env_val "$S3/twina" PLEACH_INDEX); TB=$(env_val "$S3/twinb" PLEACH_INDEX)
+PA=$(env_val "$S3/twina" PLEACH_PORT_BASE); PB=$(env_val "$S3/twinb" PLEACH_PORT_BASE)
+assert_true "incomplete: both twins got an index" bash -c "[ -n '$TA' ] && [ -n '$TB' ]"
+assert_true "incomplete: and they are not the same index" [ "$TA" != "$TB" ]
+assert_true "incomplete: nor the same port block" [ "$PA" != "$PB" ]
+# doctor is the independent judge: it checks for duplicates without knowing how
+# the indexes were assigned.
+run bash -c "$PIN3 '$PLEACH' doctor"
+assert_not_contains "incomplete: no session ends up sharing an index or a block" \
+  "$OUT" "is already taken by another session"
+
+# --- the real interruption, POSIX only --------------------------------------
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*)
+    echo "  (Windows: SIGKILL on a background job does not orphan the run the same"
+    echo "   way through Git Bash — the reporting above is asserted from a planted"
+    echo "   marker, so what goes untested here is only whether a real crash"
+    echo "   produces one.)"
+    ;;
+  *)
+    $PIN3 "$PLEACH" new slow >/dev/null 2>&1 &
+    SLOW=$!
+    for _ in $(seq 1 900); do [ -f "$S3/slow/.session-env" ] && break; sleep 0.05; done
+    if [ -f "$S3/slow/.session-env" ] && kill -0 "$SLOW" 2>/dev/null; then
+      kill -9 "$SLOW" 2>/dev/null || true
+      wait "$SLOW" 2>/dev/null || true
+    fi
+    assert_true "incomplete: a run killed during bootstrap wrote .session-env" \
+      [ -f "$S3/slow/.session-env" ]
+    # It has everything a finished session has, so nothing else tells them apart.
+    assert_true "incomplete: and left the marker that says it never finished" \
+      [ -e "$(mark_of slow)" ]
+    run bash -c "$PIN3 '$PLEACH' doctor"
+    assert_rc "incomplete: doctor catches the real interruption too" "$RC" 1
+    assert_contains "incomplete: naming that session" "$OUT" "slow: creation never finished"
+    ;;
+esac
 
 # ---------------------------------------------------------------------------
 # Summary
