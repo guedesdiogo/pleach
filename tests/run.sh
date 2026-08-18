@@ -1892,6 +1892,60 @@ assert_rc "pointer: init runs" "$RC" 0
 assert_contains "pointer: and init names the skill command" "$OUT" "pleach skill"
 
 # ---------------------------------------------------------------------------
+# Test 50: open does not create — a typo is not a request for a new session
+# ---------------------------------------------------------------------------
+# `open` used to create the session when the name did not exist, which reads well
+# in a README and badly at a keyboard: one slip of the fingers built worktrees, a
+# branch, a port block and the whole dependency bootstrap, and then needed a
+# `pleach rm` to undo. Creating is what `new` is for; `open` opens.
+MINI7=$(cd "$SANDBOX" && mkdir -p noopen && cd noopen && pwd)
+setup_repo "$MINI7/canon"
+echo root > "$MINI7/canon/f.txt"
+git -C "$MINI7/canon" add -A && git -C "$MINI7/canon" commit -q -m initial
+printf 'PLEACH_SUBS=()\npleach_bootstrap() { :; }\n' > "$MINI7/canon/.pleach.conf"
+PIN7="env PLEACH_CANONICAL=$MINI7/canon PLEACH_EXPECT_CANONICAL=$MINI7/canon"
+S7="$MINI7/.sessions"
+
+run bash -c "$PIN7 '$PLEACH' new fix-login --no-bootstrap"
+assert_rc "noopen: a real session exists" "$RC" 0
+
+run bash -c "$PIN7 '$PLEACH' open fix-login true"
+assert_rc "noopen: opening the one that exists still works" "$RC" 0
+
+run bash -c "$PIN7 '$PLEACH' open nosuchthing true"
+assert_rc "noopen: opening one that does not exist fails" "$RC" 1
+assert_contains "noopen: saying so" "$OUT" "does not exist"
+assert_contains "noopen: and handing over the command that creates it" \
+  "$OUT" "pleach new nosuchthing"
+assert_true "noopen: without building anything" [ ! -d "$S7/nosuchthing" ]
+assert_true "noopen: and without leaving a branch behind" \
+  bash -c "! git -C '$MINI7/canon' rev-parse --verify -q session/nosuchthing >/dev/null"
+
+# The typo is the whole reason this changed, so the error answers it.
+run bash -c "$PIN7 '$PLEACH' open fix-logni true"
+assert_rc "noopen: a near miss fails too" "$RC" 1
+assert_contains "noopen: but names the session that was probably meant" "$OUT" "fix-login"
+assert_true "noopen: and still builds nothing" [ ! -d "$S7/fix-logni" ]
+
+# Opening a session whose creation never finished used to say nothing at all, so a
+# build failing on half-installed dependencies looked like the code's fault. It
+# warns rather than refuses: `open` is also how you get in to look at the state,
+# and the marker cannot tell "being created right now" from "interrupted yesterday".
+: > "$S7/.pleach-building.fix-login"
+run bash -c "$PIN7 '$PLEACH' open fix-login true"
+assert_rc "noopen: an unfinished session still opens" "$RC" 0
+assert_contains "noopen: but says the creation never finished" "$OUT" "creation never finished"
+rm -f "$S7/.pleach-building.fix-login"
+run bash -c "$PIN7 '$PLEACH' open fix-login true"
+assert_not_contains "noopen: and a finished one is not nagged about it" \
+  "$OUT" "creation never finished"
+
+# A name nothing resembles must not have a suggestion invented for it.
+run bash -c "$PIN7 '$PLEACH' open zzzzzzzz true"
+assert_not_contains "noopen: no suggestion is invented for an unrelated name" \
+  "$OUT" "did you mean"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
