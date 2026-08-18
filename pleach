@@ -829,11 +829,22 @@ suggest_session() { # $1 = a name that does not exist -> the closest one that do
 }
 
 cmd_open() {
-  local name="${1:-}"
-  [ -n "$name" ] || err "usage: pleach open <name> [command ...] (default: claude)"
+  local create=0 name=""
+  # `--create` is pleach's flag, not the launched command's. It is consumed only in
+  # that exact spelling and only before the session name or immediately after it:
+  # everything past that point is the command's own argv, and eating a lookalike
+  # out of it would change what the caller asked to run.
+  if [ "${1:-}" = "--create" ]; then create=1; shift; fi
+  name="${1:-}"
+  [ -n "$name" ] || err "usage: pleach open [--create] <name> [command ...] (default: claude)"
   shift
+  if [ "${1:-}" = "--create" ]; then create=1; shift; fi
   load_config
   local dir="$SESSIONS/$name"
+  if [ ! -d "$dir" ] && [ "$create" -eq 1 ]; then
+    info "session '$name' does not exist — creating it with every sub-repo…"
+    cmd_new "$name"
+  fi
   if [ ! -d "$dir" ]; then
     # Creating here turned a typo into a whole session — worktrees, a branch, a
     # port block and the dependency bootstrap, all for a slip of the fingers, and
@@ -2595,7 +2606,7 @@ Usage: pleach <command> [arguments]
 
 Sessions
   new <name> [sub …]        Create a session: one git worktree per repo on branch session/<name>.
-  open <name> [command …]   Open an existing session. Default command: claude.
+  open [--create] <name> […] Open an existing session (--create makes it). Default: claude.
   ls [-l|--json]            List sessions. With -l, detail each one's repos; --json to script it.
   cd [<session>]            Change into the session (needs: eval "$(pleach shell-init)").
   path [<session>]          Print where a session lives (--canonical for the canonical).
@@ -2657,7 +2668,7 @@ squashed at merge, the child carries commits that no longer exist upstream.
 EOF
     ;;
     open) cat <<'EOF'
-pleach open <name> [command ...]
+pleach open [--create] <name> [command ...]
 
 Enters the session, loads
 .session-env (ports, identity) and runs the command in there. Default: claude.

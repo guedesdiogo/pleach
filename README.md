@@ -253,10 +253,14 @@ the conf first made a session its own canonical.
 ```bash
 pleach open fix-x                    # open your tool inside an existing session
 pleach open fix-x claude -r          # resume that session's previous conversation
-# `open` opens: it does not create. A name that does not exist is answered with the
-# `new` command to run — and, when it is one edit away from a session you have, with
-# a "did you mean". Creating on any unknown name turned a typo into a whole session:
-# worktrees, a branch, a port block and the dependency bootstrap, then a `rm` to undo.
+pleach open fix-x --create           # the one-command flow, asked for explicitly
+# `open` opens: by default it does not create. A name that does not exist is answered
+# with the `new` command to run — and, when it is one edit away from a session you
+# have, with a "did you mean". Creating on any unknown name turned a typo into a whole
+# session: worktrees, a branch, a port block and the dependency bootstrap, then a `rm`
+# to undo. `--create` keeps that flow for anyone who wants it, because typing the flag
+# is a decision and a typo is not. The refusal deliberately does not mention it: a
+# mistyped name should not be answered with how to build it anyway.
 pleach open fix-x code               # VS Code on the session's multi-root workspace
 
 pleach new fix-x api web             # a focused session: only these sub-repos
@@ -456,7 +460,7 @@ session and the canonical by their markers rather than by hardcoded directories:
 ## Tests
 
 ```bash
-tests/run.sh          # 462 assertions across 50 scenarios, in a throwaway sandbox
+tests/run.sh          # 470 assertions across 50 scenarios, in a throwaway sandbox
 tests/no-leaks.sh     # repository hygiene gate
 shellcheck pleach install.sh tests/*.sh examples/*.sh
 ```
