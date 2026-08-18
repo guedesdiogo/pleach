@@ -1927,6 +1927,28 @@ assert_rc "noopen: a near miss fails too" "$RC" 1
 assert_contains "noopen: but names the session that was probably meant" "$OUT" "fix-login"
 assert_true "noopen: and still builds nothing" [ ! -d "$S7/fix-logni" ]
 
+# `--create` keeps the one-command flow for anyone who wants it, without it being
+# what an unknown name means by default. Typing the flag is a decision; a typo is not.
+run bash -c "$PIN7 '$PLEACH' open made-on-purpose --create true"
+assert_rc "create: --create after the name builds the session" "$RC" 0
+assert_true "create: and it is really there" [ -d "$S7/made-on-purpose" ]
+
+run bash -c "$PIN7 '$PLEACH' open --create made-first true"
+assert_rc "create: the flag is accepted before the name too" "$RC" 0
+assert_true "create: and that one exists as well" [ -d "$S7/made-first" ]
+
+run bash -c "$PIN7 '$PLEACH' open fix-login --create true"
+assert_rc "create: on a session that exists it simply opens" "$RC" 0
+assert_not_contains "create: without claiming to have created anything" \
+  "$OUT" "does not exist"
+
+# The flag belongs to pleach, not to the command being launched: everything after
+# the session name is the command's own argv, and eating a lookalike out of it
+# would change what the caller asked to run.
+run bash -c "$PIN7 '$PLEACH' open fix-login printf '%s\\n' --create"
+assert_rc "create: a command argument that looks like the flag still runs" "$RC" 0
+assert_contains "create: and reaches the command untouched" "$OUT" "--create"
+
 # Opening a session whose creation never finished used to say nothing at all, so a
 # build failing on half-installed dependencies looked like the code's fault. It
 # warns rather than refuses: `open` is also how you get in to look at the state,
