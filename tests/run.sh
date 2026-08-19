@@ -1968,6 +1968,98 @@ assert_not_contains "noopen: no suggestion is invented for an unrelated name" \
   "$OUT" "did you mean"
 
 # ---------------------------------------------------------------------------
+# Test 51: what is in the sessions folder but is not a session
+# ---------------------------------------------------------------------------
+# `session_names` requires a .git at the root of the directory, so anything else
+# living in the sessions folder is invisible to every command that lists sessions
+# — `ls`, `doctor`, `prune`, `conflicts`. A real workspace had two stale
+# .code-workspace files and a stray folder sitting there while doctor closed with
+# "no problems found". The worse case is a directory that still has a .session-env
+# and has lost its worktree: it is not "not a session", it is a broken one, and it
+# is still holding a port block that no listing will show you.
+MINI8=$(cd "$SANDBOX" && mkdir -p leftovers && cd leftovers && pwd)
+setup_repo "$MINI8/canon"
+echo root > "$MINI8/canon/f.txt"
+git -C "$MINI8/canon" add -A && git -C "$MINI8/canon" commit -q -m initial
+printf 'PLEACH_SUBS=()\npleach_bootstrap() { :; }\n' > "$MINI8/canon/.pleach.conf"
+PIN8="env PLEACH_CANONICAL=$MINI8/canon PLEACH_EXPECT_CANONICAL=$MINI8/canon"
+S8="$MINI8/.sessions"
+
+run bash -c "$PIN8 '$PLEACH' new alive --no-bootstrap"
+assert_rc "leftovers: a live session exists" "$RC" 0
+
+run bash -c "$PIN8 '$PLEACH' doctor"
+assert_rc "leftovers: a clean sessions folder is clean" "$RC" 0
+assert_not_contains "leftovers: with nothing invented to note about it" "$OUT" "note(s) above"
+assert_not_contains "leftovers: the live session is not called a leftover" "$OUT" "alive.code-workspace"
+assert_not_contains "leftovers: and neither is the panorama" "$OUT" "panorama"
+
+# A plain folder someone left there: reported, never touched. It could be anything.
+mkdir -p "$S8/notasession/inner"
+echo keep > "$S8/notasession/inner/f.txt"
+# A generated file whose session is gone, and a marker whose session is gone. The
+# workspace file carries the real generated content: an empty one would be deleted
+# for the wrong reason, and would not be something pleach could ever have written.
+printf '{\n  "folders": [\n    { "path": "ghost" }\n  ]\n}\n' > "$S8/ghost.code-workspace"
+: > "$S8/.pleach-building.ghost"
+
+run bash -c "$PIN8 '$PLEACH' doctor"
+assert_contains "leftovers: the stray folder is named" "$OUT" "notasession"
+# The verdict is the line people read. Printing a bare "no problems found" under
+# three notes is the same reader-scanning-the-ticks failure as certifying an
+# unfinished session: nothing is broken, but something was said and the summary
+# swallowed it.
+assert_contains "leftovers: and the verdict admits there were notes" "$OUT" "note(s) above"
+assert_contains "leftovers: the orphaned workspace file is named" "$OUT" "ghost.code-workspace"
+assert_contains "leftovers: the orphaned marker is named" "$OUT" "pleach-building.ghost"
+
+# A .code-workspace is a generic name, and the sessions folder is somewhere people
+# do leave things — the workspace this came from had a stray folder in it. Deleting
+# a file somebody wrote by hand because its name has no matching directory would be
+# the tool destroying work it did not create. pleach's own file lists the session as
+# its first folder; that is what --fix requires before removing anything.
+printf '{\n  "folders": [\n    { "path": "/somewhere/else" }\n  ]\n}\n' \
+  > "$S8/handmade.code-workspace"
+
+run bash -c "$PIN8 '$PLEACH' doctor --fix"
+assert_rc "leftovers: --fix runs" "$RC" 0
+assert_true "leftovers: a workspace file pleach did not generate is left alone" \
+  [ -f "$S8/handmade.code-workspace" ]
+assert_contains "leftovers: and is reported as not pleach's to delete" \
+  "$OUT" "handmade.code-workspace"
+assert_true "leftovers: the orphaned workspace file is gone" [ ! -e "$S8/ghost.code-workspace" ]
+assert_true "leftovers: the orphaned marker is gone" [ ! -e "$S8/.pleach-building.ghost" ]
+assert_true "leftovers: but the stray folder is untouched — it is not pleach's to delete" \
+  [ -f "$S8/notasession/inner/f.txt" ]
+assert_true "leftovers: and the live session still has its workspace file" \
+  [ -f "$S8/alive.code-workspace" ]
+
+# The lock composes its owner line in a scratch file before linking it into place.
+# A run killed inside that window leaves .pleach.lock.<pid> behind, and nothing
+# removed it — not `rm`, not `doctor --fix`, which releases the lock and walks
+# past its scratch. Test 36 has been reporting exactly this whenever the kill
+# landed in the window; it was read as a flake.
+: > "$S8/.pleach.lock.999999"
+: > "$S8/.pleach.lock.$$"
+run bash -c "$PIN8 '$PLEACH' doctor"
+assert_contains "leftovers: a scratch line from a dead run is named" "$OUT" "999999"
+assert_not_contains "leftovers: but a live run's own scratch is left alone" "$OUT" ".pleach.lock.$$"
+
+run bash -c "$PIN8 '$PLEACH' doctor --fix"
+assert_true "leftovers: --fix clears the dead run's scratch" [ ! -e "$S8/.pleach.lock.999999" ]
+assert_true "leftovers: and never the live one" [ -e "$S8/.pleach.lock.$$" ]
+rm -f "$S8/.pleach.lock.$$"
+
+# The serious one: a directory that kept its .session-env and lost its worktree is
+# holding a port block, and every listing skips it.
+mkdir -p "$S8/broken"
+cp "$S8/alive/.session-env" "$S8/broken/.session-env"
+run bash -c "$PIN8 '$PLEACH' doctor"
+assert_rc "leftovers: a session with no worktree is a problem, not a note" "$RC" 1
+assert_contains "leftovers: it is named" "$OUT" "broken"
+assert_not_contains "leftovers: and the run is not certified clean" "$OUT" "no problems found"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

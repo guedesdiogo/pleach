@@ -339,6 +339,22 @@ worse daily cost than a collision nobody has hit; rename one of the directories 
 in that position. pleach does not create the database for you — it hands your tooling a
 name, which is the part that has to be decided centrally.
 
+`doctor` also looks at the sessions folder itself, not only at the sessions in it.
+`session_names` requires a `.git` at the root of a directory, so anything else living
+there — a stray folder, a `.code-workspace` whose session was removed by hand, a
+creation marker, a lock scratch line from a run that was killed — is invisible to
+every command that lists sessions, and a workspace accumulates it while `doctor`
+reports it healthy. Generated files are named and cleared by `--fix` — and only
+those: a `.code-workspace` is a generic name, so `--fix` requires pleach's own
+signature (the session listed as its first folder) before removing one, and a
+directory that is not a session is named and never touched, because it could be
+anything.
+
+The one that is not litter: a directory that still has a `.session-env` and has lost
+its worktree is not "not a session", it is a broken one — it is still holding the port
+block its `.session-env` names, and no listing will show it to you. That is reported
+as a problem, not a note.
+
 A `.session-env` pleach cannot read is treated as a claim it cannot verify, not as an
 absence. If a session directory holds one with no `PLEACH_INDEX` — a file another tool
 wrote, or one edited by hand — then the block that session is serving on cannot be named,
@@ -460,7 +476,7 @@ session and the canonical by their markers rather than by hardcoded directories:
 ## Tests
 
 ```bash
-tests/run.sh          # 470 assertions across 50 scenarios, in a throwaway sandbox
+tests/run.sh          # 493 assertions across 51 scenarios, in a throwaway sandbox
 tests/no-leaks.sh     # repository hygiene gate
 shellcheck pleach install.sh tests/*.sh examples/*.sh
 ```
