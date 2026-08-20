@@ -192,8 +192,10 @@ session_head_ref() { # $1 = session, $2 = sub ("" for root) — the ref it is RE
     ref=$(git -C "$wt" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
     if [ -n "$ref" ]; then printf '%s\n' "$ref"; return 0; fi
     # Detached: there is no branch to name and the commit answers the same
-    # question. Short, because this string is also what the report prints.
-    ref=$(git -C "$wt" rev-parse --short --verify --quiet HEAD 2>/dev/null || true)
+    # question. FULL id, never the abbreviated one: this string is fed to
+    # merge-tree and rev-list, and an abbreviation is only guaranteed unambiguous
+    # at the moment git prints it. Shortening belongs to the display path.
+    ref=$(git -C "$wt" rev-parse --verify --quiet HEAD 2>/dev/null || true)
     if [ -n "$ref" ]; then printf '%s\n' "$ref"; return 0; fi
   fi
   # Nothing readable there. The named branch is the best evidence left — and
@@ -201,11 +203,19 @@ session_head_ref() { # $1 = session, $2 = sub ("" for root) — the ref it is RE
   session_branch "$1"
 }
 
+short_ref() { # $1 = a ref — a full commit id becomes readable, a branch name is left alone
+  case "$1" in
+    *[!0-9a-f]*) printf '%s\n' "$1" ;;
+    ????????????????????????????????????????) printf '%s\n' "${1:0:8}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
 session_label() { # $1 = session, $2 = the ref it resolved to
   # A bare name reads as the session's own branch; that assumption is exactly what
   # made the stale report look coherent. Say where, but only when it is a surprise.
   if [ "$2" = "$(session_branch "$1")" ]; then printf '%s\n' "$1"
-  else printf '%s (%s)\n' "$1" "$2"; fi
+  else printf '%s (%s)\n' "$1" "$(short_ref "$2")"; fi
 }
 
 sanitize_ident() { # -> [a-z0-9_] — safe as a Postgres identifier or a compose project name
@@ -1329,7 +1339,7 @@ session_problems() { # $1 name — echoes pending work (one per line); rc 0 if n
         if git -C "$repo" show-ref --verify --quiet "refs/heads/$head_ref"; then
           echo "$label: $ahead commit(s) on $head_ref not integrated into $BASE"
         else
-          echo "$label: $ahead commit(s) on a detached HEAD at $head_ref — no branch points at them"
+          echo "$label: $ahead commit(s) on a detached HEAD at $(short_ref "$head_ref") — no branch points at them"
         fi
         count=$((count + 1))
       fi
@@ -2914,7 +2924,9 @@ session/<name> AND on whatever branch that worktree is currently checked out on,
 which is not always the same one.
 
   --force   Remove anyway. Branches with unintegrated commits are ALWAYS
-            preserved (delete by hand: git -C <repo> branch -D session/<name>).
+            preserved -- session/<name> and any other branch a worktree was left
+            on, since only session/<name> is ever considered for deletion at all
+            (delete by hand: git -C <repo> branch -D <branch>).
             Commits on a DETACHED head are held by no branch at all, so those go
             with the worktree -- reflog only, until it expires.
   --reap    Kill processes still listening inside the session's port block. By

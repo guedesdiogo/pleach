@@ -2141,6 +2141,13 @@ assert_rc "headref: rc 0 with a detached session present" "$RC" 0
 BLOCK=$(conflict_block "$OUT")
 assert_contains "headref: a detached worktree is compared by commit, not skipped" \
   "$BLOCK" "DELTA-DETACHED"
+# The id handed to merge-tree is the FULL one: an abbreviation is only guaranteed
+# unambiguous at the moment git prints it, and this string is a ref, not a label.
+# What the report shows is the short form, because a 40-character label is not one.
+DELTA_SHA=$(git -C "$S9/delta" rev-parse HEAD)
+assert_contains "headref: the detached session is labelled by a readable id" \
+  "$BLOCK" "delta (${DELTA_SHA:0:8})"
+assert_not_contains "headref: and not by all forty characters" "$BLOCK" "$DELTA_SHA"
 
 # ---------------------------------------------------------------------------
 header "Test 53: pending work is judged on the branch the session is on"
