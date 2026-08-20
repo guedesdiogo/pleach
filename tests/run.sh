@@ -1752,7 +1752,7 @@ assert_contains "expiry: a live pair is still reported" "$OUT" "WOULD CONFLICT"
 assert_contains "expiry: and it is the live one" "$OUT" "beta <-> gamma"
 
 # ---------------------------------------------------------------------------
-# Test 48: a .session-env pleach cannot read is not a free port block
+header "Test 48: a .session-env pleach cannot read is not a free port block"
 # ---------------------------------------------------------------------------
 # Measured while moving a real workspace over from another tool. Its sessions
 # already had a .session-env, in a shape pleach does not read; free_index looked
@@ -1831,7 +1831,7 @@ run bash -c "$PIN4 '$PLEACH' doctor"
 assert_rc "unreadable: and the workspace is healthy again once it is" "$RC" 0
 
 # ---------------------------------------------------------------------------
-# Test 49: the skill leaves a pointer in the instruction file that already exists
+header "Test 49: the skill leaves a pointer in the instruction file that already exists"
 # ---------------------------------------------------------------------------
 # `skill --project` writes .claude/skills/pleach/SKILL.md, which only the
 # harnesses reading that directory ever see. The workspace this was measured on
@@ -1892,7 +1892,7 @@ assert_rc "pointer: init runs" "$RC" 0
 assert_contains "pointer: and init names the skill command" "$OUT" "pleach skill"
 
 # ---------------------------------------------------------------------------
-# Test 50: open does not create — a typo is not a request for a new session
+header "Test 50: open does not create — a typo is not a request for a new session"
 # ---------------------------------------------------------------------------
 # `open` used to create the session when the name did not exist, which reads well
 # in a README and badly at a keyboard: one slip of the fingers built worktrees, a
@@ -1968,7 +1968,7 @@ assert_not_contains "noopen: no suggestion is invented for an unrelated name" \
   "$OUT" "did you mean"
 
 # ---------------------------------------------------------------------------
-# Test 51: what is in the sessions folder but is not a session
+header "Test 51: what is in the sessions folder but is not a session"
 # ---------------------------------------------------------------------------
 # `session_names` requires a .git at the root of the directory, so anything else
 # living in the sessions folder is invisible to every command that lists sessions
@@ -2058,6 +2058,165 @@ run bash -c "$PIN8 '$PLEACH' doctor"
 assert_rc "leftovers: a session with no worktree is a problem, not a note" "$RC" 1
 assert_contains "leftovers: it is named" "$OUT" "broken"
 assert_not_contains "leftovers: and the run is not certified clean" "$OUT" "no problems found"
+
+# ---------------------------------------------------------------------------
+header "Test 52: conflicts reads the branch a session is ON, not the one it was named after"
+# ---------------------------------------------------------------------------
+# Measured on a live ten-session workspace: 3 of the 10 root worktrees and 20 of
+# the 81 sub-repo worktrees were checked out on some other branch — a PR branch, a
+# fix branch, whatever the hour's work needed. Every conflict check looked up
+# refs/heads/session/<name>, so the report described work those sessions had
+# already moved on from.
+#
+# It errs in BOTH directions at once, which is why reading the output does not
+# reveal it: current work goes unreported, abandoned work gets reported, and both
+# carry the session's name. The overlap table further down already used
+# $BASE...HEAD — so a single run could list a file as touched by two sessions and,
+# three lines above, decline to call it a conflict.
+
+MINI9=$(cd "$SANDBOX" && mkdir -p headref && cd headref && pwd)
+setup_repo "$MINI9/canon"
+printf 'one\ntwo\nthree\n' > "$MINI9/canon/shared.txt"
+git -C "$MINI9/canon" add -A && git -C "$MINI9/canon" commit -q -m "initial"
+PIN9="env PLEACH_CANONICAL=$MINI9/canon PLEACH_EXPECT_CANONICAL=$MINI9/canon"
+S9="$MINI9/.sessions"
+
+run bash -c "$PIN9 '$PLEACH' new alpha --no-bootstrap"
+assert_rc "headref: alpha created" "$RC" 0
+run bash -c "$PIN9 '$PLEACH' new beta --no-bootstrap"
+assert_rc "headref: beta created" "$RC" 0
+
+# What session/alpha holds is harmless and in another file. What alpha is actually
+# DOING lives on another branch, and collides head-on with beta.
+echo "harmless" > "$S9/alpha/other.txt"
+git -C "$S9/alpha" add other.txt && git -C "$S9/alpha" commit -q -m "alpha: unrelated work"
+git -C "$S9/alpha" checkout -q -b feature/live
+printf 'ALPHA-LIVE\ntwo\nthree\n' > "$S9/alpha/shared.txt"
+git -C "$S9/alpha" commit -q -am "alpha takes line 1, on the branch it is on"
+
+printf 'BETA\ntwo\nthree\n' > "$S9/beta/shared.txt"
+git -C "$S9/beta" commit -q -am "beta takes line 1 too"
+
+run bash -c "$PIN9 '$PLEACH' conflicts"
+assert_rc "headref: rc 0" "$RC" 0
+BLOCK=$(conflict_block "$OUT")
+assert_contains "headref: the collision on the CURRENT branch is reported" "$BLOCK" "shared.txt"
+assert_contains "headref: with what alpha actually wrote" "$BLOCK" "ALPHA-LIVE"
+assert_contains "headref: and what beta wrote" "$BLOCK" "BETA"
+# The bare name is what misled the reader: "alpha" reads as session/alpha. When the
+# session is somewhere else, the report has to say where.
+assert_contains "headref: naming the branch, since it is not the session's own" \
+  "$BLOCK" "feature/live"
+
+# The other direction. gamma's NAMED branch took line 1 once; gamma itself moved on
+# and is doing something else. Reporting that as gamma's conflict attributes to a
+# session an edit it no longer has.
+run bash -c "$PIN9 '$PLEACH' new gamma --no-bootstrap"
+assert_rc "headref: gamma created" "$RC" 0
+printf 'GAMMA-OLD\ntwo\nthree\n' > "$S9/gamma/shared.txt"
+git -C "$S9/gamma" commit -q -am "gamma took line 1, once"
+git -C "$S9/gamma" checkout -q -b quiet/branch main
+echo "elsewhere" > "$S9/gamma/elsewhere.txt"
+git -C "$S9/gamma" add elsewhere.txt
+git -C "$S9/gamma" commit -q -m "gamma is doing something else now"
+
+run bash -c "$PIN9 '$PLEACH' conflicts"
+BLOCK=$(conflict_block "$OUT")
+assert_not_contains "headref: work a session has left behind is no longer reported as its conflict" \
+  "$BLOCK" "GAMMA-OLD"
+
+# Detached HEAD is a real state — a bisect, a tag, a commit someone pasted. There
+# is no branch name to read, and the commit is still the honest answer.
+run bash -c "$PIN9 '$PLEACH' new delta --no-bootstrap"
+assert_rc "headref: delta created" "$RC" 0
+echo "harmless" > "$S9/delta/delta-other.txt"
+git -C "$S9/delta" add delta-other.txt
+git -C "$S9/delta" commit -q -m "delta: unrelated work"
+git -C "$S9/delta" checkout -q --detach HEAD
+printf 'DELTA-DETACHED\ntwo\nthree\n' > "$S9/delta/shared.txt"
+git -C "$S9/delta" commit -q -am "delta takes line 1 while detached"
+
+run bash -c "$PIN9 '$PLEACH' conflicts"
+assert_rc "headref: rc 0 with a detached session present" "$RC" 0
+BLOCK=$(conflict_block "$OUT")
+assert_contains "headref: a detached worktree is compared by commit, not skipped" \
+  "$BLOCK" "DELTA-DETACHED"
+# The id handed to merge-tree is the FULL one: an abbreviation is only guaranteed
+# unambiguous at the moment git prints it, and this string is a ref, not a label.
+# What the report shows is the short form, because a 40-character label is not one.
+DELTA_SHA=$(git -C "$S9/delta" rev-parse HEAD)
+assert_contains "headref: the detached session is labelled by a readable id" \
+  "$BLOCK" "delta (${DELTA_SHA:0:8})"
+assert_not_contains "headref: and not by all forty characters" "$BLOCK" "$DELTA_SHA"
+
+# ---------------------------------------------------------------------------
+header "Test 53: pending work is judged on the branch the session is on"
+# ---------------------------------------------------------------------------
+# The same blind spot as Test 52, in the command that DELETES. session_problems
+# counted commits on refs/heads/session/<name> only, so a session whose work sat
+# on another branch reported as "fully integrated (removable)" — and prune says
+# that with a green tick before removing it.
+#
+# What it costs depends on where the commits live. On a named branch they survive
+# as a ref, and the loss is the worktree plus a false statement. Detached, nothing
+# holds them at all: `worktree remove --force` and `worktree prune` leave them for
+# the reflog to forget.
+
+MINI10=$(cd "$SANDBOX" && mkdir -p pending && cd pending && pwd)
+setup_repo "$MINI10/canon"
+echo "base" > "$MINI10/canon/file.txt"
+git -C "$MINI10/canon" add -A && git -C "$MINI10/canon" commit -q -m "initial"
+PIN10="env PLEACH_CANONICAL=$MINI10/canon PLEACH_EXPECT_CANONICAL=$MINI10/canon"
+S10="$MINI10/.sessions"
+
+run bash -c "$PIN10 '$PLEACH' new onbranch --no-bootstrap"
+assert_rc "pending: onbranch created" "$RC" 0
+git -C "$S10/onbranch" checkout -q -b work/real
+echo "work that is not in main" > "$S10/onbranch/work.txt"
+git -C "$S10/onbranch" add work.txt
+git -C "$S10/onbranch" commit -q -m "committed work, on the branch the session is on"
+
+run bash -c "$PIN10 '$PLEACH' prune"
+assert_rc "pending: prune runs" "$RC" 0
+assert_not_contains "pending: a session with unintegrated commits is NOT called removable" \
+  "$OUT" "onbranch — fully integrated"
+assert_contains "pending: it is reported as pending work" "$OUT" "onbranch — pending work"
+assert_contains "pending: naming the branch the commits are on" "$OUT" "work/real"
+
+# Two outputs of one binary, on one session, in one state. `ls -l` already counted
+# $BASE..HEAD in the worktree, so it printed "+1 commits" about the very session
+# prune called fully integrated. A contradiction inside a tool is worse than either
+# half being wrong: whichever one you read first is the one you believe.
+run bash -c "$PIN10 '$PLEACH' ls -l"
+assert_contains "pending: ls -l counts the commit" "$OUT" "+1 commits"
+assert_contains "pending: on the branch the worktree is on" "$OUT" "work/real"
+
+# rm must refuse for the same reason — prune only calls rm, so a guard that lives
+# solely in prune is one flag away from being skipped.
+run bash -c "$PIN10 '$PLEACH' rm onbranch"
+assert_rc "pending: rm refuses too" "$RC" 1
+assert_contains "pending: and says why" "$OUT" "pending work"
+assert_true "pending: the session is still there" [ -d "$S10/onbranch" ]
+
+# Detached is the case with no ref to fall back on.
+run bash -c "$PIN10 '$PLEACH' new loose --no-bootstrap"
+assert_rc "pending: loose created" "$RC" 0
+git -C "$S10/loose" checkout -q --detach HEAD
+echo "nothing points at this" > "$S10/loose/detached.txt"
+git -C "$S10/loose" add detached.txt
+git -C "$S10/loose" commit -q -m "a commit no branch holds"
+
+run bash -c "$PIN10 '$PLEACH' prune"
+assert_not_contains "pending: a detached commit is not 'fully integrated' either" \
+  "$OUT" "loose — fully integrated"
+assert_contains "pending: it is pending work" "$OUT" "loose — pending work"
+
+# The decisive negative: a session that really IS integrated must stay removable,
+# or the fix has just broken post-merge hygiene instead of the blind spot.
+run bash -c "$PIN10 '$PLEACH' new clean --no-bootstrap"
+assert_rc "pending: clean created" "$RC" 0
+run bash -c "$PIN10 '$PLEACH' prune"
+assert_contains "pending: an untouched session is still removable" "$OUT" "clean — fully integrated"
 
 # ---------------------------------------------------------------------------
 # Summary
