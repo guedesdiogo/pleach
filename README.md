@@ -476,7 +476,7 @@ session and the canonical by their markers rather than by hardcoded directories:
 ## Tests
 
 ```bash
-tests/run.sh          # 493 assertions across 51 scenarios, in a throwaway sandbox
+tests/run.sh          # 520 assertions across 53 scenarios, in a throwaway sandbox
 tests/no-leaks.sh     # repository hygiene gate
 shellcheck pleach install.sh tests/*.sh examples/*.sh
 ```
@@ -536,6 +536,27 @@ becomes an ancestor of the base; after a **squash** it is not, and the fallback 
 base holding identical content) stops being true once the base moves on. A squash-landed
 session can still be reported — remove it with `pleach rm`. Said here rather than left to be
 discovered.
+
+And it reads the branch each worktree is **on**, not the one the session was named after.
+Every check looked up `refs/heads/session/<name>` — the branch a session is *created* on,
+which is not where the work stays: a PR cut from the base, a fix branch, a bisect. Measured
+on a ten-session workspace, 3 of 10 root worktrees and 20 of 81 sub-repo worktrees were
+somewhere else. The failure is symmetrical, which is why reading the output never revealed
+it — current work goes unreported, abandoned work gets reported, and both carry the
+session's name. The overlap table in the same output already used `$BASE...HEAD`, so a single
+run could list a file as touched by two sessions and, three lines above, decline to call it
+a conflict. The branch is now resolved per repo, and named in the report when it is not the
+session's own.
+
+`prune` and `rm` had the same lookup where the cost is not a misleading report: it is the
+check that decides whether a session can be **deleted**. Committed work on another branch
+read as *"fully integrated — removable"*, which `prune` prints with a green tick immediately
+before removing it — while `ls -l`, which already counted `$BASE..HEAD`, printed `+1
+commits` about the same session in the same state. A contradiction inside one binary is
+worse than either half being wrong: whichever output you read first is the one you believe.
+On a named branch the commits survive as a ref; on a **detached** head nothing points at
+them, and `worktree remove --force` leaves them to the reflog. Both are counted now, and the
+detached case says so in those words.
 
 `each --repos` descends into every mounted sub-repo. Without it, `pleach each 'git status'`
 in a composite workspace answers for the root worktrees only, which is not where most of the

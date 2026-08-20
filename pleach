@@ -12,7 +12,7 @@
 # shellcheck disable=SC2015  # deliberate idiom: [ -z "$x" ] && x=… || err (err never runs after an assignment)
 set -euo pipefail
 
-PLEACH_VERSION="2.1.0"
+PLEACH_VERSION="2.2.0"
 
 CONF_NAME=".pleach.conf"
 USER_CONF="$HOME/.config/pleach/config"
@@ -179,6 +179,34 @@ unlock() {
 }
 
 session_branch() { echo "session/$1"; }
+
+session_head_ref() { # $1 = session, $2 = sub ("" for root) — the ref it is REALLY on
+  # The branch a session was NAMED after is not the branch it is on. A PR cut from
+  # the base, a fix branch, a bisect — all normal, and all invisible to a check
+  # that looks up refs/heads/session/<name>. Measured on a live ten-session
+  # workspace: 3 of 10 root worktrees and 20 of 81 sub-repo worktrees were
+  # somewhere else, so a quarter of the answers were about abandoned work.
+  local wt ref
+  wt="$SESSIONS/$1${2:+/$2}"
+  if [ -e "$wt/.git" ]; then
+    ref=$(git -C "$wt" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+    if [ -n "$ref" ]; then printf '%s\n' "$ref"; return 0; fi
+    # Detached: there is no branch to name and the commit answers the same
+    # question. Short, because this string is also what the report prints.
+    ref=$(git -C "$wt" rev-parse --short --verify --quiet HEAD 2>/dev/null || true)
+    if [ -n "$ref" ]; then printf '%s\n' "$ref"; return 0; fi
+  fi
+  # Nothing readable there. The named branch is the best evidence left — and
+  # doctor is the one that reports a session whose worktree went missing.
+  session_branch "$1"
+}
+
+session_label() { # $1 = session, $2 = the ref it resolved to
+  # A bare name reads as the session's own branch; that assumption is exactly what
+  # made the stale report look coherent. Say where, but only when it is a surprise.
+  if [ "$2" = "$(session_branch "$1")" ]; then printf '%s\n' "$1"
+  else printf '%s (%s)\n' "$1" "$2"; fi
+}
 
 sanitize_ident() { # -> [a-z0-9_] — safe as a Postgres identifier or a compose project name
   # Injective over the SESSION-NAME alphabet, which is the collision that bites:
@@ -1273,7 +1301,7 @@ session_problems() { # $1 name — echoes pending work (one per line); rc 0 if n
   local name="$1" dir="$SESSIONS/$1" branch
   branch=$(session_branch "$name")
   local -a present=()
-  local s wt repo label ahead count=0
+  local s wt repo label ahead head_ref count=0
   while IFS= read -r s; do [ -n "$s" ] && present+=("$s"); done < <(session_subs "$dir")
   for s in "" ${present[@]+"${present[@]}"}; do
     repo=$(repo_path "$s"); label="${s:-root}"
@@ -1287,6 +1315,24 @@ session_problems() { # $1 name — echoes pending work (one per line); rc 0 if n
     if [ "${ahead:-0}" -gt 0 ]; then
       echo "$label: $ahead commit(s) on $branch not integrated into $BASE"
       count=$((count + 1))
+    fi
+    # And the branch this worktree is actually ON, which is not always the one the
+    # session was named after. Counting only the named branch declared "fully
+    # integrated — removable" over committed work sitting on a PR branch, and prune
+    # says that with a green tick immediately before deleting it. What it costs
+    # depends on where the commits are: on a named branch they survive as a ref,
+    # detached they survive as nothing.
+    head_ref=$(session_head_ref "$name" "$s")
+    if [ "$head_ref" != "$branch" ]; then
+      ahead=$(git -C "$repo" rev-list --count "$BASE..$head_ref" 2>/dev/null || echo 0)
+      if [ "${ahead:-0}" -gt 0 ]; then
+        if git -C "$repo" show-ref --verify --quiet "refs/heads/$head_ref"; then
+          echo "$label: $ahead commit(s) on $head_ref not integrated into $BASE"
+        else
+          echo "$label: $ahead commit(s) on a detached HEAD at $head_ref — no branch points at them"
+        fi
+        count=$((count + 1))
+      fi
     fi
   done
   [ "$count" -eq 0 ]
@@ -1331,7 +1377,7 @@ cmd_rm() {
   if ! problems=$(session_problems "$name") && [ "$force" -eq 0 ]; then
     echo "pleach: session '$name' has pending work:" >&2
     printf '%s\n' "$problems" | sed 's/^/  - /' >&2
-    err "use --force to remove anyway (the worktrees go; branches with unintegrated commits are preserved)"
+    err "use --force to remove anyway (the worktrees go; branches with unintegrated commits are preserved — commits on a DETACHED head are held by nothing and go with the worktree)"
   fi
 
   lock
@@ -1885,7 +1931,6 @@ cmd_conflicts() {
     for ((i = 0; i < ${#names[@]}; i++)); do
       for ((j = i + 1; j < ${#names[@]}; j++)); do
         a="${names[$i]}"; b="${names[$j]}"
-        ba=$(session_branch "$a"); bb=$(session_branch "$b")
         # The repos to compare are the ones mounted in BOTH sessions, not the ones
         # declared in the conf: a sub mounted with `pleach add` and still outside
         # PLEACH_SUBS would be skipped, and a blind spot inside the command that
@@ -1899,8 +1944,11 @@ cmd_conflicts() {
         for s in "" ${pair[@]+"${pair[@]}"}; do
           repo=$(repo_path "$s"); label="${s:-root}"
           [ -e "$repo/.git" ] || continue
-          git -C "$repo" show-ref --verify --quiet "refs/heads/$ba" || continue
-          git -C "$repo" show-ref --verify --quiet "refs/heads/$bb" || continue
+          # Per sub-repo, not per session: one session can sit on its own branch in
+          # the root and on a PR branch in a sub, and often does.
+          ba=$(session_head_ref "$a" "$s"); bb=$(session_head_ref "$b" "$s")
+          git -C "$repo" rev-parse --verify --quiet "$ba^{commit}" >/dev/null 2>&1 || continue
+          git -C "$repo" rev-parse --verify --quiet "$bb^{commit}" >/dev/null 2>&1 || continue
           # A session whose work has LANDED conflicts with nobody, and saying it
           # does is how a command earns being ignored. The pair check compares tip
           # against tip and never consulted the base, so a merged session kept
@@ -1909,7 +1957,8 @@ cmd_conflicts() {
           # about the same file.
           session_landed "$repo" "$ba" && continue
           session_landed "$repo" "$bb" && continue
-          if block=$(report_conflict "$repo" "$label" "$ba" "$bb" "$a" "$b"); then
+          if block=$(report_conflict "$repo" "$label" "$ba" "$bb" \
+                       "$(session_label "$a" "$ba")" "$(session_label "$b" "$bb")"); then
             if [ "$real" -eq 0 ]; then
               echo "WOULD CONFLICT — git's own three-way merge says these cannot both land as they are:"
               echo ""
@@ -1930,7 +1979,7 @@ cmd_conflicts() {
   # WOULD CONFLICT into "No file is being edited in more than one session" over a
   # session git flatly refuses to merge: a nuisance traded for a false all-clear.
   if [ ${#names[@]} -ge 1 ] && git_supports_merge_tree; then
-    local bn repo_b label_b sb block_b
+    local bn repo_b label_b sb block_b ref_b
     local -a subs_n=()
     for bn in ${names[@]+"${names[@]}"}; do
       subs_n=()
@@ -1938,12 +1987,14 @@ cmd_conflicts() {
       for sb in "" ${subs_n[@]+"${subs_n[@]}"}; do
         repo_b=$(repo_path "$sb"); label_b="${sb:-root}"
         [ -e "$repo_b/.git" ] || continue
-        git -C "$repo_b" show-ref --verify --quiet "refs/heads/$(session_branch "$bn")" || continue
+        ref_b=$(session_head_ref "$bn" "$sb")
+        git -C "$repo_b" rev-parse --verify --quiet "$ref_b^{commit}" >/dev/null 2>&1 || continue
         git -C "$repo_b" show-ref --verify --quiet "refs/heads/$BASE" || continue
-        session_landed "$repo_b" "$(session_branch "$bn")" && continue
+        session_landed "$repo_b" "$ref_b" && continue
         # The session is the FIRST ref as well as the first name: refs and names are
         # positional, and crossing them attributes each side's content to the other.
-        if block_b=$(report_conflict "$repo_b" "$label_b" "$(session_branch "$bn")" "$BASE" "$bn" "$BASE"); then
+        if block_b=$(report_conflict "$repo_b" "$label_b" "$ref_b" "$BASE" \
+                       "$(session_label "$bn" "$ref_b")" "$BASE"); then
           if [ "$real" -eq 0 ]; then
             echo "WOULD CONFLICT — git's own three-way merge says these cannot both land as they are:"
             echo ""
@@ -2473,8 +2524,9 @@ where it must run. Do not run it.
 Worktrees move collisions to merge time — and hide them until then. Work in another
 session is invisible to yours by construction.
 
-- `pleach conflicts` — git's own three-way merge between every pair of session
-  branches, in memory, plus a check for two sessions claiming the same numbered
+- `pleach conflicts` — git's own three-way merge between every pair of sessions,
+  in memory, on the branch each worktree is ON (not the one it was named after),
+  plus a check for two sessions claiming the same numbered
   slot (`0004_billing.sql` against `0004_last_login.sql`: different files, so git
   merges them clean and lands two migrations numbered 0004). Always exits 0.
   **A green result is still not compatibility.** It answers "would this merge
@@ -2857,10 +2909,14 @@ EOF
 pleach rm <name> [--force] [--reap]
 
 Removes the session's worktrees and its folder. Refuses if any repo has
-uncommitted changes or commits on session/<name> not yet integrated into the base.
+uncommitted changes, or commits not yet integrated into the base -- on
+session/<name> AND on whatever branch that worktree is currently checked out on,
+which is not always the same one.
 
   --force   Remove anyway. Branches with unintegrated commits are ALWAYS
             preserved (delete by hand: git -C <repo> branch -D session/<name>).
+            Commits on a DETACHED head are held by no branch at all, so those go
+            with the worktree -- reflog only, until it expires.
   --reap    Kill processes still listening inside the session's port block. By
             default they are only reported: a dev server outlives the worktree
             that started it, and killing a process is not something a cleanup
@@ -2874,8 +2930,9 @@ EOF
 pleach prune [--apply]
 
 Post-merge hygiene: finds the sessions whose work is fully integrated into the
-base (same criterion as rm — no uncommitted changes, no session/<name> commits
-outside the base) and, with --apply, removes them through rm's safe path.
+base (same criterion as rm — no uncommitted changes, and no commits outside the
+base on session/<name> or on the branch the worktree is actually on) and, with
+--apply, removes them through rm's safe path.
 
 With no flags it is a dry run: it only lists. "Integrated" is judged against the
 LOCAL base — merges that only landed on the remote need a git fetch first.
@@ -2944,6 +3001,15 @@ serious:
                    "can this one land at all" is answered even when every other
                    session has gone. Those read <session> <-> <base>.
 
+                   The branch it merges is the one each worktree is ON, not the
+                   one the session was named after. A PR cut from the base, a fix
+                   branch, a bisect — all normal, and all invisible to a lookup of
+                   refs/heads/session/<name>. Resolved per repo, because a session
+                   sits on its own branch in the root and on a PR branch in a sub
+                   often enough. When that branch is not the session's own the
+                   report says which one it is, and a detached worktree is named
+                   by its commit.
+
                    A session whose work has already LANDED is skipped, so a
                    verdict expires with the conflict it describes. Landing is
                    decidable when it was a true merge: the branch becomes an
@@ -2966,8 +3032,8 @@ serious:
 
 ALSO TOUCHED and SAME SLOT cover every repo of every session, counting committed
 work since the session branched as well as uncommitted changes. WOULD CONFLICT
-reads the branch refs, so it sees committed work only -- an uncommitted
-resolution is invisible to it.
+reads refs, so it sees committed work only -- an uncommitted resolution is
+invisible to it.
 
 Worktrees move collisions from the working tree to merge time, which is the
 point. The side effect is that they also HIDE them until then: parallel work in
