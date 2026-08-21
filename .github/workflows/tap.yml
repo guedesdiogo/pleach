@@ -85,10 +85,11 @@ jobs:
 
       - name: check out the tap
         # Pinned by digest rather than by tag: this is the one step that holds a token
-        # with write access to another repository, so a moved `v4` tag would be a write
+        # with write access to another repository, so a moved `v7` tag would be a write
         # credential handed to code nobody here reviewed. (Verified against the API:
-        # this digest is what refs/tags/v4 points at.)
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        # this digest is what refs/tags/v7 points at, and its action.yml declares
+        # `using: node24` — v4 declared node20, which the runners are retiring.)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: guedesdiogo/homebrew-tap
           token: ${{ secrets.TAP_TOKEN }}
