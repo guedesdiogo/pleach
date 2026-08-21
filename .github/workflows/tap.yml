@@ -1,0 +1,133 @@
+name: tap
+
+# A release is only real once `brew upgrade` can see it. Doing that by hand meant
+# three steps across two repos — download the tarball, checksum it, edit the formula —
+# and every one of them was a place for the tag and the sha to drift apart without
+# anyone noticing until an install produced the wrong binary under the right name.
+on:
+  release:
+    types: [published]
+  # For re-running a release whose bump failed, or for backfilling an older tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "tag to push to the tap; empty means this repo's latest release"
+        required: false
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    # Two releases published minutes apart would otherwise race for the same push to
+    # the tap, and the loser fails on a non-fast-forward. `queue: max` matters as much
+    # as the group: the default, `single`, keeps one run waiting and cancels the rest —
+    # and a cancelled bump looks like a release that simply never reached Homebrew.
+    concurrency:
+      group: homebrew-tap-pleach
+      cancel-in-progress: false
+      queue: max
+    runs-on: ubuntu-latest
+    steps:
+      - name: resolve the tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${EVENT_TAG:-${INPUT_TAG:-}}"
+          if [ -z "$tag" ]; then
+            tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
+          fi
+          echo "tag=$tag"         >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "resolved to $tag"
+
+      - name: the tag must carry the version it claims
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Homebrew reads the version out of the url, so a tag whose pleach still says
+          # 2.1.0 would install as 2.2.0 and answer 2.1.0. That mismatch is invisible to
+          # the formula and to brew; it surfaces only at `pleach version`, in someone
+          # else's terminal. Refuse the bump instead of shipping it.
+          shipped=$(gh api "repos/$GITHUB_REPOSITORY/contents/pleach?ref=$TAG" --jq .content \
+                    | base64 -d | sed -n 's/^PLEACH_VERSION="\(.*\)"$/\1/p' | head -1)
+          if [ "$shipped" != "$VERSION" ]; then
+            echo "::error::$TAG ships PLEACH_VERSION=\"$shipped\", but the tag claims \"$VERSION\""
+            exit 1
+          fi
+          echo "$TAG ships $shipped"
+
+      - name: checksum the release tarball
+        id: sha
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Downloaded, never assumed: the sha written into the formula has to be the sha
+          # of the bytes brew will actually fetch, so this is the same URL the formula names.
+          url="https://github.com/$GITHUB_REPOSITORY/archive/refs/tags/$TAG.tar.gz"
+          curl -fsSL --retry 3 --retry-delay 2 -o tarball.tar.gz "$url"
+          sha=$(sha256sum tarball.tar.gz | cut -d' ' -f1)
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "$sha  $url"
+
+      - name: check out the tap
+        # Pinned by digest rather than by tag: this is the one step that holds a token
+        # with write access to another repository, so a moved `v4` tag would be a write
+        # credential handed to code nobody here reviewed. (Verified against the API:
+        # this digest is what refs/tags/v4 points at.)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: guedesdiogo/homebrew-tap
+          token: ${{ secrets.TAP_TOKEN }}
+          path: tap
+
+      - name: rewrite the formula
+        id: rewrite
+        env:
+          URL: ${{ steps.sha.outputs.url }}
+          SHA: ${{ steps.sha.outputs.sha }}
+        run: |
+          set -euo pipefail
+          f=tap/Formula/pleach.rb
+          # Assert both anchors before touching anything. A sed that matches nothing exits
+          # 0 and leaves the file untouched, which reads exactly like a release that needed
+          # no bump — a silent no-op is the one failure mode this job must not have.
+          grep -qE '^  url "https://github\.com/.+/archive/refs/tags/v.+\.tar\.gz"$' "$f" \
+            || { echo "::error::no url line to rewrite in $f"; exit 1; }
+          grep -qE '^  sha256 "[0-9a-f]{64}"$' "$f" \
+            || { echo "::error::no sha256 line to rewrite in $f"; exit 1; }
+          sed -i -e "s|^  url \".*\"$|  url \"$URL\"|" \
+                 -e "s|^  sha256 \".*\"$|  sha256 \"$SHA\"|" "$f"
+          if git -C tap diff --quiet; then
+            echo "changed=no" >> "$GITHUB_OUTPUT"
+            echo "formula already at this url and sha — nothing to send"
+          else
+            echo "changed=yes" >> "$GITHUB_OUTPUT"
+            git -C tap --no-pager diff
+          fi
+
+      - name: send the bump to the tap
+        if: steps.rewrite.outputs.changed == 'yes'
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd tap
+          # Attributed to the bot that did it, rather than to a person who did not.
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "pleach $VERSION"
+          git push origin HEAD
