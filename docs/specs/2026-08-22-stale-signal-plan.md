@@ -768,6 +768,17 @@ In `help_topic()`'s `status)` arm, add to the option list after the `--exit-code
   --json       The machine surface: every measured repo, behind or not.
 ```
 
+In the same arm, the synopsis line at the very top of the heredoc still reads
+`pleach status [<session>] [-q]` — it was written in Task 1 and never caught up with the
+flags added since. Replace it with:
+
+```
+pleach status [<session>|--all] [--json] [--exit-code] [-q]
+```
+
+This is the last task that touches this heredoc, so the synopsis must be correct here or it
+ships wrong.
+
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `npm test 2>&1 | tail -20`
