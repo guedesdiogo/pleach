@@ -17,9 +17,15 @@ before it `exec`s, and prints nothing when everything is in date.
 
 ## Global Constraints
 
-- The script runs under `set -euo pipefail`. Never end a function, an `if` body or a loop
-  body with `cmd_a && cmd_b || cmd_c`; use `if`/`fi`. A bare `[ test ] && cmd` is safe only
-  because a short-circuited AND-list is exempt — prefer `if`/`fi` in all new code anyway.
+- The script runs under `set -euo pipefail`. Do not introduce a `cmd_a && cmd_b || cmd_c`
+  where `cmd_b` can fail — under `set -e` the whole list then returns non-zero and kills the
+  script. Use `if`/`fi` for those. A bare `[ test ] && cmd` is safe (a short-circuited
+  AND-list is exempt).
+  **One exception, and it is the codebase's own:** `[ -z "$x" ] && x="$1" || err "…"` is the
+  established argument-parser idiom here, declared deliberate at `pleach:12` with a
+  `shellcheck disable=SC2015` and the reason — `err` can never run after an assignment,
+  which cannot fail. It appears in five argument parsers (`pleach:1111`, `1208`, `1434`,
+  `1573`, `1811`). Match it; do not convert it, and do not convert the existing ones.
 - Measure against the **local** `$BASE` only. Never invoke `git fetch`, and never read
   `origin/*`. `pleach sync --fetch` is the only thing in this tool that reaches for origin.
 - Measure against the worktree's **real HEAD**, never `refs/heads/session/<name>`.
