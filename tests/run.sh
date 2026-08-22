@@ -443,7 +443,7 @@ header "Test 18: every command is documented"
 # ---------------------------------------------------------------------------
 # The help text is the only user-facing documentation inside the tool, so a
 # command with no help topic is a real defect, not a nicety.
-for c in init new open ls path cd add sync rm prune clean each conflicts repos doctor shell-init completions install update version; do
+for c in init new open ls path cd add sync status rm prune clean each conflicts repos doctor shell-init completions install update version; do
   run "$PLEACH" help "$c"
   if [ "$RC" -eq 0 ] && [ -n "$OUT" ]; then
     ok "help $c: documented"
@@ -2217,6 +2217,96 @@ run bash -c "$PIN10 '$PLEACH' new clean --no-bootstrap"
 assert_rc "pending: clean created" "$RC" 0
 run bash -c "$PIN10 '$PLEACH' prune"
 assert_contains "pending: an untouched session is still removable" "$OUT" "clean — fully integrated"
+
+# ---------------------------------------------------------------------------
+header "Test 54: status reports how far behind the local canonical each repo is"
+# ---------------------------------------------------------------------------
+# The signal exists so the person inside a session can decide whether now is the
+# moment to integrate — never to integrate for them. It is per repo because a
+# session touching only the api does not care that the docs moved.
+
+MINI11=$(cd "$SANDBOX" && mkdir -p stale && cd stale && pwd)
+setup_repo "$MINI11/canon"
+echo "# canon" > "$MINI11/canon/README.md"
+git -C "$MINI11/canon" add -A && git -C "$MINI11/canon" commit -q -m "initial"
+setup_repo "$MINI11/canon/api"
+echo "api" > "$MINI11/canon/api/f.txt"
+git -C "$MINI11/canon/api" add -A && git -C "$MINI11/canon/api" commit -q -m "initial"
+setup_repo "$MINI11/canon/web"
+echo "web" > "$MINI11/canon/web/f.txt"
+git -C "$MINI11/canon/web" add -A && git -C "$MINI11/canon/web" commit -q -m "initial"
+
+# A repo still on master has no 'main' to be behind of. add_wt already cuts the
+# session from that repo's own branch; the report must skip it, not error on it.
+git init -q -b master "$MINI11/canon/legacy"
+git -C "$MINI11/canon/legacy" config user.email "test@test"
+git -C "$MINI11/canon/legacy" config user.name "test"
+echo "legacy" > "$MINI11/canon/legacy/f.txt"
+git -C "$MINI11/canon/legacy" add -A && git -C "$MINI11/canon/legacy" commit -q -m "initial"
+
+PIN11="env PLEACH_CANONICAL=$MINI11/canon PLEACH_EXPECT_CANONICAL=$MINI11/canon"
+S11="$MINI11/.sessions"
+
+run bash -c "$PIN11 '$PLEACH' new work --no-bootstrap"
+assert_rc "status: session created" "$RC" 0
+
+run bash -c "$PIN11 '$PLEACH' status work"
+assert_rc "status: rc 0 when in date" "$RC" 0
+assert_contains "status: says so in one line" "$OUT" "(up to date with the local main)"
+assert_not_contains "status: no per-repo lines when in date" "$OUT" "commit(s) behind"
+
+# The canonical moves — twice in the root, once in api, not at all in web.
+git -C "$MINI11/canon" commit -q --allow-empty -m "canon root moves"
+git -C "$MINI11/canon" commit -q --allow-empty -m "canon root moves again"
+git -C "$MINI11/canon/api" commit -q --allow-empty -m "api moves"
+
+run bash -c "$PIN11 '$PLEACH' status work"
+assert_rc "status: rc 0 even when behind — it is a report, not a check" "$RC" 0
+assert_contains "status: the root's distance" "$OUT" "root: 2 commit(s) behind"
+assert_contains "status: api's distance" "$OUT" "api: 1 commit(s) behind"
+assert_not_contains "status: web is in date, so it is not listed" "$OUT" "web:"
+assert_not_contains "status: no in-date line while something is behind" "$OUT" "up to date"
+assert_not_contains "status: a repo with no base to measure is skipped" "$OUT" "legacy"
+assert_not_contains "status: it reports, it does not instruct" "$OUT" "pleach sync"
+
+# The branch a session was NAMED after is not the branch it is on: 3 of 10 root
+# worktrees on a live workspace were somewhere else. Reading refs/heads/session/<name>
+# answers about work nobody is doing.
+git -C "$MINI11/canon/web" commit -q --allow-empty -m "web moves"
+git -C "$MINI11/canon/web" commit -q --allow-empty -m "web moves again"
+
+run bash -c "$PIN11 '$PLEACH' status work"
+assert_contains "status: web is behind while it sits on session/work" "$OUT" "web: 2 commit(s) behind"
+
+# Same session, same named branch, different HEAD — and this HEAD is caught up.
+git -C "$S11/work/web" checkout -q -b feature/live
+git -C "$S11/work/web" merge -q --no-edit main
+run bash -c "$PIN11 '$PLEACH' status work"
+assert_not_contains "status: measures the branch the worktree is ON, not session/work" \
+  "$OUT" "web:"
+assert_contains "status: and what really is behind is still reported" \
+  "$OUT" "root: 2 commit(s) behind"
+git -C "$S11/work/web" checkout -q session/work
+
+# Scope, exactly as sync resolves it.
+run bash -c "cd '$S11/work' && $PIN11 '$PLEACH' status"
+assert_rc "status: inside a session, no name is needed" "$RC" 0
+assert_contains "status: it resolved to the session it stands in" "$OUT" "● work"
+
+run bash -c "cd '$MINI11/canon' && $PIN11 '$PLEACH' status"
+assert_rc "status: no name in the canonical is a usage error" "$RC" 1
+assert_contains "status: and it says how to ask" "$OUT" "usage: pleach status"
+
+run bash -c "$PIN11 '$PLEACH' status nosuch"
+assert_rc "status: an unknown session is refused" "$RC" 1
+assert_contains "status: saying where it looked" "$OUT" "does not exist at"
+
+# -q means nothing at all, in either state — not "less output".
+run bash -c "$PIN11 '$PLEACH' status work -q"
+assert_rc "status -q: rc 0 while behind" "$RC" 0
+assert_eq "status -q: prints nothing while behind" "$OUT" ""
+run bash -c "cd '$S11/work' && $PIN11 '$PLEACH' status --quiet"
+assert_eq "status --quiet: the long spelling is the same flag" "$OUT" ""
 
 # ---------------------------------------------------------------------------
 # Summary

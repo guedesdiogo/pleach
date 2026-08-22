@@ -1154,6 +1154,82 @@ cmd_sync() {
 }
 
 # ---------------------------------------------------------------------------
+# Staleness — how far a session has drifted from the LOCAL canonical
+# ---------------------------------------------------------------------------
+session_behind() { # $1 name — echoes "<label>\t<behind>" per measurable worktree
+  # Measured against the worktree's REAL HEAD, never refs/heads/session/<name>. A
+  # worktree sitting on a PR branch or a detached bisect is ordinary — 3 of 10 root
+  # worktrees and 20 of 81 sub-worktrees on a live workspace were somewhere else —
+  # and asking the named branch answers about work nobody is doing. Same reason
+  # session_head_ref exists.
+  #
+  # A worktree that cannot be measured is OMITTED, never reported as 0. "Nothing to
+  # see" and "we could not look" are different answers, and only the second one is
+  # doctor's business.
+  local dir="$SESSIONS/$1" s wt behind
+  local -a present=()
+  while IFS= read -r s; do [ -n "$s" ] && present+=("$s"); done < <(session_subs "$dir")
+  for s in "" ${present[@]+"${present[@]}"}; do
+    wt="$dir${s:+/$s}"
+    [ -e "$wt/.git" ] || continue
+    # $BASE is not universal: a repo still on master has no 'main' to be behind of,
+    # and add_wt already cuts such a session from that repo's own branch.
+    git -C "$wt" rev-parse --verify --quiet "$BASE^{commit}" >/dev/null 2>&1 || continue
+    behind=$(git -C "$wt" rev-list --count "HEAD..$BASE" 2>/dev/null) || continue
+    printf '%s\t%s\n' "${s:-root}" "${behind:-0}"
+  done
+}
+
+status_report() { # $1 name, $2 quiet(0|1) — rc 1 when something is behind, 0 when nothing is
+  # The polarity is git's, not an accident: `git diff --exit-code` returns 1 for
+  # "there is a difference". --exit-code hands this straight back to the caller.
+  local name="$1" quiet="${2:-0}" label behind titled=0 rc=0
+  while IFS=$'\t' read -r label behind; do
+    [ -n "$label" ] || continue
+    [ "${behind:-0}" -gt 0 ] || continue
+    rc=1
+    if [ "$quiet" -eq 0 ]; then
+      if [ "$titled" -eq 0 ]; then
+        echo "● $name  (behind the local $BASE)"
+        titled=1
+      fi
+      printf '    %s: %s commit(s) behind\n' "$label" "$behind"
+    fi
+  done < <(session_behind "$name")
+  return "$rc"
+}
+
+cmd_status() {
+  local name="" quiet=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -q|--quiet) quiet=1 ;;
+      -*)         err "unknown flag: $1 (usage: pleach status [<session>] [-q])" ;;
+      *)          [ -z "$name" ] && name="$1" || err "too many arguments" ;;
+    esac
+    shift
+  done
+  load_config
+
+  local -a targets=()
+  if [ -z "$name" ]; then
+    name=$(detect_session_name 2>/dev/null) \
+      || err "usage: pleach status <session> [-q]"
+  fi
+  [ -d "$SESSIONS/$name" ] || err "session '$name' does not exist at $SESSIONS/$name"
+  targets=("$name")
+
+  local behind_rc=0 n
+  for n in ${targets[@]+"${targets[@]}"}; do
+    status_report "$n" "$quiet" || behind_rc=1
+  done
+  if [ "$behind_rc" -eq 0 ] && [ "$quiet" -eq 0 ]; then
+    echo "(up to date with the local $BASE)"
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 conf_subs_line() { # line number of the active PLEACH_SUBS in the conf (empty if none)
   grep -n '^[[:space:]]*PLEACH_SUBS=' "$CANONICAL/$CONF_NAME" 2>/dev/null | head -1 | cut -d: -f1
 }
@@ -2773,6 +2849,7 @@ Sessions
   path [<session>]          Print where a session lives (--canonical for the canonical).
   add [<session>] <sub …>   Mount sub-repos into an existing session.
   sync [<session>|--all]    Bring the canonical's local main into the session's branches.
+  status [<session>]        How far behind the canonical's local main each of the session's repos is.
   rm <name> [--force] [--reap]  Remove the session. Refuses when work is pending.
   prune [--apply]           List (and with --apply remove) fully integrated sessions.
   clean [<session>]         Delete git-ignored artifacts (node_modules, builds…).
@@ -2913,6 +2990,27 @@ Safety rules (a skipped repo never blocks the others):
 
 With no name and outside a session it is an error. Inside a session, the name is
 inferred.
+EOF
+    ;;
+    status) cat <<'EOF'
+pleach status [<session>] [-q]
+
+How far behind the canonical's LOCAL base each of the session's repos has drifted.
+Per repo, because a session touching only the api does not care that the docs moved.
+
+  <session>    Defaults to the session containing the current directory. Outside a
+               session the name is required.
+  -q, --quiet  Print nothing.
+
+Only the repos that are behind are listed; when none are, it says so in one line and
+nothing else. It measures the branch each worktree is really ON, not the branch the
+session was named after.
+
+It exits 0 whether or not anything is behind. It is a report: it tells you the number
+and the place, and leaves the decision to sync — or not to — with you.
+
+Never reaches for origin. The target is the base ref in your canonical checkout, which
+moves when you pull there and at no other time.
 EOF
     ;;
     rm) cat <<'EOF'
@@ -3246,7 +3344,7 @@ Guard rail for automation/harnesses (env, not conf):
                                   resolving to your real workspace.
 EOF
     ;;
-    *) err "no help for '$1' (commands: init new open ls path cd add sync rm prune clean each conflicts repos doctor shell-init completions install update version; topics: config)" ;;
+    *) err "no help for '$1' (commands: init new open ls path cd add sync status rm prune clean each conflicts repos doctor shell-init completions install update version; topics: config)" ;;
   esac
 }
 
@@ -3263,6 +3361,7 @@ case "$cmd" in
   open)    cmd_open "$@" ;;
   add)     cmd_add "$@" ;;
   sync)    cmd_sync "$@" ;;
+  status)  cmd_status "$@" ;;
   repos)   cmd_repos "$@" ;;
   rm)      cmd_rm "$@" ;;
   prune)   cmd_prune "$@" ;;
@@ -3280,5 +3379,5 @@ case "$cmd" in
   update)  cmd_update "$@" ;;
   version|--version|-V) echo "pleach $PLEACH_VERSION" ;;
   help|-h|--help) cmd_help "$@" ;;
-  *) err "unknown command: $cmd (init|new|open|add|sync|repos|rm|prune|clean|each|ls|path|cd|doctor|conflicts|skill|completions|shell-init|install|update|version|help)" ;;
+  *) err "unknown command: $cmd (init|new|open|add|sync|status|repos|rm|prune|clean|each|ls|path|cd|doctor|conflicts|skill|completions|shell-init|install|update|version|help)" ;;
 esac
