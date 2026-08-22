@@ -2344,6 +2344,32 @@ assert_rc "status --all: no sessions is rc 0" "$RC" 0
 assert_contains "status --all: and says the folder is empty" "$OUT" "no sessions in"
 
 # ---------------------------------------------------------------------------
+header "Test 56: --exit-code is opt-in, and -q is the silent way to ask"
+# ---------------------------------------------------------------------------
+# A report that fails is a check, and callers start wrapping it in `|| true`. The
+# exit code is therefore something you ask for, exactly as `git diff --exit-code`.
+run bash -c "$PIN11 '$PLEACH' status work --exit-code"
+assert_rc "status --exit-code: 1 when behind" "$RC" 1
+assert_contains "status --exit-code: and still prints the report" "$OUT" "commit(s) behind"
+
+run bash -c "$PIN11 '$PLEACH' status work"
+assert_rc "status: the same state without the flag is rc 0" "$RC" 0
+
+# -q on its own is covered by Test 54; what is new here is the pairing.
+run bash -c "$PIN11 '$PLEACH' status work -q --exit-code"
+assert_rc "status -q --exit-code: 1 when behind, silently" "$RC" 1
+assert_eq "status -q --exit-code: still prints nothing" "$OUT" ""
+
+# A session cut from the current base has nothing to be behind of.
+run bash -c "$PIN11 '$PLEACH' new fresh --no-bootstrap"
+assert_rc "status: a fresh session created" "$RC" 0
+run bash -c "$PIN11 '$PLEACH' status fresh --exit-code"
+assert_rc "status --exit-code: 0 when nothing is behind" "$RC" 0
+run bash -c "$PIN11 '$PLEACH' status fresh -q --exit-code"
+assert_rc "status -q --exit-code: 0 when nothing is behind" "$RC" 0
+assert_eq "status -q: silent in that case too" "$OUT" ""
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

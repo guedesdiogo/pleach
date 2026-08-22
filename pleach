@@ -1200,12 +1200,13 @@ status_report() { # $1 name, $2 quiet(0|1) — rc 1 when something is behind, 0 
 }
 
 cmd_status() {
-  local name="" quiet=0 all=0
+  local name="" quiet=0 all=0 exit_code=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --all)      all=1 ;;
+      --exit-code) exit_code=1 ;;
       -q|--quiet) quiet=1 ;;
-      -*)         err "unknown flag: $1 (usage: pleach status [<session>] [-q])" ;;
+      -*)         err "unknown flag: $1 (usage: pleach status [<session>|--all] [--exit-code] [-q])" ;;
       *)          [ -z "$name" ] && name="$1" || err "too many arguments" ;;
     esac
     shift
@@ -1224,7 +1225,7 @@ cmd_status() {
   else
     if [ -z "$name" ]; then
       name=$(detect_session_name 2>/dev/null) \
-        || err "usage: pleach status <session> [-q]  (or --all)"
+        || err "usage: pleach status <session> [--exit-code] [-q]  (or --all)"
     fi
     [ -d "$SESSIONS/$name" ] || err "session '$name' does not exist at $SESSIONS/$name"
     targets=("$name")
@@ -1237,6 +1238,7 @@ cmd_status() {
   if [ "$behind_rc" -eq 0 ] && [ "$quiet" -eq 0 ]; then
     echo "(up to date with the local $BASE)"
   fi
+  if [ "$exit_code" -eq 1 ]; then return "$behind_rc"; fi
   return 0
 }
 
@@ -2860,7 +2862,7 @@ Sessions
   path [<session>]          Print where a session lives (--canonical for the canonical).
   add [<session>] <sub …>   Mount sub-repos into an existing session.
   sync [<session>|--all]    Bring the canonical's local main into the session's branches.
-  status [<session>]        How far behind the canonical's local main each of the session's repos is.
+  status [<session>|--all]  How far behind the canonical's local main each of the session's repos is.
   rm <name> [--force] [--reap]  Remove the session. Refuses when work is pending.
   prune [--apply]           List (and with --apply remove) fully integrated sessions.
   clean [<session>]         Delete git-ignored artifacts (node_modules, builds…).
@@ -3012,13 +3014,15 @@ Per repo, because a session touching only the api does not care that the docs mo
   <session>    Defaults to the session containing the current directory. Outside a
                session the name is required.
   -q, --quiet  Print nothing.
+  --exit-code  Return 1 when something is behind (as `git diff --exit-code`).
 
 Only the repos that are behind are listed; when none are, it says so in one line and
 nothing else. It measures the branch each worktree is really ON, not the branch the
 session was named after.
 
-It exits 0 whether or not anything is behind. It is a report: it tells you the number
-and the place, and leaves the decision to sync — or not to — with you.
+It exits 0 whether or not anything is behind, unless you ask for --exit-code. It is a
+report: it tells you the number and the place, and leaves the decision to sync — or
+not to — with you.
 
 Never reaches for origin. The target is the base ref in your canonical checkout, which
 moves when you pull there and at no other time.
