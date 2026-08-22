@@ -2309,6 +2309,41 @@ run bash -c "cd '$S11/work' && $PIN11 '$PLEACH' status --quiet"
 assert_eq "status --quiet: the long spelling is the same flag" "$OUT" ""
 
 # ---------------------------------------------------------------------------
+header "Test 55: status --all sweeps every session"
+# ---------------------------------------------------------------------------
+run bash -c "$PIN11 '$PLEACH' new second --no-bootstrap"
+assert_rc "status --all: a second session created" "$RC" 0
+# 'second' was cut from the current main, so it needs the canonical to move again
+# before it has anything to be behind of.
+git -C "$MINI11/canon" commit -q --allow-empty -m "canon root moves once more"
+
+run bash -c "$PIN11 '$PLEACH' status --all"
+assert_rc "status --all: rc 0" "$RC" 0
+assert_contains "status --all: reports the first session" "$OUT" "● work"
+assert_contains "status --all: reports the second" "$OUT" "● second"
+assert_contains "status --all: the first session's root distance" "$OUT" "root: 3 commit(s) behind"
+
+run bash -c "$PIN11 '$PLEACH' status --all work"
+assert_rc "status --all with a name: refused" "$RC" 1
+assert_contains "status --all with a name: says why" "$OUT" "does not take a session name"
+
+# --all is a scope, not a place: it works from inside a session too.
+run bash -c "cd '$S11/work' && $PIN11 '$PLEACH' status --all"
+assert_rc "status --all: works from inside a session" "$RC" 0
+assert_contains "status --all: and still sees the others" "$OUT" "● second"
+
+# An empty sessions folder is not an error.
+MINI12=$(cd "$SANDBOX" && mkdir -p stale-empty && cd stale-empty && pwd)
+setup_repo "$MINI12/canon"
+echo "# canon" > "$MINI12/canon/README.md"
+git -C "$MINI12/canon" add -A && git -C "$MINI12/canon" commit -q -m "initial"
+PIN12="env PLEACH_CANONICAL=$MINI12/canon PLEACH_EXPECT_CANONICAL=$MINI12/canon"
+
+run bash -c "$PIN12 '$PLEACH' status --all"
+assert_rc "status --all: no sessions is rc 0" "$RC" 0
+assert_contains "status --all: and says the folder is empty" "$OUT" "no sessions in"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

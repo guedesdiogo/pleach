@@ -1200,9 +1200,10 @@ status_report() { # $1 name, $2 quiet(0|1) — rc 1 when something is behind, 0 
 }
 
 cmd_status() {
-  local name="" quiet=0
+  local name="" quiet=0 all=0
   while [ $# -gt 0 ]; do
     case "$1" in
+      --all)      all=1 ;;
       -q|--quiet) quiet=1 ;;
       -*)         err "unknown flag: $1 (usage: pleach status [<session>] [-q])" ;;
       *)          [ -z "$name" ] && name="$1" || err "too many arguments" ;;
@@ -1212,14 +1213,24 @@ cmd_status() {
   load_config
 
   local -a targets=()
-  if [ -z "$name" ]; then
-    name=$(detect_session_name 2>/dev/null) \
-      || err "usage: pleach status <session> [-q]"
+  local n
+  if [ "$all" -eq 1 ]; then
+    [ -z "$name" ] || err "--all does not take a session name"
+    while IFS= read -r n; do [ -n "$n" ] && targets+=("$n"); done < <(session_names)
+    if [ ${#targets[@]} -eq 0 ]; then
+      if [ "$quiet" -eq 0 ]; then echo "(no sessions in $SESSIONS)"; fi
+      return 0
+    fi
+  else
+    if [ -z "$name" ]; then
+      name=$(detect_session_name 2>/dev/null) \
+        || err "usage: pleach status <session> [-q]  (or --all)"
+    fi
+    [ -d "$SESSIONS/$name" ] || err "session '$name' does not exist at $SESSIONS/$name"
+    targets=("$name")
   fi
-  [ -d "$SESSIONS/$name" ] || err "session '$name' does not exist at $SESSIONS/$name"
-  targets=("$name")
 
-  local behind_rc=0 n
+  local behind_rc=0
   for n in ${targets[@]+"${targets[@]}"}; do
     status_report "$n" "$quiet" || behind_rc=1
   done
