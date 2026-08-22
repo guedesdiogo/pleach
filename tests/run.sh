@@ -2370,6 +2370,77 @@ assert_rc "status -q --exit-code: 0 when nothing is behind" "$RC" 0
 assert_eq "status -q: silent in that case too" "$OUT" ""
 
 # ---------------------------------------------------------------------------
+header "Test 57: status --json is the machine surface"
+# ---------------------------------------------------------------------------
+MINI13=$(cd "$SANDBOX" && mkdir -p stale-json && cd stale-json && pwd)
+setup_repo "$MINI13/canon"
+echo "# canon" > "$MINI13/canon/README.md"
+git -C "$MINI13/canon" add -A && git -C "$MINI13/canon" commit -q -m "initial"
+setup_repo "$MINI13/canon/api"
+echo "api" > "$MINI13/canon/api/f.txt"
+git -C "$MINI13/canon/api" add -A && git -C "$MINI13/canon/api" commit -q -m "initial"
+setup_repo "$MINI13/canon/web"
+echo "web" > "$MINI13/canon/web/f.txt"
+git -C "$MINI13/canon/web" add -A && git -C "$MINI13/canon/web" commit -q -m "initial"
+git init -q -b master "$MINI13/canon/legacy"
+git -C "$MINI13/canon/legacy" config user.email "test@test"
+git -C "$MINI13/canon/legacy" config user.name "test"
+echo "legacy" > "$MINI13/canon/legacy/f.txt"
+git -C "$MINI13/canon/legacy" add -A && git -C "$MINI13/canon/legacy" commit -q -m "initial"
+PIN13="env PLEACH_CANONICAL=$MINI13/canon PLEACH_EXPECT_CANONICAL=$MINI13/canon"
+S13="$MINI13/.sessions"
+
+run bash -c "$PIN13 '$PLEACH' new j --no-bootstrap"
+assert_rc "status --json: session created" "$RC" 0
+git -C "$MINI13/canon" commit -q --allow-empty -m "root +1"
+git -C "$MINI13/canon/api" commit -q --allow-empty -m "api +1"
+git -C "$MINI13/canon/api" commit -q --allow-empty -m "api +2"
+
+run bash -c "$PIN13 '$PLEACH' status j --json"
+assert_rc "status --json: rc 0" "$RC" 0
+assert_contains "status --json: names the base" "$OUT" '"base": "main"'
+assert_contains "status --json: names the session" "$OUT" '"name": "j"'
+assert_contains "status --json: the session total is the sum" "$OUT" '"behind": 3'
+assert_contains "status --json: the root's distance" \
+  "$OUT" '{"repo": "root", "branch": "session/j", "behind": 1}'
+assert_contains "status --json: api's distance" \
+  "$OUT" '{"repo": "api", "branch": "session/j", "behind": 2}'
+# Measured and clean is not the same answer as not measured, so web is listed at 0
+# and legacy — which has no main to be behind of — is absent.
+assert_contains "status --json: a measured, clean repo is still listed" \
+  "$OUT" '{"repo": "web", "branch": "session/j", "behind": 0}'
+assert_not_contains "status --json: an unmeasurable repo is omitted" "$OUT" '"repo": "legacy"'
+
+# The real HEAD, here too.
+git -C "$S13/j/web" checkout -q -b feature/live
+run bash -c "$PIN13 '$PLEACH' status j --json"
+assert_contains "status --json: carries the branch the worktree is ON" "$OUT" '"branch": "feature/live"'
+git -C "$S13/j/web" checkout -q session/j
+
+# --exit-code answers the same question in either format.
+run bash -c "$PIN13 '$PLEACH' status j --json --exit-code"
+assert_rc "status --json --exit-code: 1 when behind" "$RC" 1
+run bash -c "$PIN13 '$PLEACH' new k --no-bootstrap"
+run bash -c "$PIN13 '$PLEACH' status k --json --exit-code"
+assert_rc "status --json --exit-code: 0 when nothing is behind" "$RC" 0
+
+run bash -c "$PIN13 '$PLEACH' status --all --json"
+assert_rc "status --all --json: rc 0" "$RC" 0
+assert_contains "status --all --json: carries both sessions" "$OUT" '"name": "k"'
+
+# Valid JSON, not just a string that looks like it. Same treatment as ls --json:
+# with no parser available the assertion is skipped rather than faked.
+if command -v python3 >/dev/null 2>&1; then
+  if printf '%s' "$OUT" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+    ok "status --json: output parses as JSON"
+  else
+    fail "status --json: output is not valid JSON"
+  fi
+else
+  echo "  (skipped: no python3 to validate the JSON)"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

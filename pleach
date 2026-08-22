@@ -1199,14 +1199,45 @@ status_report() { # $1 name, $2 quiet(0|1) — rc 1 when something is behind, 0 
   return "$rc"
 }
 
+status_json() { # $@ = session names — rc 1 when something is behind, as status_report
+  local first=1 n label behind total repos sub branch any=0
+  printf '{\n'
+  printf '  "base": "%s",\n' "$(json_escape "$BASE")"
+  printf '  "sessions": [\n'
+  for n in "$@"; do
+    repos=""
+    total=0
+    while IFS=$'\t' read -r label behind; do
+      [ -n "$label" ] || continue
+      total=$((total + behind))
+      # Every MEASURED repo appears, behind or not: a consumer filtering the list has
+      # to tell "measured and clean" from "not measured". session_behind has already
+      # dropped the ones that could not be measured.
+      sub=""
+      [ "$label" = "root" ] || sub="$label"
+      branch=$(short_ref "$(session_head_ref "$n" "$sub")")
+      repos="$repos${repos:+, }"
+      repos="$repos{\"repo\": \"$(json_escape "$label")\", \"branch\": \"$(json_escape "$branch")\", \"behind\": $behind}"
+    done < <(session_behind "$n")
+    [ "$total" -gt 0 ] && any=1
+    [ "$first" -eq 1 ] || printf ',\n'
+    first=0
+    printf '    {"name": "%s", "behind": %s, "repos": [%s]}' \
+      "$(json_escape "$n")" "$total" "$repos"
+  done
+  printf '\n  ]\n}\n'
+  return "$any"
+}
+
 cmd_status() {
-  local name="" quiet=0 all=0 exit_code=0
+  local name="" quiet=0 all=0 exit_code=0 as_json=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --all)      all=1 ;;
+      --json)     as_json=1 ;;
       --exit-code) exit_code=1 ;;
       -q|--quiet) quiet=1 ;;
-      -*)         err "unknown flag: $1 (usage: pleach status [<session>|--all] [--exit-code] [-q])" ;;
+      -*)         err "unknown flag: $1 (usage: pleach status [<session>|--all] [--json] [--exit-code] [-q])" ;;
       *)          [ -z "$name" ] && name="$1" || err "too many arguments" ;;
     esac
     shift
@@ -1232,11 +1263,15 @@ cmd_status() {
   fi
 
   local behind_rc=0
-  for n in ${targets[@]+"${targets[@]}"}; do
-    status_report "$n" "$quiet" || behind_rc=1
-  done
-  if [ "$behind_rc" -eq 0 ] && [ "$quiet" -eq 0 ]; then
-    echo "(up to date with the local $BASE)"
+  if [ "$as_json" -eq 1 ]; then
+    status_json ${targets[@]+"${targets[@]}"} || behind_rc=1
+  else
+    for n in ${targets[@]+"${targets[@]}"}; do
+      status_report "$n" "$quiet" || behind_rc=1
+    done
+    if [ "$behind_rc" -eq 0 ] && [ "$quiet" -eq 0 ]; then
+      echo "(up to date with the local $BASE)"
+    fi
   fi
   if [ "$exit_code" -eq 1 ]; then return "$behind_rc"; fi
   return 0
@@ -3006,7 +3041,7 @@ inferred.
 EOF
     ;;
     status) cat <<'EOF'
-pleach status [<session>] [-q]
+pleach status [<session>|--all] [--json] [--exit-code] [-q]
 
 How far behind the canonical's LOCAL base each of the session's repos has drifted.
 Per repo, because a session touching only the api does not care that the docs moved.
@@ -3015,6 +3050,7 @@ Per repo, because a session touching only the api does not care that the docs mo
                session the name is required.
   -q, --quiet  Print nothing.
   --exit-code  Return 1 when something is behind (as `git diff --exit-code`).
+  --json       The machine surface: every measured repo, behind or not.
 
 Only the repos that are behind are listed; when none are, it says so in one line and
 nothing else. It measures the branch each worktree is really ON, not the branch the
