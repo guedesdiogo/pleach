@@ -644,10 +644,10 @@ assert_contains "status --json: a measured, clean repo is still listed" \
 assert_not_contains "status --json: an unmeasurable repo is omitted" "$OUT" '"repo": "legacy"'
 
 # The real HEAD, here too.
-git -C "$S13/web" checkout -q -b feature/live
+git -C "$S13/j/web" checkout -q -b feature/live
 run bash -c "$PIN13 '$PLEACH' status j --json"
 assert_contains "status --json: carries the branch the worktree is ON" "$OUT" '"branch": "feature/live"'
-git -C "$S13/web" checkout -q session/j
+git -C "$S13/j/web" checkout -q session/j
 
 # --exit-code answers the same question in either format.
 run bash -c "$PIN13 '$PLEACH' status j --json --exit-code"
@@ -776,7 +776,7 @@ git commit -m "feat: pleach status --json, the machine surface for the staleness
 
 ---
 
-### Task 5: the aviso arrives on the way in
+### Task 5: the notice arrives on the way in
 
 **Files:**
 - Modify: `pleach` — `cmd_open()` (`pleach:880`), immediately before `info "opening in $dir: $*"`
@@ -794,13 +794,13 @@ Append to `tests/run.sh`, before the `# Summary` divider. Reuses `MINI11` and `P
 
 ```bash
 # ---------------------------------------------------------------------------
-header "Test 58: open carries the aviso, and says nothing when there is none"
+header "Test 58: open carries the notice, and says nothing when there is none"
 # ---------------------------------------------------------------------------
 # Entering the session is the one moment the signal reaches the person deciding
 # without anyone having to remember to ask.
 run bash -c "$PIN11 '$PLEACH' open work pwd"
 assert_rc "open: rc 0" "$RC" 0
-assert_contains "open: the aviso arrives on the way in" "$OUT" "commit(s) behind"
+assert_contains "open: the notice arrives on the way in" "$OUT" "commit(s) behind"
 assert_contains "open: and the command still runs in the session" "$OUT" "$S11/work"
 assert_not_contains "open: it reports, it does not instruct" "$OUT" "pleach sync"
 
@@ -814,14 +814,14 @@ assert_not_contains "open: and it does not announce being in date either" "$OUT"
 # the launched command's own argv.
 run bash -c "$PIN11 PLEACH_NO_STATUS=1 '$PLEACH' open work pwd"
 assert_rc "open PLEACH_NO_STATUS=1: rc 0" "$RC" 0
-assert_not_contains "open: PLEACH_NO_STATUS silences the aviso" "$OUT" "commit(s) behind"
+assert_not_contains "open: PLEACH_NO_STATUS silences the notice" "$OUT" "commit(s) behind"
 assert_contains "open: and the command still runs" "$OUT" "$S11/work"
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `npm test 2>&1 | tail -40`
-Expected: FAIL on `open: the aviso arrives on the way in` — the output has no
+Expected: FAIL on `open: the notice arrives on the way in` — the output has no
 `commit(s) behind` in it.
 
 - [ ] **Step 3: Write the implementation**
@@ -829,7 +829,7 @@ Expected: FAIL on `open: the aviso arrives on the way in` — the output has no
 In `cmd_open`, insert this immediately before the line `info "opening in $dir: $*"`:
 
 ```bash
-  # The one moment the aviso reaches the person deciding without anyone remembering
+  # The one moment the notice reaches the person deciding without anyone remembering
   # to ask. Silence is the normal state: nothing is printed when every repo is in
   # date, and nothing is ever recommended — being behind is not being about to
   # conflict.

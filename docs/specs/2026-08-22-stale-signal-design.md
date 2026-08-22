@@ -18,10 +18,10 @@ The measurement is not the missing piece. It is already computed three times:
   prints `↓N behind`, already per repo.
 - `sync_session()` (`pleach:1113`) in `--dry-run` prints `would merge +N commits`, per repo.
 - Everything is measured against the **local** base. `fetch_base()` only runs under an
-  explicit `--fetch`. That is exactly the "canónico local" this feature is about, so no
+  explicit `--fetch`. That is exactly the local canonical this feature is about, so no
   change of philosophy is required.
 
-What is missing is delivery: a clean session-local surface to ask from, and the aviso
+What is missing is delivery: a clean session-local surface to ask from, and the notice
 arriving at the one moment nobody has to remember — entering the session.
 
 ## The approach we rejected
@@ -122,7 +122,7 @@ Cost: 1+N git calls at an interactive entry point, well under 100ms for ~9 repos
 
 One line in the emitted skill (`pleach:2497`) so an agent learns the command exists. That
 delivers the agent half of Phase 1 with no watermark and no hook. A hook is only required
-for the aviso to arrive *unprompted*.
+for the notice to arrive *unprompted*.
 
 ## Out of scope, deliberately
 
@@ -166,7 +166,7 @@ silence at almost no cost, and only a difference pays for the `rev-list`. That i
 makes a per-prompt agent hook viable, alongside `--since-ack` / `--ack` on `status` and an
 `examples/pleach-stale-notice.sh` in the mould of the existing `pleach-guard.sh`.
 
-Trigger to build it: Phase 1 proving noisy, or wanting the aviso unprompted every turn.
+Trigger to build it: Phase 1 proving noisy, or wanting the notice unprompted every turn.
 
 **Phase 3 — relevance.** Cross the paths in the new commits with the paths this session has
 touched, so "12 behind" becomes "12 behind, 2 of them in files you changed".
