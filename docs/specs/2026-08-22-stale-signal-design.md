@@ -74,11 +74,16 @@ Flags:
 - `--exit-code` — opt-in, as `git diff --exit-code`: 1 when any repo is behind. **Without it
   the command exits 0 even when behind**, the same contract `conflicts` holds. It is a
   report; a report that fails is a check, and callers would start guarding it with `|| true`.
-- `-q` / `--quiet` — no output at all. Exists to pair with `--exit-code`, so a hook can ask
-  the question without printing anything.
+- `-q` / `--quiet` — no output at all, in every path and with no exception for `--json`.
+  Exists to pair with `--exit-code`, so a hook can ask the question without printing
+  anything. It never changes the exit status: the measurement still runs, only the output
+  is dropped.
 - `--json` — the machine surface. Every mounted repo appears, behind or not, because a
   consumer filtering the list needs to know a repo was measured and found clean rather
   than skipped. Repos that could not be measured are omitted, exactly as in the text output.
+  A workspace with no sessions still answers in JSON — `{"base": …, "sessions": []}`, never
+  the prose line the text path prints. A machine surface that degrades to English in one
+  shape is not a machine surface.
 - `--all` — every session; takes no session name, and is accepted from inside a session too.
   Same shape as `sync --all`.
 

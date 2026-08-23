@@ -2343,6 +2343,21 @@ run bash -c "$PIN12 '$PLEACH' status --all"
 assert_rc "status --all: no sessions is rc 0" "$RC" 0
 assert_contains "status --all: and says the folder is empty" "$OUT" "no sessions in"
 
+# --json is the machine surface even with nothing to report: prose there would
+# break a caller parsing it.
+run bash -c "$PIN12 '$PLEACH' status --all --json"
+assert_rc "status --all --json: no sessions is still rc 0" "$RC" 0
+assert_contains "status --all --json: still carries the sessions key" "$OUT" '"sessions"'
+if command -v python3 >/dev/null 2>&1; then
+  if printf '%s' "$OUT" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+    ok "status --all --json: no sessions still parses as JSON"
+  else
+    fail "status --all --json: no sessions is not valid JSON"
+  fi
+else
+  echo "  (skipped: no python3 to validate the JSON)"
+fi
+
 # ---------------------------------------------------------------------------
 header "Test 56: --exit-code is opt-in, and -q is the silent way to ask"
 # ---------------------------------------------------------------------------
@@ -2423,6 +2438,19 @@ assert_rc "status --json --exit-code: 1 when behind" "$RC" 1
 run bash -c "$PIN13 '$PLEACH' new k --no-bootstrap"
 run bash -c "$PIN13 '$PLEACH' status k --json --exit-code"
 assert_rc "status --json --exit-code: 0 when nothing is behind" "$RC" 0
+
+# -q wins over --json: silence the document entirely, but never skip the
+# measurement, so --exit-code stays accurate either way.
+run bash -c "$PIN13 '$PLEACH' status j --json -q"
+assert_eq "status j --json -q: prints nothing at all" "$OUT" ""
+
+run bash -c "$PIN13 '$PLEACH' status j --json -q --exit-code"
+assert_rc "status j --json -q --exit-code: 1 when behind" "$RC" 1
+assert_eq "status j --json -q --exit-code: still prints nothing" "$OUT" ""
+
+run bash -c "$PIN13 '$PLEACH' status k --json -q --exit-code"
+assert_rc "status k --json -q --exit-code: 0 when nothing is behind" "$RC" 0
+assert_eq "status k --json -q --exit-code: still prints nothing" "$OUT" ""
 
 run bash -c "$PIN13 '$PLEACH' status --all --json"
 assert_rc "status --all --json: rc 0" "$RC" 0

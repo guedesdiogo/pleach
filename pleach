@@ -1250,7 +1250,9 @@ cmd_status() {
     [ -z "$name" ] || err "--all does not take a session name"
     while IFS= read -r n; do [ -n "$n" ] && targets+=("$n"); done < <(session_names)
     if [ ${#targets[@]} -eq 0 ]; then
-      if [ "$quiet" -eq 0 ]; then echo "(no sessions in $SESSIONS)"; fi
+      if [ "$quiet" -eq 0 ]; then
+        if [ "$as_json" -eq 1 ]; then status_json; else echo "(no sessions in $SESSIONS)"; fi
+      fi
       return 0
     fi
   else
@@ -1264,7 +1266,13 @@ cmd_status() {
 
   local behind_rc=0
   if [ "$as_json" -eq 1 ]; then
-    status_json ${targets[@]+"${targets[@]}"} || behind_rc=1
+    # -q wins over --json: silence the document, but still measure, so
+    # --exit-code stays accurate whether or not anything gets printed.
+    if [ "$quiet" -eq 1 ]; then
+      status_json ${targets[@]+"${targets[@]}"} >/dev/null || behind_rc=1
+    else
+      status_json ${targets[@]+"${targets[@]}"} || behind_rc=1
+    fi
   else
     for n in ${targets[@]+"${targets[@]}"}; do
       status_report "$n" "$quiet" || behind_rc=1
