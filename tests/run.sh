@@ -460,6 +460,14 @@ run "$PLEACH" help open
 assert_rc "help open: rc 0" "$RC" 0
 assert_contains "help open: documents PLEACH_NO_STATUS" "$OUT" "PLEACH_NO_STATUS"
 
+# The synopsis already advertises [<session>|--all]; the flag list below it is the
+# only place an agent (or a person) will learn --all takes no session name and
+# works from inside a session too, since skill_doc() only names --json and
+# --exit-code.
+run "$PLEACH" help status
+assert_rc "help status: rc 0" "$RC" 0
+assert_contains "help status: documents --all" "$OUT" "--all"
+
 run "$PLEACH" help nonsense
 assert_rc "help nonsense: non-zero rc" "$RC" 1
 
@@ -554,6 +562,9 @@ header "Test 23: completions"
 run "$PLEACH" completions bash
 assert_rc "completions bash: rc 0" "$RC" 0
 assert_contains "completions bash: registers the completion" "$OUT" "complete -F _pleach pleach"
+# status is a real dispatcher command like sync or rm; leaving it out of the
+# completion list is the same defect as leaving it out of help.
+assert_contains "completions bash: lists status among the commands" "$OUT" "status"
 printf '%s' "$OUT" > "$SANDBOX/completions.bash"
 assert_true "completions bash: the emitted script is valid shell" \
   bash -n "$SANDBOX/completions.bash"
@@ -561,6 +572,7 @@ assert_true "completions bash: the emitted script is valid shell" \
 run "$PLEACH" completions zsh
 assert_rc "completions zsh: rc 0" "$RC" 0
 assert_contains "completions zsh: registers the completion" "$OUT" "compdef _pleach pleach"
+assert_contains "completions zsh: lists status among the commands" "$OUT" "status"
 
 run "$PLEACH" completions fish
 assert_rc "completions fish: non-zero rc for an unsupported shell" "$RC" 1
@@ -2583,6 +2595,49 @@ assert_contains "combo-empty: it is the JSON document" "$OUT" '"sessions"'
 run bash -c "$PIN16 '$PLEACH' status --all --json -q"
 assert_rc "combo-empty: --all --json -q is rc 0" "$RC" 0
 assert_eq "combo-empty: --all --json -q prints nothing" "$OUT" ""
+
+# ---------------------------------------------------------------------------
+header "Test 60: a directory in the sessions folder that status could not measure"
+# ---------------------------------------------------------------------------
+# cmd_status only checks [ -d "$SESSIONS/$name" ], which a bare directory passes
+# as easily as a real session whose worktrees were later deleted. session_behind
+# already tells "nothing to see" from "we could not look" apart; before this fix
+# cmd_status collapsed the two and printed "(up to date with the local main)" at
+# rc 0 for a name that was never a session at all. Its own sandbox, not MINI14's
+# mutated one — Test 59's pattern.
+
+MINI17=$(cd "$SANDBOX" && mkdir -p unmeasurable && cd unmeasurable && pwd)
+setup_repo "$MINI17/canon"
+echo "# canon" > "$MINI17/canon/README.md"
+git -C "$MINI17/canon" add -A && git -C "$MINI17/canon" commit -q -m "initial"
+PIN17="env PLEACH_CANONICAL=$MINI17/canon PLEACH_EXPECT_CANONICAL=$MINI17/canon"
+S17="$MINI17/.sessions"
+
+run bash -c "$PIN17 '$PLEACH' new real --no-bootstrap"
+assert_rc "unmeasurable: a real session exists alongside it" "$RC" 0
+
+mkdir -p "$S17/bare"
+
+run bash -c "$PIN17 '$PLEACH' status bare"
+assert_rc "unmeasurable: rc 0 - we simply do not know, we are not refusing" "$RC" 0
+assert_not_contains "unmeasurable: never claims it is up to date" "$OUT" "up to date"
+assert_eq "unmeasurable: says nothing at all rather than something false" "$OUT" ""
+
+run bash -c "$PIN17 '$PLEACH' status bare --json"
+assert_rc "unmeasurable --json: rc 0" "$RC" 0
+assert_not_contains "unmeasurable --json: omitted from sessions, like an unmeasurable repo" \
+  "$OUT" '"name": "bare"'
+assert_contains "unmeasurable --json: still the JSON document" "$OUT" '"sessions"'
+
+run bash -c "$PIN17 '$PLEACH' status bare --exit-code"
+assert_rc "unmeasurable --exit-code: 0 - nothing is behind, we do not know" "$RC" 0
+
+# The negative alone would pass against a status that had simply stopped
+# working: a real session in the same workspace must still report normally.
+run bash -c "$PIN17 '$PLEACH' status real"
+assert_rc "unmeasurable: a real session is unaffected" "$RC" 0
+assert_contains "unmeasurable: and reports up to date for real, correctly" \
+  "$OUT" "(up to date with the local main)"
 
 # ---------------------------------------------------------------------------
 # Summary

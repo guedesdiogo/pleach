@@ -12,7 +12,7 @@
 # shellcheck disable=SC2015  # deliberate idiom: [ -z "$x" ] && x=… || err (err never runs after an assignment)
 set -euo pipefail
 
-PLEACH_VERSION="2.2.0"
+PLEACH_VERSION="2.3.0"
 
 CONF_NAME=".pleach.conf"
 USER_CONF="$HOME/.config/pleach/config"
@@ -1192,12 +1192,17 @@ session_behind() { # $1 name — echoes "<label>\t<behind>" per measurable workt
   done
 }
 
-status_report() { # $1 name, $2 quiet(0|1) — rc 1 when something is behind, 0 when nothing is
-  # The polarity is git's, not an accident: `git diff --exit-code` returns 1 for
-  # "there is a difference". --exit-code hands this straight back to the caller.
-  local name="$1" quiet="${2:-0}" label behind titled=0 rc=0
+status_report() { # $1 name, $2 quiet(0|1)
+  # rc 0 = measured, nothing behind. rc 1 = measured, something behind (the polarity
+  # is git's, not an accident: `git diff --exit-code` returns 1 for "there is a
+  # difference" and --exit-code hands this straight back to the caller). rc 2 =
+  # session_behind produced no lines at all — nothing here could be measured, which
+  # is a different answer from "measured and clean" and callers must tell them apart
+  # rather than assert the session is up to date.
+  local name="$1" quiet="${2:-0}" label behind titled=0 rc=0 measured=0
   while IFS=$'\t' read -r label behind; do
     [ -n "$label" ] || continue
+    measured=1
     [ "${behind:-0}" -gt 0 ] || continue
     rc=1
     if [ "$quiet" -eq 0 ]; then
@@ -1208,19 +1213,22 @@ status_report() { # $1 name, $2 quiet(0|1) — rc 1 when something is behind, 0 
       printf '    %s: %s commit(s) behind\n' "$label" "$behind"
     fi
   done < <(session_behind "$name")
+  [ "$measured" -eq 1 ] || return 2
   return "$rc"
 }
 
 status_json() { # $@ = session names — rc 1 when something is behind, as status_report
-  local first=1 n label behind total repos sub branch any=0
+  local first=1 n label behind total repos sub branch any=0 measured=0
   printf '{\n'
   printf '  "base": "%s",\n' "$(json_escape "$BASE")"
   printf '  "sessions": [\n'
   for n in "$@"; do
     repos=""
     total=0
+    measured=0
     while IFS=$'\t' read -r label behind; do
       [ -n "$label" ] || continue
+      measured=1
       total=$((total + behind))
       # Every MEASURED repo appears, behind or not: a consumer filtering the list has
       # to tell "measured and clean" from "not measured". session_behind has already
@@ -1231,6 +1239,10 @@ status_json() { # $@ = session names — rc 1 when something is behind, as statu
       repos="$repos${repos:+, }"
       repos="$repos{\"repo\": \"$(json_escape "$label")\", \"branch\": \"$(json_escape "$branch")\", \"behind\": $behind}"
     done < <(session_behind "$n")
+    # A session with no measurable repo at all is omitted from the array entirely,
+    # the same rule one level down: "measured and clean" (behind: 0) and "could not
+    # be measured" (omitted) must stay tellable apart, here for sessions too.
+    [ "$measured" -eq 1 ] || continue
     [ "$total" -gt 0 ] && any=1
     [ "$first" -eq 1 ] || printf ',\n'
     first=0
@@ -1263,7 +1275,7 @@ cmd_status() {
     while IFS= read -r n; do [ -n "$n" ] && targets+=("$n"); done < <(session_names)
     if [ ${#targets[@]} -eq 0 ]; then
       if [ "$quiet" -eq 0 ]; then
-        if [ "$as_json" -eq 1 ]; then status_json; else echo "(no sessions in $SESSIONS)"; fi
+        if [ "$as_json" -eq 1 ]; then status_json || true; else echo "(no sessions in $SESSIONS)"; fi
       fi
       return 0
     fi
@@ -1286,10 +1298,17 @@ cmd_status() {
       status_json ${targets[@]+"${targets[@]}"} || behind_rc=1
     fi
   else
+    local measured_any=0 rc
     for n in ${targets[@]+"${targets[@]}"}; do
-      status_report "$n" "$quiet" || behind_rc=1
+      rc=0
+      status_report "$n" "$quiet" || rc=$?
+      # rc 2 means nothing in this "session" could be measured at all -- say nothing
+      # about it, and do not let it count towards (or against) "up to date".
+      [ "$rc" -eq 2 ] && continue
+      measured_any=1
+      [ "$rc" -eq 1 ] && behind_rc=1
     done
-    if [ "$behind_rc" -eq 0 ] && [ "$quiet" -eq 0 ]; then
+    if [ "$behind_rc" -eq 0 ] && [ "$quiet" -eq 0 ] && [ "$measured_any" -eq 1 ]; then
       echo "(up to date with the local $BASE)"
     fi
   fi
@@ -1927,7 +1946,7 @@ cmd_completions() {
     bash) cat <<'EOF'
 # pleach bash completion. Add to ~/.bashrc:
 #   eval "$(pleach completions bash)"
-_pleach_commands="init new open ls add sync rm prune clean each conflicts repos path cd doctor skill completions shell-init install update version help"
+_pleach_commands="init new open ls add sync status rm prune clean each conflicts repos path cd doctor skill completions shell-init install update version help"
 _pleach_sessions() { pleach ls --json 2>/dev/null | sed -nE 's/.*"name": "([^"]+)".*/\1/p'; }
 _pleach() {
   local cur="${COMP_WORDS[COMP_CWORD]}"
@@ -1936,7 +1955,7 @@ _pleach() {
     return
   fi
   case "${COMP_WORDS[1]}" in
-    open|sync|rm|clean|add|path|cd)
+    open|sync|status|rm|clean|add|path|cd)
       [ "$COMP_CWORD" -eq 2 ] && COMPREPLY=($(compgen -W "$(_pleach_sessions)" -- "$cur")) ;;
     help)        COMPREPLY=($(compgen -W "$_pleach_commands config" -- "$cur")) ;;
     completions) COMPREPLY=($(compgen -W "bash zsh" -- "$cur")) ;;
@@ -1950,13 +1969,13 @@ EOF
 #   eval "$(pleach completions zsh)"
 _pleach() {
   local -a cmds
-  cmds=(init new open ls add sync rm prune clean each conflicts repos path cd doctor skill completions shell-init install update version help)
+  cmds=(init new open ls add sync status rm prune clean each conflicts repos path cd doctor skill completions shell-init install update version help)
   if (( CURRENT == 2 )); then
     _describe 'pleach command' cmds
     return
   fi
   case "${words[2]}" in
-    open|sync|rm|clean|add|path|cd)
+    open|sync|status|rm|clean|add|path|cd)
       (( CURRENT == 3 )) && _values 'session' ${(f)"$(pleach ls --json 2>/dev/null | sed -nE 's/.*"name": "([^"]+)".*/\1/p')"} ;;
     help)        _values 'topic' $cmds config ;;
     completions) _values 'shell' bash zsh ;;
@@ -3077,6 +3096,8 @@ Per repo, because a session touching only the api does not care that the docs mo
 
   <session>    Defaults to the session containing the current directory. Outside a
                session the name is required.
+  --all        Every session. Takes no session name, and is accepted from inside a
+               session too.
   -q, --quiet  Print nothing.
   --exit-code  Return 1 when something is behind (as `git diff --exit-code`).
   --json       The machine surface: every measured repo, behind or not.
