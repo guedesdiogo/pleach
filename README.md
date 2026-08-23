@@ -278,6 +278,7 @@ pleach doctor                        # drift, stale locks, port clashes; --fix r
 pleach sync fix-x                    # merge the local main into every repo of the session
 pleach sync fix-x --dry-run          # show what would happen, touch nothing
 pleach sync --all --yes              # every session (explicit --yes outside a TTY)
+pleach status fix-x                  # which of its repos drifted behind the local main
 
 pleach add fix-x payments            # mount a new sub-repo into an existing session
 pleach repos --sync                  # adopt a new workspace repo across ALL sessions

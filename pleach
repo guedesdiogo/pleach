@@ -2689,6 +2689,12 @@ session is invisible to yours by construction.
   name, the same port hardcoded twice: all merge clean and none of them show up
   here. A green answer from a check whose scope does not cover your question is
   not evidence.
+- `pleach status` — how far behind the canonical's LOCAL base each repo of a session is,
+  measured on the branch the worktree is ON. The canonical moves when someone pulls there,
+  and nothing inside a session notices. `pleach open` reports this on the way in; ask
+  directly when you have been working a while. It is a report, not an instruction:
+  being behind is not being about to conflict, and whether to `sync` is the human's call.
+  `--json` and `--exit-code` for scripting; it exits 0 without the latter.
 - `pleach each '<command>'` — runs it in the canonical and in every session ROOT.
   Add `--repos` to descend into every mounted sub-repo as well; without it, a
   composite workspace answers for the root worktree only. Use it before claiming any
