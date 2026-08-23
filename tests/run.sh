@@ -454,6 +454,11 @@ done
 run "$PLEACH" help config
 assert_rc "help config: rc 0" "$RC" 0
 assert_contains "help config: documents PLEACH_EXPECT_CANONICAL" "$OUT" "PLEACH_EXPECT_CANONICAL"
+assert_contains "help config: documents PLEACH_NO_STATUS" "$OUT" "PLEACH_NO_STATUS"
+
+run "$PLEACH" help open
+assert_rc "help open: rc 0" "$RC" 0
+assert_contains "help open: documents PLEACH_NO_STATUS" "$OUT" "PLEACH_NO_STATUS"
 
 run "$PLEACH" help nonsense
 assert_rc "help nonsense: non-zero rc" "$RC" 1
@@ -2491,6 +2496,93 @@ run bash -c "$PIN11 PLEACH_NO_STATUS=1 '$PLEACH' open work pwd"
 assert_rc "open PLEACH_NO_STATUS=1: rc 0" "$RC" 0
 assert_not_contains "open: PLEACH_NO_STATUS silences the notice" "$OUT" "commit(s) behind"
 assert_contains "open: and the command still runs" "$OUT" "$S11/work"
+
+
+# ---------------------------------------------------------------------------
+header "Test 59: status flag combinations no single task's tests covered"
+# ---------------------------------------------------------------------------
+# --all, --exit-code, -q and --json were each tested against the others only
+# where the task that added that flag required it. Four review passes flagged
+# the same shape of gap: the untested corners of a brand-new command's
+# interface. This test covers the combinations, not reused MINI11/MINI13 -
+# their session state has already been mutated by the tests before them.
+
+MINI14=$(cd "$SANDBOX" && mkdir -p combo && cd combo && pwd)
+setup_repo "$MINI14/canon"
+echo "# canon" > "$MINI14/canon/README.md"
+git -C "$MINI14/canon" add -A && git -C "$MINI14/canon" commit -q -m "initial"
+PIN14="env PLEACH_CANONICAL=$MINI14/canon PLEACH_EXPECT_CANONICAL=$MINI14/canon"
+
+# Named so the alphabetical order session_names walks ('adrift' before
+# 'zsynced') puts the BEHIND session first, not last: an --all implementation
+# that only remembered the last session it examined would call this
+# workspace clean, and --exit-code would wrongly return 0.
+run bash -c "$PIN14 '$PLEACH' new adrift --no-bootstrap"
+assert_rc "combo: adrift created" "$RC" 0
+git -C "$MINI14/canon" commit -q --allow-empty -m "canon moves"
+run bash -c "$PIN14 '$PLEACH' new zsynced --no-bootstrap"
+assert_rc "combo: zsynced created" "$RC" 0
+
+# Baseline, with none of the flags under test: adrift really is behind, and
+# that is the only thing --all has to report.
+run bash -c "$PIN14 '$PLEACH' status --all"
+assert_rc "combo: baseline status --all is rc 0" "$RC" 0
+assert_contains "combo: adrift is reported behind" "$OUT" "adrift"
+assert_contains "combo: it names the distance" "$OUT" "commit(s) behind"
+assert_not_contains "combo: zsynced has nothing to report" "$OUT" "zsynced"
+
+# 1. --all -q over a workspace where something IS behind: nothing at all,
+# rc 0. The harness captures stdout and stderr combined, so an empty $OUT
+# here is a real claim of total silence, not just an empty stdout.
+run bash -c "$PIN14 '$PLEACH' status --all -q"
+assert_rc "combo: --all -q is rc 0 even though adrift is behind" "$RC" 0
+assert_eq "combo: --all -q prints nothing" "$OUT" ""
+
+# 2. --all --exit-code: 1 when ANY session is behind, including the one
+# examined first rather than last.
+run bash -c "$PIN14 '$PLEACH' status --all --exit-code"
+assert_rc "combo: --all --exit-code is 1 - the non-last session is the one behind" "$RC" 1
+
+# The negative, in its own clean workspace: nothing behind must not trip
+# --exit-code either.
+MINI15=$(cd "$SANDBOX" && mkdir -p combo-clean && cd combo-clean && pwd)
+setup_repo "$MINI15/canon"
+echo "# canon" > "$MINI15/canon/README.md"
+git -C "$MINI15/canon" add -A && git -C "$MINI15/canon" commit -q -m "initial"
+PIN15="env PLEACH_CANONICAL=$MINI15/canon PLEACH_EXPECT_CANONICAL=$MINI15/canon"
+run bash -c "$PIN15 '$PLEACH' new one --no-bootstrap"
+assert_rc "combo-clean: one created" "$RC" 0
+run bash -c "$PIN15 '$PLEACH' new two --no-bootstrap"
+assert_rc "combo-clean: two created" "$RC" 0
+run bash -c "$PIN15 '$PLEACH' status --all --exit-code"
+assert_rc "combo-clean: --all --exit-code is 0 - nothing is behind" "$RC" 0
+
+# 3. --all --json -q over a NON-EMPTY session set: still silent, still rc 0 -
+# and --exit-code still reports the same 1 while printing nothing at all.
+run bash -c "$PIN14 '$PLEACH' status --all --json -q"
+assert_rc "combo: --all --json -q is rc 0" "$RC" 0
+assert_eq "combo: --all --json -q prints nothing" "$OUT" ""
+
+run bash -c "$PIN14 '$PLEACH' status --all --json -q --exit-code"
+assert_rc "combo: --all --json -q --exit-code is 1 - adrift is still behind" "$RC" 1
+assert_eq "combo: --all --json -q --exit-code still prints nothing" "$OUT" ""
+
+# 4. -q on the zero-sessions --all --json case: still silent, still rc 0.
+MINI16=$(cd "$SANDBOX" && mkdir -p combo-empty && cd combo-empty && pwd)
+setup_repo "$MINI16/canon"
+echo "# canon" > "$MINI16/canon/README.md"
+git -C "$MINI16/canon" add -A && git -C "$MINI16/canon" commit -q -m "initial"
+PIN16="env PLEACH_CANONICAL=$MINI16/canon PLEACH_EXPECT_CANONICAL=$MINI16/canon"
+
+# Without -q this path prints the JSON document, per Test 55; with it,
+# nothing - proof this is a real check, not a vacuous one.
+run bash -c "$PIN16 '$PLEACH' status --all --json"
+assert_rc "combo-empty: --all --json with no sessions is rc 0" "$RC" 0
+assert_contains "combo-empty: it is the JSON document" "$OUT" '"sessions"'
+
+run bash -c "$PIN16 '$PLEACH' status --all --json -q"
+assert_rc "combo-empty: --all --json -q is rc 0" "$RC" 0
+assert_eq "combo-empty: --all --json -q prints nothing" "$OUT" ""
 
 # ---------------------------------------------------------------------------
 # Summary
