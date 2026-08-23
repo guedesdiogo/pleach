@@ -923,6 +923,18 @@ cmd_open() {
   # 'pleach open x code' → VS Code on the session's multi-root workspace (SCM for
   # every repo); with extra args, the literal command is honoured.
   [ "$1" = "code" ] && [ $# -eq 1 ] && set -- code "$dir.code-workspace"
+  # The one moment the notice reaches the person deciding without anyone remembering
+  # to ask. Silence is the normal state: nothing is printed when every repo is in
+  # date, and nothing is ever recommended — being behind is not being about to
+  # conflict.
+  #
+  # The suppressor is an env var and not a flag on purpose: everything past the
+  # session name is the launched command's own argv, and eating a lookalike out of it
+  # would change what the caller asked to run (see --create at the top of this
+  # function).
+  if [ -z "${PLEACH_NO_STATUS:-}" ]; then
+    status_report "$name" 0 || true
+  fi
   info "opening in $dir: $*"
   exec "$@"
 }
@@ -2981,6 +2993,9 @@ The block gives the root PORT and every sub-repo its own PLEACH_PORT_<SUB>, so a
 workspace with three services can run all three at once. They read $PORT, so point
 each one at its own variable (PORT=$PLEACH_PORT_API npm run dev, or a two-line
 dev script) — pleach allocates the ports, it does not start your servers.
+
+On the way in it reports any repo of the session that is behind the canonical's local
+base, and says nothing when none are. Set PLEACH_NO_STATUS=1 to suppress it.
 EOF
     ;;
     ls) cat <<'EOF'
@@ -3401,6 +3416,9 @@ Guard rail for automation/harnesses (env, not conf):
                                   path, pleach aborts before any write. Mandatory
                                   in test scripts — it stops a wrong cwd from
                                   resolving to your real workspace.
+  PLEACH_NO_STATUS=1              Suppresses the behind-the-base report `open` prints
+                                  on the way in. A flag would be ambiguous: everything
+                                  after the session name is the launched command's argv.
 EOF
     ;;
     *) err "no help for '$1' (commands: init new open ls path cd add sync status rm prune clean each conflicts repos doctor shell-init completions install update version; topics: config)" ;;

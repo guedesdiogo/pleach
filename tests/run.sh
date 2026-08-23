@@ -2469,6 +2469,30 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+header "Test 58: open carries the notice, and says nothing when there is none"
+# ---------------------------------------------------------------------------
+# Entering the session is the one moment the signal reaches the person deciding
+# without anyone having to remember to ask.
+run bash -c "$PIN11 '$PLEACH' open work pwd"
+assert_rc "open: rc 0" "$RC" 0
+assert_contains "open: the notice arrives on the way in" "$OUT" "commit(s) behind"
+assert_contains "open: and the command still runs in the session" "$OUT" "$S11/work"
+assert_not_contains "open: it reports, it does not instruct" "$OUT" "pleach sync"
+
+# Silence is the normal state.
+run bash -c "$PIN11 '$PLEACH' open fresh pwd"
+assert_rc "open (in date): rc 0" "$RC" 0
+assert_not_contains "open: nothing printed when every repo is in date" "$OUT" "commit(s) behind"
+assert_not_contains "open: and it does not announce being in date either" "$OUT" "up to date"
+
+# The suppressor is an env var, not a flag: everything after the session name is
+# the launched command's own argv.
+run bash -c "$PIN11 PLEACH_NO_STATUS=1 '$PLEACH' open work pwd"
+assert_rc "open PLEACH_NO_STATUS=1: rc 0" "$RC" 0
+assert_not_contains "open: PLEACH_NO_STATUS silences the notice" "$OUT" "commit(s) behind"
+assert_contains "open: and the command still runs" "$OUT" "$S11/work"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
