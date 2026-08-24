@@ -443,7 +443,7 @@ header "Test 18: every command is documented"
 # ---------------------------------------------------------------------------
 # The help text is the only user-facing documentation inside the tool, so a
 # command with no help topic is a real defect, not a nicety.
-for c in init new open ls path cd add sync rm prune clean each conflicts repos doctor shell-init completions install update version; do
+for c in init new open ls path cd add sync status rm prune clean each conflicts repos doctor shell-init completions install update version; do
   run "$PLEACH" help "$c"
   if [ "$RC" -eq 0 ] && [ -n "$OUT" ]; then
     ok "help $c: documented"
@@ -454,6 +454,19 @@ done
 run "$PLEACH" help config
 assert_rc "help config: rc 0" "$RC" 0
 assert_contains "help config: documents PLEACH_EXPECT_CANONICAL" "$OUT" "PLEACH_EXPECT_CANONICAL"
+assert_contains "help config: documents PLEACH_NO_STATUS" "$OUT" "PLEACH_NO_STATUS"
+
+run "$PLEACH" help open
+assert_rc "help open: rc 0" "$RC" 0
+assert_contains "help open: documents PLEACH_NO_STATUS" "$OUT" "PLEACH_NO_STATUS"
+
+# The synopsis already advertises [<session>|--all]; the flag list below it is the
+# only place an agent (or a person) will learn --all takes no session name and
+# works from inside a session too, since skill_doc() only names --json and
+# --exit-code.
+run "$PLEACH" help status
+assert_rc "help status: rc 0" "$RC" 0
+assert_contains "help status: documents --all" "$OUT" "--all"
 
 run "$PLEACH" help nonsense
 assert_rc "help nonsense: non-zero rc" "$RC" 1
@@ -549,6 +562,9 @@ header "Test 23: completions"
 run "$PLEACH" completions bash
 assert_rc "completions bash: rc 0" "$RC" 0
 assert_contains "completions bash: registers the completion" "$OUT" "complete -F _pleach pleach"
+# status is a real dispatcher command like sync or rm; leaving it out of the
+# completion list is the same defect as leaving it out of help.
+assert_contains "completions bash: lists status among the commands" "$OUT" "status"
 printf '%s' "$OUT" > "$SANDBOX/completions.bash"
 assert_true "completions bash: the emitted script is valid shell" \
   bash -n "$SANDBOX/completions.bash"
@@ -556,6 +572,7 @@ assert_true "completions bash: the emitted script is valid shell" \
 run "$PLEACH" completions zsh
 assert_rc "completions zsh: rc 0" "$RC" 0
 assert_contains "completions zsh: registers the completion" "$OUT" "compdef _pleach pleach"
+assert_contains "completions zsh: lists status among the commands" "$OUT" "status"
 
 run "$PLEACH" completions fish
 assert_rc "completions fish: non-zero rc for an unsupported shell" "$RC" 1
@@ -2217,6 +2234,410 @@ run bash -c "$PIN10 '$PLEACH' new clean --no-bootstrap"
 assert_rc "pending: clean created" "$RC" 0
 run bash -c "$PIN10 '$PLEACH' prune"
 assert_contains "pending: an untouched session is still removable" "$OUT" "clean — fully integrated"
+
+# ---------------------------------------------------------------------------
+header "Test 54: status reports how far behind the local canonical each repo is"
+# ---------------------------------------------------------------------------
+# The signal exists so the person inside a session can decide whether now is the
+# moment to integrate — never to integrate for them. It is per repo because a
+# session touching only the api does not care that the docs moved.
+
+MINI11=$(cd "$SANDBOX" && mkdir -p stale && cd stale && pwd)
+setup_repo "$MINI11/canon"
+echo "# canon" > "$MINI11/canon/README.md"
+git -C "$MINI11/canon" add -A && git -C "$MINI11/canon" commit -q -m "initial"
+setup_repo "$MINI11/canon/api"
+echo "api" > "$MINI11/canon/api/f.txt"
+git -C "$MINI11/canon/api" add -A && git -C "$MINI11/canon/api" commit -q -m "initial"
+setup_repo "$MINI11/canon/web"
+echo "web" > "$MINI11/canon/web/f.txt"
+git -C "$MINI11/canon/web" add -A && git -C "$MINI11/canon/web" commit -q -m "initial"
+
+# A repo still on master has no 'main' to be behind of. add_wt already cuts the
+# session from that repo's own branch; the report must skip it, not error on it.
+git init -q -b master "$MINI11/canon/legacy"
+git -C "$MINI11/canon/legacy" config user.email "test@test"
+git -C "$MINI11/canon/legacy" config user.name "test"
+echo "legacy" > "$MINI11/canon/legacy/f.txt"
+git -C "$MINI11/canon/legacy" add -A && git -C "$MINI11/canon/legacy" commit -q -m "initial"
+
+PIN11="env PLEACH_CANONICAL=$MINI11/canon PLEACH_EXPECT_CANONICAL=$MINI11/canon"
+S11="$MINI11/.sessions"
+
+run bash -c "$PIN11 '$PLEACH' new work --no-bootstrap"
+assert_rc "status: session created" "$RC" 0
+
+run bash -c "$PIN11 '$PLEACH' status work"
+assert_rc "status: rc 0 when in date" "$RC" 0
+assert_contains "status: says so in one line" "$OUT" "(up to date with the local main)"
+assert_not_contains "status: no per-repo lines when in date" "$OUT" "commit(s) behind"
+
+# The canonical moves — twice in the root, once in api, not at all in web.
+git -C "$MINI11/canon" commit -q --allow-empty -m "canon root moves"
+git -C "$MINI11/canon" commit -q --allow-empty -m "canon root moves again"
+git -C "$MINI11/canon/api" commit -q --allow-empty -m "api moves"
+
+run bash -c "$PIN11 '$PLEACH' status work"
+assert_rc "status: rc 0 even when behind — it is a report, not a check" "$RC" 0
+assert_contains "status: the root's distance" "$OUT" "root: 2 commit(s) behind"
+assert_contains "status: api's distance" "$OUT" "api: 1 commit(s) behind"
+assert_not_contains "status: web is in date, so it is not listed" "$OUT" "web:"
+assert_not_contains "status: no in-date line while something is behind" "$OUT" "up to date"
+assert_not_contains "status: a repo with no base to measure is skipped" "$OUT" "legacy"
+assert_not_contains "status: it reports, it does not instruct" "$OUT" "pleach sync"
+
+# The branch a session was NAMED after is not the branch it is on: 3 of 10 root
+# worktrees on a live workspace were somewhere else. Reading refs/heads/session/<name>
+# answers about work nobody is doing.
+git -C "$MINI11/canon/web" commit -q --allow-empty -m "web moves"
+git -C "$MINI11/canon/web" commit -q --allow-empty -m "web moves again"
+
+run bash -c "$PIN11 '$PLEACH' status work"
+assert_contains "status: web is behind while it sits on session/work" "$OUT" "web: 2 commit(s) behind"
+
+# Same session, same named branch, different HEAD — and this HEAD is caught up.
+git -C "$S11/work/web" checkout -q -b feature/live
+git -C "$S11/work/web" merge -q --no-edit main
+run bash -c "$PIN11 '$PLEACH' status work"
+assert_not_contains "status: measures the branch the worktree is ON, not session/work" \
+  "$OUT" "web:"
+assert_contains "status: and what really is behind is still reported" \
+  "$OUT" "root: 2 commit(s) behind"
+git -C "$S11/work/web" checkout -q session/work
+
+# Scope, exactly as sync resolves it.
+run bash -c "cd '$S11/work' && $PIN11 '$PLEACH' status"
+assert_rc "status: inside a session, no name is needed" "$RC" 0
+assert_contains "status: it resolved to the session it stands in" "$OUT" "● work"
+
+run bash -c "cd '$MINI11/canon' && $PIN11 '$PLEACH' status"
+assert_rc "status: no name in the canonical is a usage error" "$RC" 1
+assert_contains "status: and it says how to ask" "$OUT" "usage: pleach status"
+
+run bash -c "$PIN11 '$PLEACH' status nosuch"
+assert_rc "status: an unknown session is refused" "$RC" 1
+assert_contains "status: saying where it looked" "$OUT" "does not exist at"
+
+# -q means nothing at all, in either state — not "less output".
+run bash -c "$PIN11 '$PLEACH' status work -q"
+assert_rc "status -q: rc 0 while behind" "$RC" 0
+assert_eq "status -q: prints nothing while behind" "$OUT" ""
+run bash -c "cd '$S11/work' && $PIN11 '$PLEACH' status --quiet"
+assert_eq "status --quiet: the long spelling is the same flag" "$OUT" ""
+
+# ---------------------------------------------------------------------------
+header "Test 55: status --all sweeps every session"
+# ---------------------------------------------------------------------------
+run bash -c "$PIN11 '$PLEACH' new second --no-bootstrap"
+assert_rc "status --all: a second session created" "$RC" 0
+# 'second' was cut from the current main, so it needs the canonical to move again
+# before it has anything to be behind of.
+git -C "$MINI11/canon" commit -q --allow-empty -m "canon root moves once more"
+
+run bash -c "$PIN11 '$PLEACH' status --all"
+assert_rc "status --all: rc 0" "$RC" 0
+assert_contains "status --all: reports the first session" "$OUT" "● work"
+assert_contains "status --all: reports the second" "$OUT" "● second"
+assert_contains "status --all: the first session's root distance" "$OUT" "root: 3 commit(s) behind"
+
+run bash -c "$PIN11 '$PLEACH' status --all work"
+assert_rc "status --all with a name: refused" "$RC" 1
+assert_contains "status --all with a name: says why" "$OUT" "does not take a session name"
+
+# --all is a scope, not a place: it works from inside a session too.
+run bash -c "cd '$S11/work' && $PIN11 '$PLEACH' status --all"
+assert_rc "status --all: works from inside a session" "$RC" 0
+assert_contains "status --all: and still sees the others" "$OUT" "● second"
+
+# An empty sessions folder is not an error.
+MINI12=$(cd "$SANDBOX" && mkdir -p stale-empty && cd stale-empty && pwd)
+setup_repo "$MINI12/canon"
+echo "# canon" > "$MINI12/canon/README.md"
+git -C "$MINI12/canon" add -A && git -C "$MINI12/canon" commit -q -m "initial"
+PIN12="env PLEACH_CANONICAL=$MINI12/canon PLEACH_EXPECT_CANONICAL=$MINI12/canon"
+
+run bash -c "$PIN12 '$PLEACH' status --all"
+assert_rc "status --all: no sessions is rc 0" "$RC" 0
+assert_contains "status --all: and says the folder is empty" "$OUT" "no sessions in"
+
+# --json is the machine surface even with nothing to report: prose there would
+# break a caller parsing it.
+run bash -c "$PIN12 '$PLEACH' status --all --json"
+assert_rc "status --all --json: no sessions is still rc 0" "$RC" 0
+assert_contains "status --all --json: still carries the sessions key" "$OUT" '"sessions"'
+if command -v python3 >/dev/null 2>&1; then
+  if printf '%s' "$OUT" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+    ok "status --all --json: no sessions still parses as JSON"
+  else
+    fail "status --all --json: no sessions is not valid JSON"
+  fi
+else
+  echo "  (skipped: no python3 to validate the JSON)"
+fi
+
+# ---------------------------------------------------------------------------
+header "Test 56: --exit-code is opt-in, and -q is the silent way to ask"
+# ---------------------------------------------------------------------------
+# A report that fails is a check, and callers start wrapping it in `|| true`. The
+# exit code is therefore something you ask for, exactly as `git diff --exit-code`.
+run bash -c "$PIN11 '$PLEACH' status work --exit-code"
+assert_rc "status --exit-code: 1 when behind" "$RC" 1
+assert_contains "status --exit-code: and still prints the report" "$OUT" "commit(s) behind"
+
+run bash -c "$PIN11 '$PLEACH' status work"
+assert_rc "status: the same state without the flag is rc 0" "$RC" 0
+
+# -q on its own is covered by Test 54; what is new here is the pairing.
+run bash -c "$PIN11 '$PLEACH' status work -q --exit-code"
+assert_rc "status -q --exit-code: 1 when behind, silently" "$RC" 1
+assert_eq "status -q --exit-code: still prints nothing" "$OUT" ""
+
+# A session cut from the current base has nothing to be behind of.
+run bash -c "$PIN11 '$PLEACH' new fresh --no-bootstrap"
+assert_rc "status: a fresh session created" "$RC" 0
+run bash -c "$PIN11 '$PLEACH' status fresh --exit-code"
+assert_rc "status --exit-code: 0 when nothing is behind" "$RC" 0
+run bash -c "$PIN11 '$PLEACH' status fresh -q --exit-code"
+assert_rc "status -q --exit-code: 0 when nothing is behind" "$RC" 0
+assert_eq "status -q: silent in that case too" "$OUT" ""
+
+# ---------------------------------------------------------------------------
+header "Test 57: status --json is the machine surface"
+# ---------------------------------------------------------------------------
+MINI13=$(cd "$SANDBOX" && mkdir -p stale-json && cd stale-json && pwd)
+setup_repo "$MINI13/canon"
+echo "# canon" > "$MINI13/canon/README.md"
+git -C "$MINI13/canon" add -A && git -C "$MINI13/canon" commit -q -m "initial"
+setup_repo "$MINI13/canon/api"
+echo "api" > "$MINI13/canon/api/f.txt"
+git -C "$MINI13/canon/api" add -A && git -C "$MINI13/canon/api" commit -q -m "initial"
+setup_repo "$MINI13/canon/web"
+echo "web" > "$MINI13/canon/web/f.txt"
+git -C "$MINI13/canon/web" add -A && git -C "$MINI13/canon/web" commit -q -m "initial"
+git init -q -b master "$MINI13/canon/legacy"
+git -C "$MINI13/canon/legacy" config user.email "test@test"
+git -C "$MINI13/canon/legacy" config user.name "test"
+echo "legacy" > "$MINI13/canon/legacy/f.txt"
+git -C "$MINI13/canon/legacy" add -A && git -C "$MINI13/canon/legacy" commit -q -m "initial"
+PIN13="env PLEACH_CANONICAL=$MINI13/canon PLEACH_EXPECT_CANONICAL=$MINI13/canon"
+S13="$MINI13/.sessions"
+
+run bash -c "$PIN13 '$PLEACH' new j --no-bootstrap"
+assert_rc "status --json: session created" "$RC" 0
+git -C "$MINI13/canon" commit -q --allow-empty -m "root +1"
+git -C "$MINI13/canon/api" commit -q --allow-empty -m "api +1"
+git -C "$MINI13/canon/api" commit -q --allow-empty -m "api +2"
+
+run bash -c "$PIN13 '$PLEACH' status j --json"
+assert_rc "status --json: rc 0" "$RC" 0
+assert_contains "status --json: names the base" "$OUT" '"base": "main"'
+assert_contains "status --json: names the session" "$OUT" '"name": "j"'
+assert_contains "status --json: the session total is the sum" "$OUT" '"behind": 3'
+assert_contains "status --json: the root's distance" \
+  "$OUT" '{"repo": "root", "branch": "session/j", "behind": 1}'
+assert_contains "status --json: api's distance" \
+  "$OUT" '{"repo": "api", "branch": "session/j", "behind": 2}'
+# Measured and clean is not the same answer as not measured, so web is listed at 0
+# and legacy — which has no main to be behind of — is absent.
+assert_contains "status --json: a measured, clean repo is still listed" \
+  "$OUT" '{"repo": "web", "branch": "session/j", "behind": 0}'
+assert_not_contains "status --json: an unmeasurable repo is omitted" "$OUT" '"repo": "legacy"'
+
+# The real HEAD, here too.
+git -C "$S13/j/web" checkout -q -b feature/live
+run bash -c "$PIN13 '$PLEACH' status j --json"
+assert_contains "status --json: carries the branch the worktree is ON" "$OUT" '"branch": "feature/live"'
+git -C "$S13/j/web" checkout -q session/j
+
+# --exit-code answers the same question in either format.
+run bash -c "$PIN13 '$PLEACH' status j --json --exit-code"
+assert_rc "status --json --exit-code: 1 when behind" "$RC" 1
+run bash -c "$PIN13 '$PLEACH' new k --no-bootstrap"
+run bash -c "$PIN13 '$PLEACH' status k --json --exit-code"
+assert_rc "status --json --exit-code: 0 when nothing is behind" "$RC" 0
+
+# -q wins over --json: silence the document entirely, but never skip the
+# measurement, so --exit-code stays accurate either way.
+run bash -c "$PIN13 '$PLEACH' status j --json -q"
+assert_eq "status j --json -q: prints nothing at all" "$OUT" ""
+
+run bash -c "$PIN13 '$PLEACH' status j --json -q --exit-code"
+assert_rc "status j --json -q --exit-code: 1 when behind" "$RC" 1
+assert_eq "status j --json -q --exit-code: still prints nothing" "$OUT" ""
+
+run bash -c "$PIN13 '$PLEACH' status k --json -q --exit-code"
+assert_rc "status k --json -q --exit-code: 0 when nothing is behind" "$RC" 0
+assert_eq "status k --json -q --exit-code: still prints nothing" "$OUT" ""
+
+run bash -c "$PIN13 '$PLEACH' status --all --json"
+assert_rc "status --all --json: rc 0" "$RC" 0
+assert_contains "status --all --json: carries both sessions" "$OUT" '"name": "k"'
+
+# Valid JSON, not just a string that looks like it. Same treatment as ls --json:
+# with no parser available the assertion is skipped rather than faked.
+if command -v python3 >/dev/null 2>&1; then
+  if printf '%s' "$OUT" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+    ok "status --json: output parses as JSON"
+  else
+    fail "status --json: output is not valid JSON"
+  fi
+else
+  echo "  (skipped: no python3 to validate the JSON)"
+fi
+
+# ---------------------------------------------------------------------------
+header "Test 58: open carries the notice, and says nothing when there is none"
+# ---------------------------------------------------------------------------
+# Entering the session is the one moment the signal reaches the person deciding
+# without anyone having to remember to ask.
+run bash -c "$PIN11 '$PLEACH' open work pwd"
+assert_rc "open: rc 0" "$RC" 0
+assert_contains "open: the notice arrives on the way in" "$OUT" "commit(s) behind"
+assert_contains "open: and the command still runs in the session" "$OUT" "$S11/work"
+assert_not_contains "open: it reports, it does not instruct" "$OUT" "pleach sync"
+
+# Silence is the normal state.
+run bash -c "$PIN11 '$PLEACH' open fresh pwd"
+assert_rc "open (in date): rc 0" "$RC" 0
+assert_not_contains "open: nothing printed when every repo is in date" "$OUT" "commit(s) behind"
+assert_not_contains "open: and it does not announce being in date either" "$OUT" "up to date"
+
+# The suppressor is an env var, not a flag: everything after the session name is
+# the launched command's own argv.
+run bash -c "$PIN11 PLEACH_NO_STATUS=1 '$PLEACH' open work pwd"
+assert_rc "open PLEACH_NO_STATUS=1: rc 0" "$RC" 0
+assert_not_contains "open: PLEACH_NO_STATUS silences the notice" "$OUT" "commit(s) behind"
+assert_contains "open: and the command still runs" "$OUT" "$S11/work"
+
+
+# ---------------------------------------------------------------------------
+header "Test 59: status flag combinations no single task's tests covered"
+# ---------------------------------------------------------------------------
+# --all, --exit-code, -q and --json were each tested against the others only
+# where the task that added that flag required it. Four review passes flagged
+# the same shape of gap: the untested corners of a brand-new command's
+# interface. This test covers the combinations, not reused MINI11/MINI13 -
+# their session state has already been mutated by the tests before them.
+
+MINI14=$(cd "$SANDBOX" && mkdir -p combo && cd combo && pwd)
+setup_repo "$MINI14/canon"
+echo "# canon" > "$MINI14/canon/README.md"
+git -C "$MINI14/canon" add -A && git -C "$MINI14/canon" commit -q -m "initial"
+PIN14="env PLEACH_CANONICAL=$MINI14/canon PLEACH_EXPECT_CANONICAL=$MINI14/canon"
+
+# Named so the alphabetical order session_names walks ('adrift' before
+# 'zsynced') puts the BEHIND session first, not last: an --all implementation
+# that only remembered the last session it examined would call this
+# workspace clean, and --exit-code would wrongly return 0.
+run bash -c "$PIN14 '$PLEACH' new adrift --no-bootstrap"
+assert_rc "combo: adrift created" "$RC" 0
+git -C "$MINI14/canon" commit -q --allow-empty -m "canon moves"
+run bash -c "$PIN14 '$PLEACH' new zsynced --no-bootstrap"
+assert_rc "combo: zsynced created" "$RC" 0
+
+# Baseline, with none of the flags under test: adrift really is behind, and
+# that is the only thing --all has to report.
+run bash -c "$PIN14 '$PLEACH' status --all"
+assert_rc "combo: baseline status --all is rc 0" "$RC" 0
+assert_contains "combo: adrift is reported behind" "$OUT" "adrift"
+assert_contains "combo: it names the distance" "$OUT" "commit(s) behind"
+assert_not_contains "combo: zsynced has nothing to report" "$OUT" "zsynced"
+
+# 1. --all -q over a workspace where something IS behind: nothing at all,
+# rc 0. The harness captures stdout and stderr combined, so an empty $OUT
+# here is a real claim of total silence, not just an empty stdout.
+run bash -c "$PIN14 '$PLEACH' status --all -q"
+assert_rc "combo: --all -q is rc 0 even though adrift is behind" "$RC" 0
+assert_eq "combo: --all -q prints nothing" "$OUT" ""
+
+# 2. --all --exit-code: 1 when ANY session is behind, including the one
+# examined first rather than last.
+run bash -c "$PIN14 '$PLEACH' status --all --exit-code"
+assert_rc "combo: --all --exit-code is 1 - the non-last session is the one behind" "$RC" 1
+
+# The negative, in its own clean workspace: nothing behind must not trip
+# --exit-code either.
+MINI15=$(cd "$SANDBOX" && mkdir -p combo-clean && cd combo-clean && pwd)
+setup_repo "$MINI15/canon"
+echo "# canon" > "$MINI15/canon/README.md"
+git -C "$MINI15/canon" add -A && git -C "$MINI15/canon" commit -q -m "initial"
+PIN15="env PLEACH_CANONICAL=$MINI15/canon PLEACH_EXPECT_CANONICAL=$MINI15/canon"
+run bash -c "$PIN15 '$PLEACH' new one --no-bootstrap"
+assert_rc "combo-clean: one created" "$RC" 0
+run bash -c "$PIN15 '$PLEACH' new two --no-bootstrap"
+assert_rc "combo-clean: two created" "$RC" 0
+run bash -c "$PIN15 '$PLEACH' status --all --exit-code"
+assert_rc "combo-clean: --all --exit-code is 0 - nothing is behind" "$RC" 0
+
+# 3. --all --json -q over a NON-EMPTY session set: still silent, still rc 0 -
+# and --exit-code still reports the same 1 while printing nothing at all.
+run bash -c "$PIN14 '$PLEACH' status --all --json -q"
+assert_rc "combo: --all --json -q is rc 0" "$RC" 0
+assert_eq "combo: --all --json -q prints nothing" "$OUT" ""
+
+run bash -c "$PIN14 '$PLEACH' status --all --json -q --exit-code"
+assert_rc "combo: --all --json -q --exit-code is 1 - adrift is still behind" "$RC" 1
+assert_eq "combo: --all --json -q --exit-code still prints nothing" "$OUT" ""
+
+# 4. -q on the zero-sessions --all --json case: still silent, still rc 0.
+MINI16=$(cd "$SANDBOX" && mkdir -p combo-empty && cd combo-empty && pwd)
+setup_repo "$MINI16/canon"
+echo "# canon" > "$MINI16/canon/README.md"
+git -C "$MINI16/canon" add -A && git -C "$MINI16/canon" commit -q -m "initial"
+PIN16="env PLEACH_CANONICAL=$MINI16/canon PLEACH_EXPECT_CANONICAL=$MINI16/canon"
+
+# Without -q this path prints the JSON document, per Test 55; with it,
+# nothing - proof this is a real check, not a vacuous one.
+run bash -c "$PIN16 '$PLEACH' status --all --json"
+assert_rc "combo-empty: --all --json with no sessions is rc 0" "$RC" 0
+assert_contains "combo-empty: it is the JSON document" "$OUT" '"sessions"'
+
+run bash -c "$PIN16 '$PLEACH' status --all --json -q"
+assert_rc "combo-empty: --all --json -q is rc 0" "$RC" 0
+assert_eq "combo-empty: --all --json -q prints nothing" "$OUT" ""
+
+# ---------------------------------------------------------------------------
+header "Test 60: a directory in the sessions folder that status could not measure"
+# ---------------------------------------------------------------------------
+# cmd_status only checks [ -d "$SESSIONS/$name" ], which a bare directory passes
+# as easily as a real session whose worktrees were later deleted. session_behind
+# already tells "nothing to see" from "we could not look" apart; before this fix
+# cmd_status collapsed the two and printed "(up to date with the local main)" at
+# rc 0 for a name that was never a session at all. Its own sandbox, not MINI14's
+# mutated one — Test 59's pattern.
+
+MINI17=$(cd "$SANDBOX" && mkdir -p unmeasurable && cd unmeasurable && pwd)
+setup_repo "$MINI17/canon"
+echo "# canon" > "$MINI17/canon/README.md"
+git -C "$MINI17/canon" add -A && git -C "$MINI17/canon" commit -q -m "initial"
+PIN17="env PLEACH_CANONICAL=$MINI17/canon PLEACH_EXPECT_CANONICAL=$MINI17/canon"
+S17="$MINI17/.sessions"
+
+run bash -c "$PIN17 '$PLEACH' new real --no-bootstrap"
+assert_rc "unmeasurable: a real session exists alongside it" "$RC" 0
+
+mkdir -p "$S17/bare"
+
+run bash -c "$PIN17 '$PLEACH' status bare"
+assert_rc "unmeasurable: rc 0 - we simply do not know, we are not refusing" "$RC" 0
+assert_not_contains "unmeasurable: never claims it is up to date" "$OUT" "up to date"
+assert_eq "unmeasurable: says nothing at all rather than something false" "$OUT" ""
+
+run bash -c "$PIN17 '$PLEACH' status bare --json"
+assert_rc "unmeasurable --json: rc 0" "$RC" 0
+assert_not_contains "unmeasurable --json: omitted from sessions, like an unmeasurable repo" \
+  "$OUT" '"name": "bare"'
+assert_contains "unmeasurable --json: still the JSON document" "$OUT" '"sessions"'
+
+run bash -c "$PIN17 '$PLEACH' status bare --exit-code"
+assert_rc "unmeasurable --exit-code: 0 - nothing is behind, we do not know" "$RC" 0
+
+# The negative alone would pass against a status that had simply stopped
+# working: a real session in the same workspace must still report normally.
+run bash -c "$PIN17 '$PLEACH' status real"
+assert_rc "unmeasurable: a real session is unaffected" "$RC" 0
+assert_contains "unmeasurable: and reports up to date for real, correctly" \
+  "$OUT" "(up to date with the local main)"
 
 # ---------------------------------------------------------------------------
 # Summary

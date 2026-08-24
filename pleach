@@ -12,7 +12,7 @@
 # shellcheck disable=SC2015  # deliberate idiom: [ -z "$x" ] && x=… || err (err never runs after an assignment)
 set -euo pipefail
 
-PLEACH_VERSION="2.2.0"
+PLEACH_VERSION="2.3.0"
 
 CONF_NAME=".pleach.conf"
 USER_CONF="$HOME/.config/pleach/config"
@@ -923,6 +923,18 @@ cmd_open() {
   # 'pleach open x code' → VS Code on the session's multi-root workspace (SCM for
   # every repo); with extra args, the literal command is honoured.
   [ "$1" = "code" ] && [ $# -eq 1 ] && set -- code "$dir.code-workspace"
+  # The one moment the notice reaches the person deciding without anyone remembering
+  # to ask. Silence is the normal state: nothing is printed when every repo is in
+  # date, and nothing is ever recommended — being behind is not being about to
+  # conflict.
+  #
+  # The suppressor is an env var and not a flag on purpose: everything past the
+  # session name is the launched command's own argv, and eating a lookalike out of it
+  # would change what the caller asked to run (see --create at the top of this
+  # function).
+  if [ -z "${PLEACH_NO_STATUS:-}" ]; then
+    status_report "$name" 0 || true
+  fi
   info "opening in $dir: $*"
   exec "$@"
 }
@@ -1151,6 +1163,157 @@ cmd_sync() {
       || err "usage: pleach sync <session> [--rebase] [--fetch] [--dry-run]  (or --all)"
   fi
   sync_session "$name" "$do_fetch" "$mode" "$any_branch" "$dry"
+}
+
+# ---------------------------------------------------------------------------
+# Staleness — how far a session has drifted from the LOCAL canonical
+# ---------------------------------------------------------------------------
+session_behind() { # $1 name — echoes "<label>\t<behind>" per measurable worktree
+  # Measured against the worktree's REAL HEAD, never refs/heads/session/<name>. A
+  # worktree sitting on a PR branch or a detached bisect is ordinary — 3 of 10 root
+  # worktrees and 20 of 81 sub-worktrees on a live workspace were somewhere else —
+  # and asking the named branch answers about work nobody is doing. Same reason
+  # session_head_ref exists.
+  #
+  # A worktree that cannot be measured is OMITTED, never reported as 0. "Nothing to
+  # see" and "we could not look" are different answers, and only the second one is
+  # doctor's business.
+  local dir="$SESSIONS/$1" s wt behind
+  local -a present=()
+  while IFS= read -r s; do [ -n "$s" ] && present+=("$s"); done < <(session_subs "$dir")
+  for s in "" ${present[@]+"${present[@]}"}; do
+    wt="$dir${s:+/$s}"
+    [ -e "$wt/.git" ] || continue
+    # $BASE is not universal: a repo still on master has no 'main' to be behind of,
+    # and add_wt already cuts such a session from that repo's own branch.
+    git -C "$wt" rev-parse --verify --quiet "$BASE^{commit}" >/dev/null 2>&1 || continue
+    behind=$(git -C "$wt" rev-list --count "HEAD..$BASE" 2>/dev/null) || continue
+    printf '%s\t%s\n' "${s:-root}" "${behind:-0}"
+  done
+}
+
+status_report() { # $1 name, $2 quiet(0|1)
+  # rc 0 = measured, nothing behind. rc 1 = measured, something behind (the polarity
+  # is git's, not an accident: `git diff --exit-code` returns 1 for "there is a
+  # difference" and --exit-code hands this straight back to the caller). rc 2 =
+  # session_behind produced no lines at all — nothing here could be measured, which
+  # is a different answer from "measured and clean" and callers must tell them apart
+  # rather than assert the session is up to date.
+  local name="$1" quiet="${2:-0}" label behind titled=0 rc=0 measured=0
+  while IFS=$'\t' read -r label behind; do
+    [ -n "$label" ] || continue
+    measured=1
+    [ "${behind:-0}" -gt 0 ] || continue
+    rc=1
+    if [ "$quiet" -eq 0 ]; then
+      if [ "$titled" -eq 0 ]; then
+        echo "● $name  (behind the local $BASE)"
+        titled=1
+      fi
+      printf '    %s: %s commit(s) behind\n' "$label" "$behind"
+    fi
+  done < <(session_behind "$name")
+  [ "$measured" -eq 1 ] || return 2
+  return "$rc"
+}
+
+status_json() { # $@ = session names — rc 1 when something is behind, as status_report
+  local first=1 n label behind total repos sub branch any=0 measured=0
+  printf '{\n'
+  printf '  "base": "%s",\n' "$(json_escape "$BASE")"
+  printf '  "sessions": [\n'
+  for n in "$@"; do
+    repos=""
+    total=0
+    measured=0
+    while IFS=$'\t' read -r label behind; do
+      [ -n "$label" ] || continue
+      measured=1
+      total=$((total + behind))
+      # Every MEASURED repo appears, behind or not: a consumer filtering the list has
+      # to tell "measured and clean" from "not measured". session_behind has already
+      # dropped the ones that could not be measured.
+      sub=""
+      [ "$label" = "root" ] || sub="$label"
+      branch=$(short_ref "$(session_head_ref "$n" "$sub")")
+      repos="$repos${repos:+, }"
+      repos="$repos{\"repo\": \"$(json_escape "$label")\", \"branch\": \"$(json_escape "$branch")\", \"behind\": $behind}"
+    done < <(session_behind "$n")
+    # A session with no measurable repo at all is omitted from the array entirely,
+    # the same rule one level down: "measured and clean" (behind: 0) and "could not
+    # be measured" (omitted) must stay tellable apart, here for sessions too.
+    [ "$measured" -eq 1 ] || continue
+    [ "$total" -gt 0 ] && any=1
+    [ "$first" -eq 1 ] || printf ',\n'
+    first=0
+    printf '    {"name": "%s", "behind": %s, "repos": [%s]}' \
+      "$(json_escape "$n")" "$total" "$repos"
+  done
+  printf '\n  ]\n}\n'
+  return "$any"
+}
+
+cmd_status() {
+  local name="" quiet=0 all=0 exit_code=0 as_json=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all)      all=1 ;;
+      --json)     as_json=1 ;;
+      --exit-code) exit_code=1 ;;
+      -q|--quiet) quiet=1 ;;
+      -*)         err "unknown flag: $1 (usage: pleach status [<session>|--all] [--json] [--exit-code] [-q])" ;;
+      *)          [ -z "$name" ] && name="$1" || err "too many arguments" ;;
+    esac
+    shift
+  done
+  load_config
+
+  local -a targets=()
+  local n
+  if [ "$all" -eq 1 ]; then
+    [ -z "$name" ] || err "--all does not take a session name"
+    while IFS= read -r n; do [ -n "$n" ] && targets+=("$n"); done < <(session_names)
+    if [ ${#targets[@]} -eq 0 ]; then
+      if [ "$quiet" -eq 0 ]; then
+        if [ "$as_json" -eq 1 ]; then status_json || true; else echo "(no sessions in $SESSIONS)"; fi
+      fi
+      return 0
+    fi
+  else
+    if [ -z "$name" ]; then
+      name=$(detect_session_name 2>/dev/null) \
+        || err "usage: pleach status <session> [--exit-code] [-q]  (or --all)"
+    fi
+    [ -d "$SESSIONS/$name" ] || err "session '$name' does not exist at $SESSIONS/$name"
+    targets=("$name")
+  fi
+
+  local behind_rc=0
+  if [ "$as_json" -eq 1 ]; then
+    # -q wins over --json: silence the document, but still measure, so
+    # --exit-code stays accurate whether or not anything gets printed.
+    if [ "$quiet" -eq 1 ]; then
+      status_json ${targets[@]+"${targets[@]}"} >/dev/null || behind_rc=1
+    else
+      status_json ${targets[@]+"${targets[@]}"} || behind_rc=1
+    fi
+  else
+    local measured_any=0 rc
+    for n in ${targets[@]+"${targets[@]}"}; do
+      rc=0
+      status_report "$n" "$quiet" || rc=$?
+      # rc 2 means nothing in this "session" could be measured at all -- say nothing
+      # about it, and do not let it count towards (or against) "up to date".
+      [ "$rc" -eq 2 ] && continue
+      measured_any=1
+      [ "$rc" -eq 1 ] && behind_rc=1
+    done
+    if [ "$behind_rc" -eq 0 ] && [ "$quiet" -eq 0 ] && [ "$measured_any" -eq 1 ]; then
+      echo "(up to date with the local $BASE)"
+    fi
+  fi
+  if [ "$exit_code" -eq 1 ]; then return "$behind_rc"; fi
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -1783,7 +1946,7 @@ cmd_completions() {
     bash) cat <<'EOF'
 # pleach bash completion. Add to ~/.bashrc:
 #   eval "$(pleach completions bash)"
-_pleach_commands="init new open ls add sync rm prune clean each conflicts repos path cd doctor skill completions shell-init install update version help"
+_pleach_commands="init new open ls add sync status rm prune clean each conflicts repos path cd doctor skill completions shell-init install update version help"
 _pleach_sessions() { pleach ls --json 2>/dev/null | sed -nE 's/.*"name": "([^"]+)".*/\1/p'; }
 _pleach() {
   local cur="${COMP_WORDS[COMP_CWORD]}"
@@ -1792,7 +1955,7 @@ _pleach() {
     return
   fi
   case "${COMP_WORDS[1]}" in
-    open|sync|rm|clean|add|path|cd)
+    open|sync|status|rm|clean|add|path|cd)
       [ "$COMP_CWORD" -eq 2 ] && COMPREPLY=($(compgen -W "$(_pleach_sessions)" -- "$cur")) ;;
     help)        COMPREPLY=($(compgen -W "$_pleach_commands config" -- "$cur")) ;;
     completions) COMPREPLY=($(compgen -W "bash zsh" -- "$cur")) ;;
@@ -1806,13 +1969,13 @@ EOF
 #   eval "$(pleach completions zsh)"
 _pleach() {
   local -a cmds
-  cmds=(init new open ls add sync rm prune clean each conflicts repos path cd doctor skill completions shell-init install update version help)
+  cmds=(init new open ls add sync status rm prune clean each conflicts repos path cd doctor skill completions shell-init install update version help)
   if (( CURRENT == 2 )); then
     _describe 'pleach command' cmds
     return
   fi
   case "${words[2]}" in
-    open|sync|rm|clean|add|path|cd)
+    open|sync|status|rm|clean|add|path|cd)
       (( CURRENT == 3 )) && _values 'session' ${(f)"$(pleach ls --json 2>/dev/null | sed -nE 's/.*"name": "([^"]+)".*/\1/p')"} ;;
     help)        _values 'topic' $cmds config ;;
     completions) _values 'shell' bash zsh ;;
@@ -2545,6 +2708,12 @@ session is invisible to yours by construction.
   name, the same port hardcoded twice: all merge clean and none of them show up
   here. A green answer from a check whose scope does not cover your question is
   not evidence.
+- `pleach status` — how far behind the canonical's LOCAL base each repo of a session is,
+  measured on the branch the worktree is ON. The canonical moves when someone pulls there,
+  and nothing inside a session notices. `pleach open` reports this on the way in; ask
+  directly when you have been working a while. It is a report, not an instruction:
+  being behind is not being about to conflict, and whether to `sync` is the human's call.
+  `--json` and `--exit-code` for scripting; it exits 0 without the latter.
 - `pleach each '<command>'` — runs it in the canonical and in every session ROOT.
   Add `--repos` to descend into every mounted sub-repo as well; without it, a
   composite workspace answers for the root worktree only. Use it before claiming any
@@ -2773,6 +2942,7 @@ Sessions
   path [<session>]          Print where a session lives (--canonical for the canonical).
   add [<session>] <sub …>   Mount sub-repos into an existing session.
   sync [<session>|--all]    Bring the canonical's local main into the session's branches.
+  status [<session>|--all]  How far behind the canonical's local main each of the session's repos is.
   rm <name> [--force] [--reap]  Remove the session. Refuses when work is pending.
   prune [--apply]           List (and with --apply remove) fully integrated sessions.
   clean [<session>]         Delete git-ignored artifacts (node_modules, builds…).
@@ -2848,6 +3018,9 @@ The block gives the root PORT and every sub-repo its own PLEACH_PORT_<SUB>, so a
 workspace with three services can run all three at once. They read $PORT, so point
 each one at its own variable (PORT=$PLEACH_PORT_API npm run dev, or a two-line
 dev script) — pleach allocates the ports, it does not start your servers.
+
+On the way in it reports any repo of the session that is behind the canonical's local
+base, and says nothing when none are. Set PLEACH_NO_STATUS=1 to suppress it.
 EOF
     ;;
     ls) cat <<'EOF'
@@ -2913,6 +3086,32 @@ Safety rules (a skipped repo never blocks the others):
 
 With no name and outside a session it is an error. Inside a session, the name is
 inferred.
+EOF
+    ;;
+    status) cat <<'EOF'
+pleach status [<session>|--all] [--json] [--exit-code] [-q]
+
+How far behind the canonical's LOCAL base each of the session's repos has drifted.
+Per repo, because a session touching only the api does not care that the docs moved.
+
+  <session>    Defaults to the session containing the current directory. Outside a
+               session the name is required.
+  --all        Every session. Takes no session name, and is accepted from inside a
+               session too.
+  -q, --quiet  Print nothing.
+  --exit-code  Return 1 when something is behind (as `git diff --exit-code`).
+  --json       The machine surface: every measured repo, behind or not.
+
+Only the repos that are behind are listed; when none are, it says so in one line and
+nothing else. It measures the branch each worktree is really ON, not the branch the
+session was named after.
+
+It exits 0 whether or not anything is behind, unless you ask for --exit-code. It is a
+report: it tells you the number and the place, and leaves the decision to sync — or
+not to — with you.
+
+Never reaches for origin. The target is the base ref in your canonical checkout, which
+moves when you pull there and at no other time.
 EOF
     ;;
     rm) cat <<'EOF'
@@ -3244,9 +3443,12 @@ Guard rail for automation/harnesses (env, not conf):
                                   path, pleach aborts before any write. Mandatory
                                   in test scripts — it stops a wrong cwd from
                                   resolving to your real workspace.
+  PLEACH_NO_STATUS=1              Suppresses the behind-the-base report `open` prints
+                                  on the way in. A flag would be ambiguous: everything
+                                  after the session name is the launched command's argv.
 EOF
     ;;
-    *) err "no help for '$1' (commands: init new open ls path cd add sync rm prune clean each conflicts repos doctor shell-init completions install update version; topics: config)" ;;
+    *) err "no help for '$1' (commands: init new open ls path cd add sync status rm prune clean each conflicts repos doctor shell-init completions install update version; topics: config)" ;;
   esac
 }
 
@@ -3263,6 +3465,7 @@ case "$cmd" in
   open)    cmd_open "$@" ;;
   add)     cmd_add "$@" ;;
   sync)    cmd_sync "$@" ;;
+  status)  cmd_status "$@" ;;
   repos)   cmd_repos "$@" ;;
   rm)      cmd_rm "$@" ;;
   prune)   cmd_prune "$@" ;;
@@ -3280,5 +3483,5 @@ case "$cmd" in
   update)  cmd_update "$@" ;;
   version|--version|-V) echo "pleach $PLEACH_VERSION" ;;
   help|-h|--help) cmd_help "$@" ;;
-  *) err "unknown command: $cmd (init|new|open|add|sync|repos|rm|prune|clean|each|ls|path|cd|doctor|conflicts|skill|completions|shell-init|install|update|version|help)" ;;
+  *) err "unknown command: $cmd (init|new|open|add|sync|status|repos|rm|prune|clean|each|ls|path|cd|doctor|conflicts|skill|completions|shell-init|install|update|version|help)" ;;
 esac
