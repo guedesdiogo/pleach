@@ -619,9 +619,15 @@ run_bootstrap() { # $1 session dir, $2 sub ("" = whole session)
     # sh -c '…' _ <path>: the path arrives as "$1". Avoids `xargs -I{}`, whose
     # substitution is capped at 255 bytes in BSD xargs (macOS) and blows up with
     # "command line cannot be assembled" on long paths.
+    # --no-save where the repo has no bun lockfile: a plain `bun install` in an npm,
+    # pnpm or yarn repo writes a bun.lock the repo does not track, and that untracked
+    # file is "uncommitted work" to rm and prune — a session created that way could
+    # not be pruned without --force, because of its own bootstrap.
     # shellcheck disable=SC2016  # single quotes deliberate: $1 expands in the child sh
     find "$target" -maxdepth "$depth" -name package.json -not -path '*/node_modules/*' -print0 \
-      | xargs -0 -n1 -P 4 sh -c 'd=$(dirname "$1"); cd "$d" && bun install --silent >/dev/null 2>&1 || echo "  ⚠ bun install failed in $d"' _ \
+      | xargs -0 -n1 -P 4 sh -c 'd=$(dirname "$1"); cd "$d" || exit 0
+          save=--no-save; if [ -e bun.lock ] || [ -e bun.lockb ]; then save=; fi
+          bun install --silent $save >/dev/null 2>&1 || echo "  ⚠ bun install failed in $d"' _ \
       || warn "there were bootstrap failures — check by hand"
   else
     info "no bootstrap (define pleach_bootstrap in $CONF_NAME if the project needs one)"
@@ -684,7 +690,8 @@ $subs_line
 # PLEACH_SECRETS_EXTRA=()
 
 # Post-creation bootstrap (\$1 = session folder, \$2 = sub being mounted, or empty
-# for the whole session). Default: bun install wherever there is a package.json.
+# for the whole session). Default: bun install wherever there is a package.json
+# (--no-save where the repo has no bun lockfile, so none is written).
 # pleach_bootstrap() {
 #   (cd app && npm install)
 # }
@@ -1484,8 +1491,10 @@ session_problems() { # $1 name — echoes pending work (one per line); rc 0 if n
       echo "$label: uncommitted or untracked changes"
       count=$((count + 1))
     fi
+    # rev-list first: it is cheap and settles the common case, so session_landed
+    # (a merge-tree) only runs for branches that do have commits outside the base.
     ahead=$(git -C "$repo" rev-list --count "$BASE..$branch" 2>/dev/null || echo 0)
-    if [ "${ahead:-0}" -gt 0 ]; then
+    if [ "${ahead:-0}" -gt 0 ] && ! session_landed "$repo" "$branch"; then
       echo "$label: $ahead commit(s) on $branch not integrated into $BASE"
       count=$((count + 1))
     fi
@@ -1498,7 +1507,7 @@ session_problems() { # $1 name — echoes pending work (one per line); rc 0 if n
     head_ref=$(session_head_ref "$name" "$s")
     if [ "$head_ref" != "$branch" ]; then
       ahead=$(git -C "$repo" rev-list --count "$BASE..$head_ref" 2>/dev/null || echo 0)
-      if [ "${ahead:-0}" -gt 0 ]; then
+      if [ "${ahead:-0}" -gt 0 ] && ! session_landed "$repo" "$head_ref"; then
         if git -C "$repo" show-ref --verify --quiet "refs/heads/$head_ref"; then
           echo "$label: $ahead commit(s) on $head_ref not integrated into $BASE"
         else
@@ -1570,12 +1579,14 @@ cmd_rm() {
   unlock
 
   # Branches: delete only the ones fully integrated into $BASE; keep the rest.
-  # (merge-base rather than `branch -d`: -d compares against the canonical repo's
-  #  current HEAD, which may sit on some unrelated working branch.)
+  # (session_landed rather than `branch -d`: -d compares against the canonical
+  #  repo's current HEAD, which may sit on some unrelated working branch, and it
+  #  cannot see a squash — prune would call a session removable and rm would then
+  #  keep its branch as "unintegrated".)
   for s in "" ${present[@]+"${present[@]}"}; do
     repo=$(repo_path "$s"); label="${s:-root}"
     git -C "$repo" show-ref --verify --quiet "refs/heads/$branch" || continue
-    if git -C "$repo" merge-base --is-ancestor "$branch" "$BASE" 2>/dev/null; then
+    if session_landed "$repo" "$branch"; then
       git -C "$repo" branch -D "$branch" >/dev/null 2>&1 || true
       info "$label: branch $branch deleted (integrated into $BASE)"
     else
@@ -2018,14 +2029,26 @@ EOF
 }
 
 session_landed() { # 0 when $2's work is already in $BASE, judged inside repo $1
-  # Two shapes, and only one of them is exact. A true merge makes the branch an
-  # ancestor of the base, which is decidable. A squash or a rebase does not, and
-  # then the only evidence left is that branch and base now hold the same content
-  # — true right after the landing, and no longer true once the base moves on.
-  # The residual is stated in `help conflicts` rather than implied by silence.
+  # A true merge makes the branch an ancestor of the base, which is exact. A squash
+  # or a rebase does not, and then the evidence is content: merging the branch
+  # into the base would change nothing. That still holds after the base moves on,
+  # which a plain "branch and base are identical" check does not — measured on a
+  # live workspace: three squash-merged PR branches, content already in the base,
+  # all read as unintegrated work once other merges landed, so prune kept the
+  # session indefinitely.
+  # Two residuals, both on the side of keeping work: git older than 2.38 has no
+  # `merge-tree --write-tree`, and a base that later edited the same lines makes
+  # the merge conflict — either way the answer is "not landed". The converse is
+  # deliberate: a branch whose commits cancel out also changes nothing, and there
+  # is no content to lose. Objects the merge writes are left to gc, as in
+  # conflict_detail.
+  local merged base_tree
   git -C "$1" show-ref --verify --quiet "refs/heads/$BASE" || return 1
   git -C "$1" merge-base --is-ancestor "$2" "$BASE" 2>/dev/null && return 0
-  git -C "$1" diff --quiet "$BASE" "$2" 2>/dev/null
+  git -C "$1" diff --quiet "$BASE" "$2" 2>/dev/null && return 0
+  merged=$(git -C "$1" merge-tree --write-tree "$BASE" "$2" 2>/dev/null) || return 1
+  base_tree=$(git -C "$1" rev-parse --verify --quiet "$BASE^{tree}") || return 1
+  [ "${merged%%$'\n'*}" = "$base_tree" ]
 }
 
 conflict_detail() { # $1 repo, $2 merged tree, $3 path, $4 session a, $5 session b
@@ -3134,7 +3157,9 @@ which is not always the same one.
             command should do behind your back.
 
 "Integrated" is judged against the LOCAL base — if the merge only happened on the
-remote, run git fetch in the repo before rm.
+remote, run git fetch in the repo before rm. A squash or rebase merge counts: a
+branch whose merge into the base would change nothing is integrated, and its
+session/<name> branch is deleted like a merged one.
 EOF
     ;;
     prune) cat <<'EOF'
@@ -3147,6 +3172,7 @@ base on session/<name> or on the branch the worktree is actually on) and, with
 
 With no flags it is a dry run: it only lists. "Integrated" is judged against the
 LOCAL base — merges that only landed on the remote need a git fetch first.
+Squash and rebase merges count (see rm).
 EOF
     ;;
     clean) cat <<'EOF'
@@ -3223,12 +3249,13 @@ serious:
 
                    A session whose work has already LANDED is skipped, so a
                    verdict expires with the conflict it describes. Landing is
-                   decidable when it was a true merge: the branch becomes an
-                   ancestor of the base. After a SQUASH or a rebase it is not,
-                   and the fallback - branch and base holding identical content -
-                   stops being true once the base moves on. A squash-landed
-                   session can therefore still be reported; remove it with
-                   `pleach rm`.
+                   exact when it was a true merge: the branch becomes an ancestor
+                   of the base. After a SQUASH or a rebase it is judged by
+                   content - merging the branch into the base would change
+                   nothing - which survives the base moving on. It needs git
+                   >= 2.38, and a base that later edited the same lines reads as
+                   not landed; such a session can still be reported, remove it
+                   with `pleach rm`.
 
   ALSO TOUCHED     the same file appears in more than one session but git merges
                    it cleanly today -- or the work is not committed yet, so no

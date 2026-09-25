@@ -237,7 +237,7 @@ A bash file, sourced, at the canonical's root. Everything optional:
 | `PLEACH_DIR` | `<parent>/.sessions` | Where sessions live |
 | `PLEACH_PORT_START` | `10000` | Start of the port blocks (session N gets `START + N*100`) |
 | `PLEACH_SECRETS_EXTRA=(…)` | `(.claude/settings.local.json)` | Extra relative paths to copy into each session |
-| `pleach_bootstrap() {…}` | `bun install` where a `package.json` is | Post-creation hook: `npm ci`, `go mod download`, `make setup`, whatever the project needs |
+| `pleach_bootstrap() {…}` | `bun install` where a `package.json` is (`--no-save` when the repo has no bun lockfile, so an npm/pnpm/yarn repo is not left with an untracked `bun.lock`) | Post-creation hook: `npm ci`, `go mod download`, `make setup`, whatever the project needs |
 
 The canonical is resolved in order: the `PLEACH_CANONICAL` env var, then `.session-env`
 walking up from the cwd (you are inside a session), then `.pleach.conf` walking up, then
@@ -533,9 +533,12 @@ against session tip and never consulted the base, so a session whose work had al
 kept conflicting with everyone for as long as its folder existed — while the overlap table
 directly below it, which does diff against the base, had already gone quiet about the same
 file. Landed sessions are now skipped. That is exact for a true merge, where the branch
-becomes an ancestor of the base; after a **squash** it is not, and the fallback (branch and
-base holding identical content) stops being true once the base moves on. A squash-landed
-session can still be reported — remove it with `pleach rm`. Said here rather than left to be
+becomes an ancestor of the base; after a **squash** or a rebase it is judged by content —
+merging the branch into the base would change nothing — which keeps holding after the base
+moves on. The same test decides "integrated" for `rm` and `prune`, so a session whose PR was
+squash-merged is removable instead of pending forever. Two residuals, both on the side of
+keeping work: it needs git ≥ 2.38, and a base that later rewrote the same lines reads as
+not landed — remove such a session with `pleach rm`. Said here rather than left to be
 discovered.
 
 And it reads the branch each worktree is **on**, not the one the session was named after.
