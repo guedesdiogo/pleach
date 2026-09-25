@@ -2640,6 +2640,118 @@ assert_contains "unmeasurable: and reports up to date for real, correctly" \
   "$OUT" "(up to date with the local main)"
 
 # ---------------------------------------------------------------------------
+header "Test 61: a squash-merged session is integrated, even after the base moves on"
+# ---------------------------------------------------------------------------
+# A squash leaves the branch's commits outside the base forever, so rev-list
+# alone reported them as pending, and the "identical content" fallback stopped
+# holding at the next merge. Measured on a live workspace: sessions whose PRs were
+# all squash-merged stayed "pending work" in prune indefinitely. Covers the
+# session's own branch AND a PR branch the worktree was left on, then the residual
+# that must still keep work: a base that later rewrote the same lines.
+
+MINI18=$(cd "$SANDBOX" && mkdir -p squash && cd squash && pwd)
+setup_repo "$MINI18/canon"
+printf 'one\ntwo\n' > "$MINI18/canon/a.txt"
+git -C "$MINI18/canon" add -A && git -C "$MINI18/canon" commit -q -m "initial"
+PIN18="env PLEACH_CANONICAL=$MINI18/canon PLEACH_EXPECT_CANONICAL=$MINI18/canon"
+S18="$MINI18/.sessions"
+squash_in() { # $1 branch — squash-merge it into main of the canonical, as a PR would
+  git -C "$MINI18/canon" merge --squash -q "$1" >/dev/null
+  git -C "$MINI18/canon" commit -q -m "squash of $1"
+}
+
+run bash -c "$PIN18 '$PLEACH' new sq --no-bootstrap"
+assert_rc "squash: new sq" "$RC" 0
+echo "sq work" > "$S18/sq/sq.txt"
+git -C "$S18/sq" add sq.txt && git -C "$S18/sq" commit -q -m "work in sq"
+
+run bash -c "$PIN18 '$PLEACH' new pr --no-bootstrap"
+assert_rc "squash: new pr" "$RC" 0
+git -C "$S18/pr" checkout -q -b feat/pr-branch
+echo "pr work" > "$S18/pr/pr.txt"
+git -C "$S18/pr" add pr.txt && git -C "$S18/pr" commit -q -m "work on a PR branch"
+
+run bash -c "$PIN18 '$PLEACH' new clash --no-bootstrap"
+assert_rc "squash: new clash" "$RC" 0
+printf 'one\nTWO from the session\n' > "$S18/clash/a.txt"
+git -C "$S18/clash" commit -q -am "session edits line two"
+
+squash_in session/sq
+squash_in feat/pr-branch
+squash_in session/clash
+# The base moves on after all three landed — the case the old fallback missed —
+# and, for clash only, rewrites the very line the session had edited.
+echo "later" > "$MINI18/canon/later.txt"
+printf 'one\nTWO rewritten on main\n' > "$MINI18/canon/a.txt"
+git -C "$MINI18/canon" add -A && git -C "$MINI18/canon" commit -q -m "main moves on"
+
+run bash -c "$PIN18 '$PLEACH' prune"
+assert_rc "squash: prune dry run rc 0" "$RC" 0
+assert_contains "squash: the session's own squash-merged branch is removable" \
+  "$OUT" "✓ sq — fully integrated (removable)"
+assert_contains "squash: a squash-merged PR branch the worktree sits on is removable" \
+  "$OUT" "✓ pr — fully integrated (removable)"
+assert_contains "squash: a base that rewrote the same lines still reads as pending" \
+  "$OUT" "● clash — pending work:"
+
+run bash -c "$PIN18 '$PLEACH' prune --apply"
+assert_rc "squash: prune --apply rc 0" "$RC" 0
+assert_true "squash: sq removed" [ ! -e "$S18/sq" ]
+assert_true "squash: pr removed" [ ! -e "$S18/pr" ]
+assert_true "squash: clash kept - its work is not in the base" [ -d "$S18/clash" ]
+assert_true "squash: session/sq deleted like a merged branch" \
+  bash -c "! git -C '$MINI18/canon' show-ref --verify --quiet refs/heads/session/sq"
+assert_true "squash: session/clash preserved" \
+  git -C "$MINI18/canon" show-ref --verify --quiet refs/heads/session/clash
+
+# ---------------------------------------------------------------------------
+header "Test 62: the default bootstrap writes no lockfile the repo does not have"
+# ---------------------------------------------------------------------------
+# A plain `bun install` in an npm/pnpm/yarn repo writes bun.lock, untracked, and
+# rm/prune rightly treat an untracked file as pending work: the session could not
+# be pruned because of its own bootstrap. A bun double records its arguments and,
+# like the real one, writes bun.lock unless told --no-save — so the test holds on
+# runners without bun, and fails if the flag is ever dropped.
+
+MINI19=$(cd "$SANDBOX" && mkdir -p bootstrap && cd bootstrap && pwd)
+setup_repo "$MINI19/canon"
+printf '{"name":"npm-repo","version":"1.0.0"}\n' > "$MINI19/canon/package.json"
+printf '{"lockfileVersion":3}\n' > "$MINI19/canon/package-lock.json"
+mkdir -p "$MINI19/canon/bunpkg"
+printf '{"name":"bun-pkg","version":"1.0.0"}\n' > "$MINI19/canon/bunpkg/package.json"
+printf '# bun lockfile\n' > "$MINI19/canon/bunpkg/bun.lock"
+git -C "$MINI19/canon" add -A && git -C "$MINI19/canon" commit -q -m "initial"
+PIN19="env PLEACH_CANONICAL=$MINI19/canon PLEACH_EXPECT_CANONICAL=$MINI19/canon"
+S19="$MINI19/.sessions"
+
+BUNBIN="$SANDBOX/bunbin"
+mkdir -p "$BUNBIN"
+cat > "$BUNBIN/bun" <<'FAKE_BUN'
+#!/usr/bin/env bash
+# Test double for bun: logs "<dir> :: <args>", and writes bun.lock the way the
+# real `bun install` does — unless --no-save, or one is already there.
+echo "$PWD :: $*" >> "$BUN_LOG"
+case " $* " in *" --no-save "*) exit 0 ;; esac
+[ -e bun.lock ] || echo "written by bun install" > bun.lock
+FAKE_BUN
+chmod +x "$BUNBIN/bun"
+BUN_LOG="$SANDBOX/bun.log"; : > "$BUN_LOG"
+
+run bash -c "BUN_LOG='$BUN_LOG' PATH='$BUNBIN:$PATH' $PIN19 '$PLEACH' new boot"
+assert_rc "bootstrap: new boot rc 0" "$RC" 0
+assert_contains "bootstrap: repo with no bun lockfile gets --no-save" \
+  "$(cat "$BUN_LOG")" "$S19/boot :: install --silent --no-save"
+assert_contains "bootstrap: a package with bun.lock keeps a plain bun install" \
+  "$(cat "$BUN_LOG")" "$S19/boot/bunpkg :: install --silent"
+assert_not_contains "bootstrap: ...and only that one, without --no-save" \
+  "$(grep -F "$S19/boot/bunpkg ::" "$BUN_LOG")" "--no-save"
+assert_true "bootstrap: no bun.lock written into the npm repo" [ ! -e "$S19/boot/bun.lock" ]
+
+run bash -c "$PIN19 '$PLEACH' prune"
+assert_contains "bootstrap: the fresh session is removable, not pending because of itself" \
+  "$OUT" "✓ boot — fully integrated (removable)"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
