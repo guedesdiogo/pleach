@@ -172,6 +172,11 @@ brew install guedesdiogo/tap/pleach     # completions included
 npm install -g @diogoaguedes/pleach     # or: bun add -g @diogoaguedes/pleach
 ```
 
+Homebrew installs the bash and zsh completions; Tab completes commands and session names
+alike, since `pleach <session>` is `open`. Before 2.5.0 the zsh one lacked its `#compdef`
+line and was never registered, so after upgrading from an older version rebuild zsh's
+completion cache once: `rm -f ~/.zcompdump && exec zsh`.
+
 The npm package is scoped because npm reserves the bare name `pleach`, judging it too
 close to `preact`. The command it installs is still `pleach`.
 
