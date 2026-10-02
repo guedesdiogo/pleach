@@ -471,9 +471,11 @@ assert_contains "help status: documents --all" "$OUT" "--all"
 run "$PLEACH" help nonsense
 assert_rc "help nonsense: non-zero rc" "$RC" 1
 
+# A word that is not a command is read as a session name (`pleach <session>` is
+# `open`), so the refusal has to cover both readings.
 run "$PLEACH" nonsense
 assert_rc "unknown command: non-zero rc" "$RC" 1
-assert_contains "unknown command: says so" "$OUT" "unknown command"
+assert_contains "unknown command: says so" "$OUT" "neither a command nor a session"
 
 # ---------------------------------------------------------------------------
 header "Test 19: open runs the command inside the session"
@@ -2750,6 +2752,115 @@ assert_true "bootstrap: no bun.lock written into the npm repo" [ ! -e "$S19/boot
 run bash -c "$PIN19 '$PLEACH' prune"
 assert_contains "bootstrap: the fresh session is removable, not pending because of itself" \
   "$OUT" "✓ boot — fully integrated (removable)"
+
+# ---------------------------------------------------------------------------
+header "Test 63: a session name alone is open, and flags alone are claude's"
+# ---------------------------------------------------------------------------
+# `open` is what gets typed most, so it is the default: `pleach fix-x …` is
+# `pleach open fix-x …`. And `claude -r` is what gets launched most, so flags with
+# no command in front of them go to claude — no command starts with a dash, so
+# that reading takes nothing away. A claude double prints where it ran and with
+# what, so the test holds on runners without claude.
+MINI20=$(cd "$SANDBOX" && mkdir -p implied && cd implied && pwd)
+setup_repo "$MINI20/canon"
+echo root > "$MINI20/canon/f.txt"
+git -C "$MINI20/canon" add -A && git -C "$MINI20/canon" commit -q -m initial
+printf 'PLEACH_SUBS=()\npleach_bootstrap() { :; }\n' > "$MINI20/canon/.pleach.conf"
+CLAUDEBIN="$SANDBOX/claudebin"
+mkdir -p "$CLAUDEBIN"
+cat > "$CLAUDEBIN/claude" <<'FAKE_CLAUDE'
+#!/usr/bin/env bash
+echo "claude-double in $PWD :: [$*]"
+FAKE_CLAUDE
+chmod +x "$CLAUDEBIN/claude"
+PIN20="env PATH='$CLAUDEBIN:$PATH' PLEACH_CANONICAL=$MINI20/canon PLEACH_EXPECT_CANONICAL=$MINI20/canon"
+S20="$MINI20/.sessions"
+
+run bash -c "$PIN20 '$PLEACH' new fix-login --no-bootstrap"
+assert_rc "implied: a real session exists" "$RC" 0
+
+run bash -c "$PIN20 '$PLEACH' fix-login"
+assert_rc "implied: the name alone opens it" "$RC" 0
+assert_contains "implied: with the default, inside the session" \
+  "$OUT" "claude-double in $S20/fix-login :: []"
+
+run bash -c "$PIN20 '$PLEACH' fix-login pwd"
+assert_rc "implied: with a command" "$RC" 0
+assert_contains "implied: the command runs in the session folder" "$OUT" "$S20/fix-login"
+assert_not_contains "implied: and claude is not launched in its place" "$OUT" "claude-double"
+
+run bash -c "$PIN20 '$PLEACH' fix-login -r"
+assert_rc "flags: pleach <name> -r" "$RC" 0
+assert_contains "flags: is claude -r" "$OUT" "claude-double in $S20/fix-login :: [-r]"
+
+run bash -c "$PIN20 '$PLEACH' open fix-login -r"
+assert_contains "flags: and so is pleach open <name> -r" "$OUT" "claude-double in $S20/fix-login :: [-r]"
+
+run bash -c "$PIN20 '$PLEACH' fix-login --resume abc"
+assert_contains "flags: every flag and its value go along" "$OUT" ":: [--resume abc]"
+
+# Only the FIRST word is in question: a command's own flags stay that command's.
+run bash -c "$PIN20 '$PLEACH' fix-login printf '%s\\n' -r"
+assert_rc "flags: a command's own flag" "$RC" 0
+assert_eq "flags: reaches that command untouched" "$(printf '%s\n' "$OUT" | tail -1)" "-r"
+assert_not_contains "flags: without claude stepping in" "$OUT" "claude-double"
+
+run bash -c "$PIN20 '$PLEACH' made-here --create -r"
+assert_rc "implied: --create right after the name" "$RC" 0
+assert_true "implied: builds the session" [ -d "$S20/made-here" ]
+assert_contains "implied: and then runs claude -r in it" \
+  "$OUT" "claude-double in $S20/made-here :: [-r]"
+
+# --create is pleach's only right after the name; past a flag it is claude's argv.
+run bash -c "$PIN20 '$PLEACH' fix-login -r --create"
+assert_contains "flags: a later --create is the command's, not pleach's" \
+  "$OUT" ":: [-r --create]"
+
+# A word in the command's place that is neither: a typo of either kind is
+# answered with the closest, and nothing is built for it.
+run bash -c "$PIN20 '$PLEACH' stauts"
+assert_rc "implied: a mistyped command fails" "$RC" 1
+assert_contains "implied: saying it is neither" "$OUT" "neither a command nor a session"
+assert_contains "implied: naming the command that was probably meant" "$OUT" "did you mean 'status'?"
+assert_not_contains "implied: without offering to build it anyway" "$OUT" "--create"
+assert_true "implied: and building nothing" [ ! -d "$S20/stauts" ]
+
+run bash -c "$PIN20 '$PLEACH' fix-logni"
+assert_rc "implied: a mistyped session fails" "$RC" 1
+assert_contains "implied: naming the session that was probably meant" \
+  "$OUT" "did you mean 'fix-login'?"
+assert_true "implied: building nothing for it either" [ ! -d "$S20/fix-logni" ]
+
+run bash -c "$PIN20 '$PLEACH' zzzzzzzz"
+assert_not_contains "implied: no suggestion is invented for an unrelated word" \
+  "$OUT" "did you mean"
+
+run bash -c "$PIN20 '$PLEACH' -x"
+assert_rc "implied: a dash is never a session" "$RC" 1
+assert_contains "implied: so it stays an unknown command" "$OUT" "unknown command: -x"
+
+# Without a workspace there is no session to look for: both readings are named.
+mkdir -p "$SANDBOX/noworkspace" "$SANDBOX/nohome"
+run bash -c "cd '$SANDBOX/noworkspace' && env -u PLEACH_CANONICAL -u PLEACH_EXPECT_CANONICAL HOME='$SANDBOX/nohome' '$PLEACH' stauts"
+assert_rc "implied: outside a workspace it fails" "$RC" 1
+assert_contains "implied: saying the word is no command" "$OUT" "'stauts' is not a pleach command"
+assert_contains "implied: and that there is no workspace for a session" \
+  "$OUT" "cannot tell which workspace is canonical"
+
+# A command always wins: a session named like one is reached through `open`.
+run bash -c "$PIN20 '$PLEACH' new ls --no-bootstrap"
+assert_rc "precedence: a session may be called ls" "$RC" 0
+run bash -c "$PIN20 '$PLEACH' ls"
+assert_rc "precedence: pleach ls" "$RC" 0
+assert_contains "precedence: still lists the sessions" "$OUT" "fix-login"
+assert_not_contains "precedence: instead of opening the one named ls" "$OUT" "claude-double"
+run bash -c "$PIN20 '$PLEACH' open ls"
+assert_contains "precedence: which open reaches" "$OUT" "claude-double in $S20/ls :: []"
+
+run "$PLEACH" help open
+assert_contains "help open: documents the shorthand" "$OUT" "pleach fix-x -r"
+run "$PLEACH" help
+assert_contains "help: the synopsis names the shorthand" "$OUT" "pleach <session> [command …]"
 
 # ---------------------------------------------------------------------------
 # Summary

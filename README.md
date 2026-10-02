@@ -263,6 +263,13 @@ pleach open fix-x --create           # the one-command flow, asked for explicitl
 # mistyped name should not be answered with how to build it anyway.
 pleach open fix-x code               # VS Code on the session's multi-root workspace
 
+pleach fix-x                         # `open` is the default: a session name alone opens it
+pleach fix-x -r                      # flags with no command are claude's: `claude -r`
+pleach fix-x --create                # the same as: pleach open fix-x --create
+# A command always wins over a session of the same name (a session called `status` is
+# reached with `pleach open status`). A word that is neither is answered with the
+# closest command or session, and nothing is created for it.
+
 pleach new fix-x api web             # a focused session: only these sub-repos
 pleach new fix-x --fetch             # update the base from origin first
 pleach new fix-y --from fix-x        # stack on fix-x's unmerged work, not on main
