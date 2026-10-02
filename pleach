@@ -12,7 +12,7 @@
 # shellcheck disable=SC2015  # deliberate idiom: [ -z "$x" ] && x=… || err (err never runs after an assignment)
 set -euo pipefail
 
-PLEACH_VERSION="2.4.0"
+PLEACH_VERSION="2.5.0"
 
 CONF_NAME=".pleach.conf"
 USER_CONF="$HOME/.config/pleach/config"
@@ -1994,7 +1994,8 @@ _pleach_sessions() { pleach ls --json 2>/dev/null | sed -nE 's/.*"name": "([^"]+
 _pleach() {
   local cur="${COMP_WORDS[COMP_CWORD]}"
   if [ "$COMP_CWORD" -eq 1 ]; then
-    COMPREPLY=($(compgen -W "$_pleach_commands" -- "$cur"))
+    # A session name stands where a command goes too: `pleach fix-x` is `open fix-x`.
+    COMPREPLY=($(compgen -W "$_pleach_commands $(_pleach_sessions)" -- "$cur"))
     return
   fi
   case "${COMP_WORDS[1]}" in
@@ -2008,14 +2009,20 @@ complete -F _pleach pleach
 EOF
       ;;
     zsh) cat <<'EOF'
+#compdef pleach
 # pleach zsh completion. Add to ~/.zshrc:
 #   eval "$(pleach completions zsh)"
+# or save it as _pleach in a directory on $fpath, which is what Homebrew does.
 _pleach() {
-  local -a cmds
+  local -a cmds sessions
+  local ret=1
   cmds=(init new open ls add sync status rm prune clean each conflicts repos path cd doctor skill completions shell-init install update version help)
   if (( CURRENT == 2 )); then
-    _describe 'pleach command' cmds
-    return
+    # A session name stands where a command goes too: `pleach fix-x` is `open fix-x`.
+    sessions=(${(f)"$(pleach ls --json 2>/dev/null | sed -nE 's/.*"name": "([^"]+)".*/\1/p')"})
+    _describe -t commands 'pleach command' cmds && ret=0
+    _describe -t sessions 'session' sessions && ret=0
+    return ret
   fi
   case "${words[2]}" in
     open|sync|status|rm|clean|add|path|cd)
@@ -2024,7 +2031,14 @@ _pleach() {
     completions) _values 'shell' bash zsh ;;
   esac
 }
-compdef _pleach pleach
+# Through eval, register the function. Autoloaded from $fpath, this file IS
+# _pleach's body: the first Tab runs it, so define the function and answer that Tab.
+# Without the #compdef line above, compinit never registers the file at all.
+if [ "${funcstack[1]:-}" = "_pleach" ]; then
+  _pleach "$@"
+else
+  compdef _pleach pleach
+fi
 EOF
       ;;
     *) err "unknown shell: $shell (supported: bash, zsh)" ;;

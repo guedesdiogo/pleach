@@ -2863,6 +2863,76 @@ run "$PLEACH" help
 assert_contains "help: the synopsis names the shorthand" "$OUT" "pleach <session> [command …]"
 
 # ---------------------------------------------------------------------------
+header "Test 64: Tab offers sessions where a command goes"
+# ---------------------------------------------------------------------------
+# `pleach fix-x` is `open fix-x`, so the first word completes to a session as well
+# as to a command. And the zsh script must register itself when Homebrew installs
+# it as _pleach on $fpath: without a #compdef line compinit skipped the file, and a
+# brew install had no zsh completion at all.
+MINI21=$(cd "$SANDBOX" && mkdir -p complete && cd complete && pwd)
+setup_repo "$MINI21/canon"
+echo root > "$MINI21/canon/f.txt"
+git -C "$MINI21/canon" add -A && git -C "$MINI21/canon" commit -q -m initial
+printf 'PLEACH_SUBS=()\npleach_bootstrap() { :; }\n' > "$MINI21/canon/.pleach.conf"
+PIN21="env PLEACH_CANONICAL=$MINI21/canon PLEACH_EXPECT_CANONICAL=$MINI21/canon"
+run bash -c "$PIN21 '$PLEACH' new fix-login --no-bootstrap && $PIN21 '$PLEACH' new feat-search --no-bootstrap"
+assert_rc "complete: two sessions exist" "$RC" 0
+
+# The completion scripts call `pleach` by name, so the one under test goes on PATH.
+COMPBIN="$SANDBOX/compbin"
+mkdir -p "$COMPBIN"
+printf '#!/usr/bin/env bash\nexec "%s" "$@"\n' "$PLEACH" > "$COMPBIN/pleach"
+chmod +x "$COMPBIN/pleach"
+cat > "$SANDBOX/complete.bash" <<'COMPLETE_BASH'
+# complete.bash <word …> — what Tab offers for the last word, one per line.
+eval "$(pleach completions bash)"
+COMP_WORDS=("$@"); COMP_CWORD=$(( $# - 1 ))
+_pleach
+printf '%s\n' "${COMPREPLY[@]}"
+COMPLETE_BASH
+CB="$PIN21 PATH='$COMPBIN:$PATH' bash '$SANDBOX/complete.bash'"
+
+run bash -c "$CB pleach fe"
+assert_eq "bash: the first word completes to a session" "$OUT" "feat-search"
+run bash -c "$CB pleach ''"
+assert_contains "bash: an empty first word offers the sessions" "$OUT" "fix-login"
+assert_contains "bash: and still the commands" "$OUT" "status"
+run bash -c "$CB pleach sta"
+assert_eq "bash: a command prefix completes to the command alone" "$OUT" "status"
+run bash -c "$CB pleach open fix"
+assert_eq "bash: open <Tab> still completes the session" "$OUT" "fix-login"
+
+run "$PLEACH" completions zsh
+assert_eq "zsh: the script opens with #compdef, so compinit registers it from \$fpath" \
+  "$(printf '%s\n' "$OUT" | head -1)" "#compdef pleach"
+
+# zsh is not on every runner (Windows has none); where it is, check it for real.
+if command -v zsh >/dev/null 2>&1; then
+  mkdir -p "$SANDBOX/zfpath"
+  "$PLEACH" completions zsh > "$SANDBOX/zfpath/_pleach"
+  assert_true "zsh: the emitted script is valid zsh" zsh -n "$SANDBOX/zfpath/_pleach"
+  ZS="$PIN21 PATH='$COMPBIN:$PATH' zsh -f -c"
+  run bash -c "$ZS 'fpath=($SANDBOX/zfpath \$fpath); autoload -Uz compinit; compinit -u -D; print -r -- \$_comps[pleach]'"
+  assert_eq "zsh: installed on \$fpath (Homebrew), compinit registers it" "$OUT" "_pleach"
+  run bash -c "$ZS 'autoload -Uz compinit; compinit -u -D; eval \"\$(pleach completions zsh)\"; print -r -- \$_comps[pleach]'"
+  assert_eq "zsh: through eval, it registers too" "$OUT" "_pleach"
+  # The completion system needs a terminal; _describe is stubbed to print what it
+  # would have offered, which is the logic this change touched.
+  cat > "$SANDBOX/complete.zsh" <<'COMPLETE_ZSH'
+autoload -Uz compinit; compinit -u -D
+eval "$(pleach completions zsh)"
+_describe() { local a=${@[-1]}; print -rl -- ${(P)a}; }
+CURRENT=2; words=(pleach '')
+_pleach
+COMPLETE_ZSH
+  run bash -c "$PIN21 PATH='$COMPBIN:$PATH' zsh -f '$SANDBOX/complete.zsh'"
+  assert_contains "zsh: the first word offers the sessions" "$OUT" "feat-search"
+  assert_contains "zsh: and still the commands" "$OUT" "status"
+else
+  echo "  (zsh not installed here — only its #compdef line was checked)"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
