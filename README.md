@@ -180,9 +180,20 @@ completion cache once: `rm -f ~/.zcompdump && exec zsh`.
 The npm package is scoped because npm reserves the bare name `pleach`, judging it too
 close to `preact`. The command it installs is still `pleach`.
 
+The same package is on GitHub Packages as `@guedesdiogo/pleach`, published from every
+release; that registry only takes the repository owner's scope, hence the second name.
+It asks for a token even to install a public package (a classic token with
+`read:packages`):
+
+```bash
+npm config set @guedesdiogo:registry https://npm.pkg.github.com
+npm config set //npm.pkg.github.com/:_authToken <token>
+npm install -g @guedesdiogo/pleach
+```
+
 `pleach update` recognises installs owned by Homebrew, npm or bun and redirects to that
 package manager rather than self-updating over the top of them — which would leave the
-managed copy stale and a second one shadowing it. Four channels that never fight is a
+managed copy stale and a second one shadowing it. Five channels that never fight is a
 property worth testing, so it is: the suite asserts each redirect fires before any network
 call is made.
 

@@ -655,7 +655,7 @@ git -C "$SESSIONS/s4/subA" checkout -- f.txt
 # ---------------------------------------------------------------------------
 header "Test 26: update defers to whoever owns the install"
 # ---------------------------------------------------------------------------
-# pleach ships through four channels. A copy installed by a package manager must
+# pleach ships through five channels. A copy installed by a package manager must
 # never self-update over the top of it - it would write to ~/.local/bin, leaving
 # the managed copy stale and a second one shadowing it. These assertions also
 # prove `update` decides BEFORE reaching the network: nothing is downloaded here.
@@ -669,7 +669,16 @@ mkdir -p "$SANDBOX/fake/node_modules/.bin"
 cp "$PLEACH" "$SANDBOX/fake/node_modules/.bin/pleach"
 run "$SANDBOX/fake/node_modules/.bin/pleach" update
 assert_rc "update (npm-managed): non-zero rc" "$RC" 1
-assert_contains "update (npm-managed): redirects to the package manager" "$OUT" "npm update -g"
+assert_contains "update (npm-managed): redirects to the package manager" "$OUT" "npm update -g @diogoaguedes/pleach"
+
+# GitHub Packages carries the same script under the owner's scope. Sending that install
+# to the npmjs name would put a second package beside it, both claiming the `pleach` bin.
+mkdir -p "$SANDBOX/fake/node_modules/@guedesdiogo/pleach"
+cp "$PLEACH" "$SANDBOX/fake/node_modules/@guedesdiogo/pleach/pleach"
+run "$SANDBOX/fake/node_modules/@guedesdiogo/pleach/pleach" update
+assert_rc "update (GitHub Packages): non-zero rc" "$RC" 1
+assert_contains "update (GitHub Packages): names the package it came from" "$OUT" "npm update -g @guedesdiogo/pleach"
+assert_not_contains "update (GitHub Packages): never the npmjs name" "$OUT" "@diogoaguedes"
 
 # ---------------------------------------------------------------------------
 header "Test 27: conflicts distinguishes a real conflict from a mere overlap"
