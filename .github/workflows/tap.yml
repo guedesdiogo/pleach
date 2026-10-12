@@ -92,8 +92,9 @@ jobs:
         # with write access to another repository, so a moved `v7` tag would be a write
         # credential handed to code nobody here reviewed. (Verified against the API:
         # this digest is what refs/tags/v7 points at, and its action.yml declares
-        # `using: node24` — v4 declared node20, which the runners are retiring.) Nor is the
-        # token left in tap/.git/config, where every later step could read it.
+        # `using: node24` — v4 declared node20, which the runners are retiring.) The token
+        # is only lent for the fetch: it is not left in tap/.git/config, where every later
+        # step could read it, and the push below gets it on its own.
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: guedesdiogo/homebrew-tap
