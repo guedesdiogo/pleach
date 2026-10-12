@@ -1,0 +1,111 @@
+name: npm
+
+# Publishing to npm by hand meant a token on someone's machine, and npm is removing direct
+# publish from tokens that bypass 2FA. Trusted publishing replaces the token: npm trusts
+# this workflow file, by name, to publish @diogoaguedes/pleach, and GitHub proves through
+# OIDC that the run is this file in this repository. Nothing secret is stored, and every
+# version carries a provenance attestation pointing back at the run that built it.
+#
+# npm checks the repository and the file name, not the ref, so on its own that trust would
+# also cover an edited copy of this file pushed to a branch. The job therefore runs in the
+# `npm` environment, which only admits v* tags, and npm only trusts that environment: what
+# publishes is always the workflow and the code of a release tag.
+#
+# The trust is configured on npmjs.com (package settings, Trusted Publisher): user
+# guedesdiogo, repository pleach, workflow npm.yml, environment npm. Renaming this file or
+# the environment breaks it.
+on:
+  release:
+    types: [published]
+  # For re-running a release whose publish failed: "Use workflow from" its tag. Not for an
+  # older tag: npm moves `latest` to whatever it publishes.
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    # npm moves `latest` to whatever it publishes last, so two releases minutes apart must
+    # publish in order. `queue: max` for the reason tap.yml gives: the default cancels the
+    # waiting runs, and a cancelled publish is a release that never reached npm.
+    concurrency:
+      group: npm-pleach
+      cancel-in-progress: false
+      queue: max
+    environment: npm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PACKAGE: "@diogoaguedes/pleach"
+    steps:
+      - name: resolve the tag
+        id: tag
+        run: |
+          set -euo pipefail
+          # The run's own ref is the only source: a release runs on its tag, and a dispatch
+          # on the ref it was started from. The environment already refuses anything but a
+          # v* tag; this also refuses a v* tag that is not a release version.
+          tag="$GITHUB_REF_NAME"
+          if [ "$GITHUB_REF_TYPE" != tag ] || ! [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::$GITHUB_REF is not a release tag (refs/tags/vX.Y.Z)"
+            exit 1
+          fi
+          echo "tag=$tag"         >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "resolved to $tag"
+
+      - name: check out the tag
+        # Pinned by digest for the reason tap.yml gives: this job can publish the package.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: the tag must carry the version it claims
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          # npm publishes package.json's version and `pleach version` answers PLEACH_VERSION.
+          # A tag where either lags would put one number on the package and another in the
+          # terminal that installed it. Refuse instead of publishing it.
+          script=$(sed -n 's/^PLEACH_VERSION="\(.*\)"$/\1/p' pleach | head -1)
+          pkg=$(node -p 'require("./package.json").version')
+          if [ "$script" != "$VERSION" ] || [ "$pkg" != "$VERSION" ]; then
+            echo "::error::$TAG claims $VERSION, but pleach says \"$script\" and package.json says \"$pkg\""
+            exit 1
+          fi
+          echo "$TAG ships $VERSION"
+
+      # Trusted publishing needs npm 11.5.1 or later; the runner's own Node 22 ships npm 10.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: publish
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          npm_version=$(npm --version)
+          if [ "$(printf '%s\n' 11.5.1 "$npm_version" | sort -V | head -1)" != 11.5.1 ]; then
+            echo "::error::npm $npm_version cannot publish through OIDC; trusted publishing needs 11.5.1 or later"
+            exit 1
+          fi
+          # npm refuses a version twice, so a re-run of a release that already went through
+          # has nothing to do. Only the printed version counts: npm 10+ fails with E404 for
+          # a missing version, while older npm printed nothing and exited 0.
+          published=$(npm view "$PACKAGE@$VERSION" version 2>/dev/null || true)
+          if [ "$published" = "$VERSION" ]; then
+            echo "$PACKAGE@$VERSION is already on npm - nothing to publish"
+            exit 0
+          fi
+          # No lifecycle script runs while the job can mint a publish token.
+          npm publish --ignore-scripts
