@@ -4,16 +4,18 @@ name: github-packages
 # @guedesdiogo/pleach: its npm registry only takes a package scoped to the repository's
 # owner, so the name is the one thing that differs. Published on release, like the tap,
 # so every version on GitHub Packages is one that was tagged.
+#
+# Unlike npm.yml and tap.yml, this job runs in no environment, because there is nothing
+# to fence off in one: its only credential is the run's own GITHUB_TOKEN, which a workflow
+# on any branch can give `packages: write`, and anyone with write access can publish with
+# a token of their own anyway. What keeps a branch from publishing by mistake is the tag
+# check below.
 on:
   release:
     types: [published]
-  # For re-running a release whose publish failed. Not for an older tag: npm moves
-  # `latest` to whatever it publishes.
+  # For re-running a release whose publish failed: "Use workflow from" its tag. Not for an
+  # older tag: npm moves `latest` to whatever it publishes.
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "tag to publish; empty means this repo's latest release"
-        required: false
 
 defaults:
   run:
@@ -41,20 +43,13 @@ jobs:
     steps:
       - name: resolve the tag
         id: tag
-        env:
-          GH_TOKEN: ${{ github.token }}
-          EVENT_TAG: ${{ github.event.release.tag_name }}
-          INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          tag="${EVENT_TAG:-${INPUT_TAG:-}}"
-          if [ -z "$tag" ]; then
-            tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
-          fi
-          # A dispatched tag is free text: anything but a release tag could name a branch,
-          # or carry a newline that writes its own version= into GITHUB_OUTPUT.
-          if ! [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::'$tag' is not a release tag (vX.Y.Z)"
+          # The run's own ref is the only source: a release runs on its tag, and a dispatch
+          # on the ref it was started from, so a dispatch from a branch stops here.
+          tag="$GITHUB_REF_NAME"
+          if [ "$GITHUB_REF_TYPE" != tag ] || ! [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::$GITHUB_REF is not a release tag (refs/tags/vX.Y.Z)"
             exit 1
           fi
           echo "tag=$tag"         >> "$GITHUB_OUTPUT"
@@ -67,7 +62,6 @@ jobs:
         # token left in .git/config, where every later step could read it.
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: refs/tags/${{ steps.tag.outputs.tag }}
           persist-credentials: false
 
       - name: the tag must carry the version it claims

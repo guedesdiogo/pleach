@@ -4,15 +4,18 @@ name: tap
 # three steps across two repos — download the tarball, checksum it, edit the formula —
 # and every one of them was a place for the tag and the sha to drift apart without
 # anyone noticing until an install produced the wrong binary under the right name.
+#
+# TAP_TOKEN can push to guedesdiogo/homebrew-tap, so it is a secret of the `tap`
+# environment, not of the repository: a repository secret is readable by a workflow on
+# any branch. The environment only admits v* tags, and the "release tags" ruleset leaves
+# creating one to admins, so only the workflow and the code of a release tag hold the
+# token. Renaming the environment means moving the secret with it.
 on:
   release:
     types: [published]
-  # For re-running a release whose bump failed, or for backfilling an older tag.
+  # For re-running a release whose bump failed: "Use workflow from" its tag. Not for an
+  # older tag: the formula would move back to it.
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "tag to push to the tap; empty means this repo's latest release"
-        required: false
 
 defaults:
   run:
@@ -31,19 +34,20 @@ jobs:
       group: homebrew-tap-pleach
       cancel-in-progress: false
       queue: max
+    environment: tap
     runs-on: ubuntu-latest
     steps:
       - name: resolve the tag
         id: tag
-        env:
-          GH_TOKEN: ${{ github.token }}
-          EVENT_TAG: ${{ github.event.release.tag_name }}
-          INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          tag="${EVENT_TAG:-${INPUT_TAG:-}}"
-          if [ -z "$tag" ]; then
-            tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
+          # The run's own ref is the only source: a release runs on its tag, and a dispatch
+          # on the ref it was started from. The environment already refuses anything but a
+          # v* tag; this also refuses a v* tag that is not a release version.
+          tag="$GITHUB_REF_NAME"
+          if [ "$GITHUB_REF_TYPE" != tag ] || ! [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::$GITHUB_REF is not a release tag (refs/tags/vX.Y.Z)"
+            exit 1
           fi
           echo "tag=$tag"         >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
@@ -88,12 +92,14 @@ jobs:
         # with write access to another repository, so a moved `v7` tag would be a write
         # credential handed to code nobody here reviewed. (Verified against the API:
         # this digest is what refs/tags/v7 points at, and its action.yml declares
-        # `using: node24` — v4 declared node20, which the runners are retiring.)
+        # `using: node24` — v4 declared node20, which the runners are retiring.) Nor is the
+        # token left in tap/.git/config, where every later step could read it.
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: guedesdiogo/homebrew-tap
           token: ${{ secrets.TAP_TOKEN }}
           path: tap
+          persist-credentials: false
 
       - name: rewrite the formula
         id: rewrite
@@ -123,6 +129,7 @@ jobs:
       - name: send the bump to the tap
         if: steps.rewrite.outputs.changed == 'yes'
         env:
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
           VERSION: ${{ steps.tag.outputs.version }}
         run: |
           set -euo pipefail
@@ -131,4 +138,11 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -am "pleach $VERSION"
-          git push origin HEAD
+          # The checkout kept no credential, so the token reaches git only through the
+          # environment of the push itself, the way checkout would have sent it.
+          auth=$(printf 'x-access-token:%s' "$TAP_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+            git push origin HEAD
