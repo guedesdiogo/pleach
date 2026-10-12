@@ -24,6 +24,13 @@ permissions:
 
 jobs:
   publish:
+    # The registry moves `latest` to whatever it publishes last, so two releases minutes
+    # apart must publish in order. `queue: max` for the reason tap.yml gives: the default
+    # cancels the waiting runs, and a cancelled publish is a release that never went out.
+    concurrency:
+      group: github-packages-pleach
+      cancel-in-progress: false
+      queue: max
     runs-on: ubuntu-latest
     permissions:
       contents: read
