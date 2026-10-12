@@ -12,7 +12,7 @@
 # shellcheck disable=SC2015  # deliberate idiom: [ -z "$x" ] && x=… || err (err never runs after an assignment)
 set -euo pipefail
 
-PLEACH_VERSION="2.5.0"
+PLEACH_VERSION="2.5.1"
 
 CONF_NAME=".pleach.conf"
 USER_CONF="$HOME/.config/pleach/config"
@@ -2967,7 +2967,10 @@ cmd_update() {
   [ -L "$self" ] && self=$(readlink "$self")
   case "$self" in
     *node_modules*|*/.bun/*)
-      err "this install is managed by npm/bun — update with: bun update -g @diogoaguedes/pleach (or npm update -g @diogoaguedes/pleach)"
+      # GitHub Packages carries the same script under the repository owner's scope.
+      local pkg="@diogoaguedes/pleach"
+      case "$self" in */@guedesdiogo/pleach/*) pkg="@guedesdiogo/pleach" ;; esac
+      err "this install is managed by npm/bun — update with: bun update -g $pkg (or npm update -g $pkg)"
       ;;
     */Cellar/*|*/homebrew/*|*/linuxbrew/*)
       err "this install is managed by Homebrew — update with: brew update && brew upgrade pleach"
