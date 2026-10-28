@@ -525,7 +525,7 @@ warn_if_behind() { # $1 repo, $2 label
   local behind
   behind=$(git -C "$1" rev-list --count "$BASE..origin/$BASE" 2>/dev/null || echo 0)
   if [ "${behind:-0}" -gt 0 ]; then
-    warn "$2: local $BASE is $behind commit(s) behind origin/$BASE (create with --fetch to update)"
+    warn "$2: local $BASE is $behind commit(s) behind origin/$BASE (advance it with: pleach fetch)"
   fi
 }
 
@@ -747,14 +747,13 @@ cmd_new() {
   touch "$SESSIONS/.metadata_never_index" # macOS: keep Spotlight out of sessions
 
   if [ "$do_fetch" -eq 1 ]; then
+    # fetch_base, not `git fetch origin BASE:BASE`: git refuses that one whenever the
+    # base is checked out, which in a canonical is the normal case, so origin/BASE
+    # moved, the local BASE did not, and the session was cut from the stale one.
     info "fetching origin/$BASE in every repo…"
-    local repo
-    for repo in "$CANONICAL" ${subs[@]+"${subs[@]/#/$CANONICAL/}"}; do
-      # Fast-forward the local ref without touching the working tree; if $BASE is
-      # checked out in that repo, fall back to a plain fetch (updates origin/$BASE).
-      git -C "$repo" fetch --quiet origin "$BASE:$BASE" 2>/dev/null \
-        || git -C "$repo" fetch --quiet origin "$BASE" \
-        || warn "fetch failed in $repo (offline?) — using the local $BASE"
+    fetch_base_or_warn "$CANONICAL" root
+    for s in ${subs[@]+"${subs[@]}"}; do
+      fetch_base_or_warn "$CANONICAL/$s" "$s"
     done
   fi
 
@@ -798,7 +797,9 @@ cmd_new() {
     [ "$from_ref" = "$BASE" ] || from_used=1
     add_wt "$CANONICAL" "$dir" "$branch" "$from_ref"
   else
-    warn_if_behind "$CANONICAL" "root"
+    # After --fetch a base still behind is one fetch_base could not advance, and it
+    # has already said why; advising --fetch again would be advice that was taken.
+    [ "$do_fetch" -eq 1 ] || warn_if_behind "$CANONICAL" "root"
     add_wt "$CANONICAL" "$dir" "$branch"
   fi
   for s in ${subs[@]+"${subs[@]}"}; do
@@ -807,7 +808,7 @@ cmd_new() {
       [ "$from_ref" = "$BASE" ] || from_used=1
       add_wt "$CANONICAL/$s" "$dir/$s" "$branch" "$from_ref"
     else
-      warn_if_behind "$CANONICAL/$s" "$s"
+      [ "$do_fetch" -eq 1 ] || warn_if_behind "$CANONICAL/$s" "$s"
       add_wt "$CANONICAL/$s" "$dir/$s" "$branch"
     fi
   done
@@ -928,8 +929,8 @@ cmd_open() {
       # The word stood where a command goes, so a typo there is as likely a
       # mistyped command as a mistyped session. These are the dispatch's commands.
       local -a commands=(init new open ls path cd add sync status rm prune clean each
-                         conflicts repos doctor skill completions shell-init install
-                         update version help)
+                         conflicts repos fetch doctor skill completions shell-init
+                         install update version help)
       hint=$({ printf '%s\n' "${commands[@]}"; session_dirs; } | closest_name "$name") || hint=""
       if [ -n "$hint" ]; then suffix=" — did you mean '$hint'?"; fi
       err "'$name' is neither a command nor a session$suffix
@@ -1039,23 +1040,150 @@ cmd_add() {
 }
 
 # ---------------------------------------------------------------------------
-FETCHED=""   # repos already updated in this invocation (avoids N fetches on --all)
-fetch_base() { # $1 repo, $2 label — advances the LOCAL base ref from origin
-  local repo="$1" label="$2" cur
+# The local base, kept a fast-forward mirror of origin's. Everything pleach judges
+# — status, sync, prune, rm, the commit `new` cuts from — reads the LOCAL ref, and
+# that ref moves only when someone pulls in the canonical: on live workspaces it
+# sat anywhere from 2 to 100 commits behind, so merged work read as pending and
+# fresh sessions started behind. These advance it, and touch nothing else.
+# ---------------------------------------------------------------------------
+FETCHED=""     # repos already handled in this invocation (avoids N fetches on --all)
+FETCH_NOTE=""  # what the last fetch_base did, phrased to follow "<repo>: "
+fetch_base() { # $1 repo, [$2 = prune] — advances the LOCAL base from origin
+  # rc 0: the local base now matches origin's — or is ahead of it, or neither side
+  # has one. rc 1: it could not be brought level, and FETCH_NOTE says why. Only
+  # ever a fast-forward: never forced, never stashed, never a merge commit.
+  local repo="$1" mode="${2:-}" out failed=0 why local_ref remote_ref ahead behind cur holder
   # shellcheck disable=SC2086  # deliberate split: FETCHED is a space-separated list
   in_list "$repo" $FETCHED && return 0
   FETCHED="$FETCHED $repo"
-  # Normal path: base is not checked out here → update the ref directly.
-  git -C "$repo" fetch --quiet origin "$BASE:$BASE" 2>/dev/null && return 0
-  git -C "$repo" fetch --quiet origin "$BASE" 2>/dev/null \
-    || { warn "$label: fetch failed (offline?) — using the local $BASE"; return 1; }
-  # Base is checked out (the canonical usually sits on main): fast-forward it.
-  cur=$(git -C "$repo" branch --show-current 2>/dev/null || echo "")
-  if [ "$cur" = "$BASE" ] && [ -z "$(git -C "$repo" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
-    git -C "$repo" merge --ff-only --quiet "origin/$BASE" 2>/dev/null && return 0
+  if ! git -C "$repo" remote get-url origin >/dev/null 2>&1; then
+    FETCH_NOTE="$BASE not advanced — no remote named origin"
+    return 1
   fi
-  warn "$label: origin/$BASE moved, but the local $BASE did not — run: git -C $repo pull --ff-only"
-  return 1
+  # With a refspec on the command line, --prune only prunes what that refspec
+  # covers, so dropping every stale remote-tracking ref takes the plain form.
+  if [ "$mode" = prune ]; then
+    out=$(git -C "$repo" fetch --quiet --prune origin 2>&1) || failed=1
+  else
+    out=$(git -C "$repo" fetch --quiet origin "$BASE" 2>&1) || failed=1
+  fi
+  if [ "$failed" -eq 1 ]; then
+    why=$(printf '%s\n' "$out" | sed -n 's/^fatal: //p; s/^error: //p' | head -1)
+    FETCH_NOTE="$BASE not advanced — fetch from origin failed${why:+: $why}"
+    return 1
+  fi
+  remote_ref=$(git -C "$repo" rev-parse --verify --quiet "refs/remotes/origin/$BASE^{commit}" 2>/dev/null) || remote_ref=""
+  local_ref=$(git -C "$repo" rev-parse --verify --quiet "refs/heads/$BASE^{commit}" 2>/dev/null) || local_ref=""
+  if [ -z "$remote_ref" ]; then
+    # A repo still on master has no base on either side, and add_wt already cuts its
+    # sessions from its own branch: nothing is missing there.
+    if [ -z "$local_ref" ]; then
+      FETCH_NOTE="no $BASE here nor on origin — nothing to advance"
+      return 0
+    fi
+    FETCH_NOTE="$BASE not advanced — origin has no $BASE"
+    return 1
+  fi
+  if [ "$local_ref" = "$remote_ref" ]; then
+    FETCH_NOTE="$BASE up to date"
+    return 0
+  fi
+  behind=""
+  if [ -n "$local_ref" ]; then
+    behind=$(git -C "$repo" rev-list --count "$local_ref..$remote_ref" 2>/dev/null || echo "?")
+    if ! git -C "$repo" merge-base --is-ancestor "$local_ref" "$remote_ref" 2>/dev/null; then
+      ahead=$(git -C "$repo" rev-list --count "$remote_ref..$local_ref" 2>/dev/null || echo "?")
+      if [ "$behind" = 0 ]; then
+        # Commits nobody has pushed yet. Nothing to advance, and nothing lost.
+        FETCH_NOTE="$BASE up to date — $ahead commit(s) ahead of origin/$BASE, not pushed"
+        return 0
+      fi
+      FETCH_NOTE="$BASE not advanced — diverged from origin/$BASE ($ahead ahead, $behind behind); only a fast-forward is ever made"
+      return 1
+    fi
+  fi
+  cur=$(git -C "$repo" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+  if [ -n "$local_ref" ] && [ "$cur" = "$BASE" ]; then
+    # Checked out here — the canonical usually sits on its base — so the working
+    # tree has to follow. With tracked changes in the way it is left alone.
+    if [ -n "$(git -C "$repo" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+      FETCH_NOTE="$BASE not advanced — uncommitted changes to tracked files ($behind behind origin/$BASE)"
+      return 1
+    fi
+    if ! git -C "$repo" merge --ff-only --quiet "refs/remotes/origin/$BASE" >/dev/null 2>&1; then
+      FETCH_NOTE="$BASE not advanced — git refused the fast-forward (an untracked file in the way?)"
+      return 1
+    fi
+  elif ! git -C "$repo" fetch --quiet . "refs/remotes/origin/$BASE:refs/heads/$BASE" >/dev/null 2>&1; then
+    # Not checked out here, so only the ref moves. Fetching from the repo itself is
+    # the fast-forward-only way to move it, and git refuses when another worktree
+    # has the branch checked out: that worktree's files would stop matching its HEAD.
+    holder=$(git -C "$repo" worktree list --porcelain 2>/dev/null \
+      | awk -v want="branch refs/heads/$BASE" '/^worktree /{ wt = substr($0, 10) } $0 == want { print wt; exit }')
+    if [ -n "$holder" ]; then
+      FETCH_NOTE="$BASE not advanced — it is checked out at $holder; advance it there"
+    else
+      FETCH_NOTE="$BASE not advanced — git refused to move it"
+    fi
+    return 1
+  fi
+  if [ -z "$local_ref" ]; then
+    FETCH_NOTE="$BASE created from origin/$BASE at $(short_ref "$remote_ref")"
+  else
+    FETCH_NOTE="$BASE advanced $(short_ref "$local_ref") → $(short_ref "$remote_ref") (+$behind)"
+  fi
+  return 0
+}
+
+fetch_base_or_warn() { # $1 repo, $2 label — for the commands that go on with whatever base there is
+  fetch_base "$1" && return 0
+  warn "$2: $FETCH_NOTE; using the local $BASE as it is"
+  return 0
+}
+
+fetch_sessions_base() { # $@ = session names — advances the base in every repo they are judged in
+  local n s
+  fetch_base_or_warn "$CANONICAL" root
+  for n in "$@"; do
+    while IFS= read -r s; do
+      [ -n "$s" ] && [ -e "$CANONICAL/$s/.git" ] || continue
+      fetch_base_or_warn "$CANONICAL/$s" "$s"
+    done < <(session_subs "$SESSIONS/$n")
+  done
+  return 0
+}
+
+cmd_fetch() { # advances the local base from origin in every repo of the workspace
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -*) err "unknown flag: $1 (usage: pleach fetch)" ;;
+      *)  err "unexpected argument: $1 (usage: pleach fetch)" ;;
+    esac
+  done
+  # load_config resolves the canonical from a session's .session-env too, so run
+  # from inside a session this acts on the canonical's repos all the same.
+  load_config
+  local -a labels=("root") repos=("$CANONICAL")
+  local s i failed=0
+  # SUBS, as `each --repos`: the resolved list — the conf's PLEACH_SUBS when it
+  # declares one, auto-detection otherwise.
+  for s in ${SUBS[@]+"${SUBS[@]}"}; do
+    if [ -e "$CANONICAL/$s/.git" ]; then
+      labels+=("$s"); repos+=("$CANONICAL/$s")
+    else
+      warn "$s: declared in PLEACH_SUBS but not on disk — skipped (see: pleach repos)"
+    fi
+  done
+  info "advancing the local $BASE from origin (fast-forward only) in ${#repos[@]} repo(s)…"
+  for ((i = 0; i < ${#repos[@]}; i++)); do
+    fetch_base "${repos[$i]}" prune || failed=$((failed + 1))
+    printf '    %s: %s\n' "${labels[$i]}" "$FETCH_NOTE"
+  done
+  if [ "$failed" -gt 0 ]; then
+    warn "$failed repo(s) not level with origin/$BASE — status, sync, prune, rm and new go on reading the stale $BASE there"
+    return 1
+  fi
+  return 0
 }
 
 sync_session() { # $1 name, $2 do_fetch, $3 mode (merge|rebase), $4 any_branch, $5 dry — 0 ok, 1 conflicts
@@ -1083,7 +1211,7 @@ sync_session() { # $1 name, $2 do_fetch, $3 mode (merge|rebase), $4 any_branch, 
     # The target is always the LOCAL base ref (the canonical's main). --fetch only
     # tries to advance it from origin before integrating. In a dry run nothing is
     # touched — not even the base ref.
-    [ "$do_fetch" -eq 1 ] && [ "$dry" -eq 0 ] && { fetch_base "$repo" "$label" || true; }
+    [ "$do_fetch" -eq 1 ] && [ "$dry" -eq 0 ] && fetch_base_or_warn "$repo" "$label"
 
     # Guard rail: we only integrate into the SESSION's branch. A worktree sitting
     # on feat/x (the user switched branches in there) is none of our business.
@@ -1293,14 +1421,15 @@ status_json() { # $@ = session names — rc 1 when something is behind, as statu
 }
 
 cmd_status() {
-  local name="" quiet=0 all=0 exit_code=0 as_json=0
+  local name="" quiet=0 all=0 exit_code=0 as_json=0 do_fetch=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --all)      all=1 ;;
       --json)     as_json=1 ;;
       --exit-code) exit_code=1 ;;
+      --fetch)    do_fetch=1 ;;
       -q|--quiet) quiet=1 ;;
-      -*)         err "unknown flag: $1 (usage: pleach status [<session>|--all] [--json] [--exit-code] [-q])" ;;
+      -*)         err "unknown flag: $1 (usage: pleach status [<session>|--all] [--fetch] [--json] [--exit-code] [-q])" ;;
       *)          [ -z "$name" ] && name="$1" || err "too many arguments" ;;
     esac
     shift
@@ -1321,11 +1450,16 @@ cmd_status() {
   else
     if [ -z "$name" ]; then
       name=$(detect_session_name 2>/dev/null) \
-        || err "usage: pleach status <session> [--exit-code] [-q]  (or --all)"
+        || err "usage: pleach status <session> [--fetch] [--exit-code] [-q]  (or --all)"
     fi
     [ -d "$SESSIONS/$name" ] || err "session '$name' does not exist at $SESSIONS/$name"
     targets=("$name")
   fi
+
+  # The base ref is a mirror of origin's, so advancing it changes no session — only
+  # how stale the yardstick is. Warnings go to stderr: a base that cannot be
+  # advanced never lands inside --json.
+  [ "$do_fetch" -eq 1 ] && fetch_sessions_base "${targets[@]}"
 
   local behind_rc=0
   if [ "$as_json" -eq 1 ]; then
@@ -1507,9 +1641,11 @@ session_identity_problem() { # $1 name — echoes why the folder cannot be judge
   return 0
 }
 
-session_problems() { # $1 name — echoes pending work (one per line); rc 0 if none
+session_problems() { # $1 name — echoes "<repo>\t<reason>" per pending item; rc 0 if none
   # Criterion shared by rm and prune: uncommitted changes in any worktree, or
-  # commits on session/<name> not yet integrated into the local BASE.
+  # commits on session/<name> not yet integrated into the local BASE. A tab between
+  # the repo and the reason, so prune --json splits them without guessing; people
+  # read them joined by problem_lines.
   local name="$1" dir="$SESSIONS/$1" branch
   branch=$(session_branch "$name")
   local -a present=()
@@ -1520,14 +1656,14 @@ session_problems() { # $1 name — echoes pending work (one per line); rc 0 if n
     wt="$dir${s:+/$s}"
     [ -e "$wt/.git" ] || continue
     if [ -n "$(worktree_dirt "$wt" "$([ -z "$s" ] && printf '%s' "$dir")")" ]; then
-      echo "$label: uncommitted or untracked changes"
+      printf '%s\t%s\n' "$label" "uncommitted or untracked changes"
       count=$((count + 1))
     fi
     # rev-list first: it is cheap and settles the common case, so session_landed
     # (a merge-tree) only runs for branches that do have commits outside the base.
     ahead=$(git -C "$repo" rev-list --count "$BASE..$branch" 2>/dev/null || echo 0)
     if [ "${ahead:-0}" -gt 0 ] && ! session_landed "$repo" "$branch"; then
-      echo "$label: $ahead commit(s) on $branch not integrated into $BASE"
+      printf '%s\t%s\n' "$label" "$ahead commit(s) on $branch not integrated into $BASE"
       count=$((count + 1))
     fi
     # And the branch this worktree is actually ON, which is not always the one the
@@ -1541,9 +1677,9 @@ session_problems() { # $1 name — echoes pending work (one per line); rc 0 if n
       ahead=$(git -C "$repo" rev-list --count "$BASE..$head_ref" 2>/dev/null || echo 0)
       if [ "${ahead:-0}" -gt 0 ] && ! session_landed "$repo" "$head_ref"; then
         if git -C "$repo" show-ref --verify --quiet "refs/heads/$head_ref"; then
-          echo "$label: $ahead commit(s) on $head_ref not integrated into $BASE"
+          printf '%s\t%s\n' "$label" "$ahead commit(s) on $head_ref not integrated into $BASE"
         else
-          echo "$label: $ahead commit(s) on a detached HEAD at $(short_ref "$head_ref") — no branch points at them"
+          printf '%s\t%s\n' "$label" "$ahead commit(s) on a detached HEAD at $(short_ref "$head_ref") — no branch points at them"
         fi
         count=$((count + 1))
       fi
@@ -1552,18 +1688,102 @@ session_problems() { # $1 name — echoes pending work (one per line); rc 0 if n
   [ "$count" -eq 0 ]
 }
 
+problem_lines() { # $1 = session_problems output, $2 = prefix — "<repo>: <reason>" per line
+  printf '%s\n' "$1" | awk -F'\t' -v p="$2" 'NF { printf "%s%s: %s\n", p, $1, $2 }'
+}
+
+# ---------------------------------------------------------------------------
+# In use — which processes have their working directory inside a session
+# ---------------------------------------------------------------------------
+# A session that was just created is clean and has no commits, so by the pending-
+# work test alone it is integrated: prune --apply would remove the session another
+# agent opened a minute ago, or the one the caller stands in. A process's working
+# directory is the cheapest evidence that someone is there, and both platforms the
+# agents run on will say: /proc on Linux, lsof on macOS. It is not all the evidence
+# there is — an editor holding files open from elsewhere has its cwd elsewhere —
+# and the help says so rather than promise more.
+CWD_TABLE=""   # "<pid>\t<command>\t<cwd>" per process this user can see (cwd_scan)
+CWD_BLIND=0    # 1 when this system offers no way to ask (Git Bash on Windows)
+CWD_WARNED=0
+cwd_scan() { # reads, fresh, where every visible process is working
+  local t=""
+  if [ "$(uname -s 2>/dev/null)" = Linux ] && [ -d /proc/self ]; then
+    t=$(cwd_table_proc) || t=""
+  fi
+  if [ -z "$t" ] && command -v lsof >/dev/null 2>&1; then
+    t=$(cwd_table_lsof) || t=""
+  fi
+  CWD_TABLE="$t"
+  # Never empty when it worked: the scan itself is a process with a working
+  # directory. Empty means nothing could be asked, which is said, not hidden.
+  if [ -n "$t" ]; then CWD_BLIND=0; else CWD_BLIND=1; fi
+}
+
+cwd_table_proc() { # Linux: one find over /proc rather than a readlink per process
+  # From /, so neither this scan nor anything it starts counts as working where the
+  # caller stands. The caller itself still does, and that is the point.
+  cd / || return 0
+  find /proc -mindepth 2 -maxdepth 2 -name cwd -printf '%h\t%l\n' 2>/dev/null | awk -F'\t' '
+    $2 == "" { next }
+    {
+      pid = substr($1, 7)
+      if (pid !~ /^[0-9]+$/) next
+      cwd = $2; sub(/ \(deleted\)$/, "", cwd)
+      cmd = "?"; f = "/proc/" pid "/comm"
+      if ((getline line < f) > 0) cmd = line
+      close(f)
+      print pid "\t" cmd "\t" cwd
+    }' || true
+}
+
+cwd_table_lsof() { # macOS, and Linux without /proc: one lsof for every process's cwd
+  cd / || return 0   # same reason as in cwd_table_proc
+  # +c 0: the whole command name — by default lsof cuts it at nine characters.
+  lsof -w +c 0 -d cwd -Fpcn 2>/dev/null | awk '
+    /^p/ { pid = substr($0, 2); cmd = "?" }
+    /^c/ { cmd = substr($0, 2) }
+    /^n/ { print pid "\t" cmd "\t" substr($0, 2) }' || true
+}
+
+session_users() { # $1 session dir — "<pid>\t<command>" per process working inside it
+  # Matched on the PHYSICAL path, which is what both sources report: on macOS the
+  # temporary folders sit behind a symlink, and a compare against the path as given
+  # matches nothing there. And on a path boundary, so a session called fix is not in
+  # use because of one called fix-login. This pleach is named as such: standing in
+  # a session, the caller is one of the processes using it.
+  local real
+  [ -n "$CWD_TABLE" ] || return 0
+  real=$(cd "$1" 2>/dev/null && pwd -P) || return 0
+  printf '%s\n' "$CWD_TABLE" | awk -F'\t' -v d="$real" -v self="$$" '
+    $3 == d || substr($3, 1, length(d) + 1) == d "/" {
+      if (seen[$1]++) next
+      print $1 "\t" ($1 == self ? "pleach" : $2)
+    }'
+}
+
+user_lines() { # $1 = session_users output, $2 = prefix — "pid <n> (<command>)" per line
+  printf '%s\n' "$1" | awk -F'\t' -v p="$2" 'NF { printf "%spid %s (%s)\n", p, $1, $2 }'
+}
+
+warn_if_blind() { # once per run: what cannot be seen is said, never read as "nobody"
+  [ "$CWD_BLIND" -eq 1 ] && [ "$CWD_WARNED" -eq 0 ] || return 0
+  CWD_WARNED=1
+  warn "this system offers no way to see which processes work where (no /proc, no lsof) — a session in use looks idle here; make sure nothing runs in it"
+}
+
 cmd_rm() {
-  local name="" force=0 reap=0
+  local name="" force=0 reap=0 do_fetch=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --force) force=1 ;;
       --reap)  reap=1 ;;
-      -*)      err "unknown flag: $1" ;;
+      --fetch) do_fetch=1 ;;
+      -*)      err "unknown flag: $1 (usage: pleach rm <name> [--force] [--reap] [--fetch])" ;;
       *)       [ -z "$name" ] && name="$1" || err "too many arguments" ;;
     esac
     shift
   done
-  [ -n "$name" ] || err "usage: pleach rm <name> [--force] [--reap]"
+  [ -n "$name" ] || err "usage: pleach rm <name> [--force] [--reap] [--fetch]"
   load_config
   # Before anything destructive: refuse when the folder and its own record disagree.
   # --force does not override this, because there is nothing to override — the guard
@@ -1580,6 +1800,10 @@ cmd_rm() {
   local s repo label
   while IFS= read -r s; do [ -n "$s" ] && present+=("$s"); done < <(session_subs "$dir")
 
+  # Judged against what origin has: a merge that only landed on the remote is
+  # pending work to a stale base, and rm would refuse over it.
+  [ "$do_fetch" -eq 1 ] && fetch_sessions_base "$name"
+
   # Read the port block BEFORE the worktrees go: after removal the .session-env
   # is gone and a process still bound to that block becomes untraceable.
   local port listeners
@@ -1590,9 +1814,23 @@ cmd_rm() {
   local problems=""
   if ! problems=$(session_problems "$name") && [ "$force" -eq 0 ]; then
     echo "pleach: session '$name' has pending work:" >&2
-    printf '%s\n' "$problems" | sed 's/^/  - /' >&2
+    problem_lines "$problems" "  - " >&2
     err "use --force to remove anyway (the worktrees go; branches with unintegrated commits are preserved — commits on a DETACHED head are held by nothing and go with the worktree)"
   fi
+
+  # Safety: refuse while anyone is working in it. Asked last, as close to the
+  # removal as it gets, and --force does not reach it: --force overrides a judgment
+  # about work, and a session somebody is standing in is not a judgment call — the
+  # agent in there loses its ground whatever the commits say.
+  local users
+  cwd_scan
+  users=$(session_users "$dir")
+  if [ -n "$users" ]; then
+    echo "pleach: session '$name' is in use — $(printf '%s\n' "$users" | grep -c .) process(es) working inside it:" >&2
+    user_lines "$users" "  - " >&2
+    err "not removed while it is in use — stop them, or step out of it, and run rm again (--force does not override this)"
+  fi
+  warn_if_blind
 
   lock
   # Subs first, root last (the root worktree contains the subs').
@@ -1652,44 +1890,117 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+prune_json() { # $@ = session names — the machine surface for prune (cwd_scan first)
+  # Removable is integrated AND nobody in it; both halves are given rather than the
+  # conclusion, so a caller can tell "wait for the agent to leave" from "has work".
+  local first=1 n problems integrated users pending in_use repo reason pid cmd
+  printf '{\n'
+  printf '  "base": "%s",\n' "$(json_escape "$BASE")"
+  printf '  "sessions": ['
+  for n in "$@"; do
+    integrated=true
+    problems=$(session_problems "$n") || integrated=false
+    pending=""
+    while IFS=$'\t' read -r repo reason; do
+      [ -n "$repo" ] || continue
+      pending="$pending${pending:+, }{\"repo\": \"$(json_escape "$repo")\", \"reason\": \"$(json_escape "$reason")\"}"
+    done <<EOF
+$problems
+EOF
+    in_use=""
+    users=$(session_users "$SESSIONS/$n")
+    while IFS=$'\t' read -r pid cmd; do
+      [ -n "$pid" ] || continue
+      in_use="$in_use${in_use:+, }{\"pid\": $pid, \"command\": \"$(json_escape "$cmd")\"}"
+    done <<EOF
+$users
+EOF
+    if [ "$first" -eq 1 ]; then printf '\n'; else printf ',\n'; fi
+    first=0
+    printf '    {"name": "%s", "integrated": %s, "in_use": [%s], "pending": [%s]}' \
+      "$(json_escape "$n")" "$integrated" "$in_use" "$pending"
+  done
+  if [ "$first" -eq 1 ]; then printf ']\n}\n'; else printf '\n  ]\n}\n'; fi
+}
+
 cmd_prune() { # hygiene: remove sessions whose work is fully integrated (dry run by default)
-  local apply=0
+  local apply=0 do_fetch=0 as_json=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --apply|--yes|-y) apply=1 ;;
-      -*) err "unknown flag: $1 (usage: pleach prune [--apply])" ;;
-      *)  err "unexpected argument: $1 (usage: pleach prune [--apply])" ;;
+      --fetch)          do_fetch=1 ;;
+      --json)           as_json=1 ;;
+      -*) err "unknown flag: $1 (usage: pleach prune [--apply] [--fetch] [--json])" ;;
+      *)  err "unexpected argument: $1 (usage: pleach prune [--apply] [--fetch] [--json])" ;;
     esac
     shift
   done
+  [ "$as_json" -eq 1 ] && [ "$apply" -eq 1 ] \
+    && err "--json only lists — it does not combine with --apply (usage: pleach prune [--apply] [--fetch] [--json])"
   load_config
-  local n problems found=0
-  local -a removable=()
-  while IFS= read -r n; do
-    [ -n "$n" ] || continue
-    found=1
+  local -a names=() removable=()
+  local n problems users pending=0 busy=0
+  while IFS= read -r n; do [ -n "$n" ] && names+=("$n"); done < <(session_names)
+  # The base ref is a mirror of origin's, so advancing it changes no session — which
+  # is why --fetch runs for a listing too: the listing is only as true as the base.
+  [ "$do_fetch" -eq 1 ] && [ ${#names[@]} -gt 0 ] && fetch_sessions_base "${names[@]}"
+  cwd_scan
+  warn_if_blind
+  if [ "$as_json" -eq 1 ]; then
+    prune_json ${names[@]+"${names[@]}"}
+    return 0
+  fi
+  [ ${#names[@]} -gt 0 ] || { echo "(no sessions in $SESSIONS)"; return 0; }
+  for n in "${names[@]}"; do
+    users=$(session_users "$SESSIONS/$n")
     if problems=$(session_problems "$n"); then
-      removable+=("$n")
-      echo "  ✓ $n — fully integrated (removable)"
+      if [ -z "$users" ]; then
+        removable+=("$n")
+        echo "  ✓ $n — fully integrated (removable)"
+      else
+        busy=$((busy + 1))
+        echo "  ● $n — fully integrated, but in use (kept while it is):"
+        user_lines "$users" "      - "
+      fi
     else
+      pending=$((pending + 1))
       echo "  ● $n — pending work:"
-      printf '%s\n' "$problems" | sed 's/^/      - /'
+      problem_lines "$problems" "      - "
+      [ -z "$users" ] || user_lines "$users" "      - in use: "
     fi
-  done < <(session_names)
-  [ "$found" -eq 0 ] && { echo "(no sessions in $SESSIONS)"; return 0; }
+  done
   echo ""
+  local hint=""
+  if [ "$pending" -gt 0 ] && [ "$do_fetch" -eq 0 ]; then
+    hint="(\"integrated\" is judged against the LOCAL $BASE — merges that only landed on the remote count once it is advanced: add --fetch, or run pleach fetch)"
+  fi
   if [ ${#removable[@]} -eq 0 ]; then
-    echo "Nothing to remove — every session has pending work."
-    echo "(\"integrated\" is judged against the LOCAL $BASE — merges that only landed on the remote need a git fetch first)"
+    if [ "$busy" -gt 0 ]; then
+      echo "Nothing to remove — every session has pending work or is in use."
+    else
+      echo "Nothing to remove — every session has pending work."
+    fi
+    [ -z "$hint" ] || echo "$hint"
     return 0
   fi
   if [ "$apply" -eq 0 ]; then
     echo "Dry run — remove ${#removable[@]} session(s): pleach prune --apply"
+    [ -z "$hint" ] || echo "$hint"
     return 0
   fi
+  local rc=0 one
   for n in "${removable[@]}"; do
-    cmd_rm "$n"
+    # Someone can step into a session after the listing above. rm asks again, and
+    # its refusal must cost that one session, not the rest of the sweep — an `err`
+    # inside rm would otherwise end the whole run. The subshell keeps errexit on
+    # inside rm, which the left-hand side of an || would quietly switch off.
+    set +e
+    ( set -e; cmd_rm "$n" )
+    one=$?
+    set -e
+    [ "$one" -eq 0 ] || rc=1
   done
+  return "$rc"
 }
 
 # ---------------------------------------------------------------------------
@@ -1989,7 +2300,7 @@ cmd_completions() {
     bash) cat <<'EOF'
 # pleach bash completion. Add to ~/.bashrc:
 #   eval "$(pleach completions bash)"
-_pleach_commands="init new open ls add sync status rm prune clean each conflicts repos path cd doctor skill completions shell-init install update version help"
+_pleach_commands="init new open ls add sync status rm prune clean each conflicts repos fetch path cd doctor skill completions shell-init install update version help"
 _pleach_sessions() { pleach ls --json 2>/dev/null | sed -nE 's/.*"name": "([^"]+)".*/\1/p'; }
 _pleach() {
   local cur="${COMP_WORDS[COMP_CWORD]}"
@@ -2016,7 +2327,7 @@ EOF
 _pleach() {
   local -a cmds sessions
   local ret=1
-  cmds=(init new open ls add sync status rm prune clean each conflicts repos path cd doctor skill completions shell-init install update version help)
+  cmds=(init new open ls add sync status rm prune clean each conflicts repos fetch path cd doctor skill completions shell-init install update version help)
   if (( CURRENT == 2 )); then
     # A session name stands where a command goes too: `pleach fix-x` is `open fix-x`.
     sessions=(${(f)"$(pleach ls --json 2>/dev/null | sed -nE 's/.*"name": "([^"]+)".*/\1/p')"})
@@ -2754,7 +3065,7 @@ A `.pleach.conf` and no `.session-env` means you are in the canonical checkout.
 |                                | Canonical (outside)                     | Inside a session                                                        |
 | ------------------------------ | --------------------------------------- | ----------------------------------------------------------------------- |
 | Purpose                        | integration, releases, session lifecycle | implementing one task                                                    |
-| Remove / prune sessions        | yes                                     | target other sessions. Your own is the hazard, and the tool is not a safety net for it: `pleach rm` refuses it only while it still holds pending work, and `pleach prune --apply` sweeps every integrated session — including the one you stand in |
+| Remove / prune sessions        | yes                                     | target other sessions. Your own is the hazard. `pleach rm` and `pleach prune --apply` leave alone a session some process has its working directory in — the one you stand in included — but that guard sees working directories and nothing else. It is a backstop, not permission to try |
 | Deploy, publish, `terraform apply` | yes                                  | **no** — two sessions collide in the *environment*; git isolates files, not environments |
 | Edit code                      | prefer a session                        | yes, that is the job                                                     |
 
@@ -2778,8 +3089,8 @@ session is invisible to yours by construction.
   here. A green answer from a check whose scope does not cover your question is
   not evidence.
 - `pleach status` — how far behind the canonical's LOCAL base each repo of a session is,
-  measured on the branch the worktree is ON. The canonical moves when someone pulls there,
-  and nothing inside a session notices. `pleach open` reports this on the way in; ask
+  measured on the branch the worktree is ON. The canonical moves when someone pulls there
+  or runs `pleach fetch`, and nothing inside a session notices. `pleach open` reports this on the way in; ask
   directly when you have been working a while. It is a report, not an instruction:
   being behind is not being about to conflict, and whether to `sync` is the human's call.
   `--json` and `--exit-code` for scripting; it exits 0 without the latter.
@@ -2795,11 +3106,14 @@ session is invisible to yours by construction.
 copy here would. Go to it rather than assume:
 
 - `pleach prune` and `pleach clean` only **list** until `--apply`; `pleach sync --all`
-  refuses without a TTY unless you pass `--yes`; `pleach rm` refuses while work is pending.
-- "Integrated" is judged against the **local** base, and `pleach sync` never reaches for
-  origin — a PR merged on the remote is invisible until `git fetch`.
-- `pleach ls --json` is the machine surface; the human table is not a contract. There is no
-  MCP server, and the shell-out is the interface deliberately.
+  refuses without a TTY unless you pass `--yes`; `pleach rm` refuses while work is pending,
+  and while the session is in use — `--force` overrides only the first.
+- "Integrated" and "behind" are judged against the **local** base, which moves only when
+  someone advances it. `pleach fetch` brings it level with origin in every repo, fast-forward
+  only; `--fetch` on `status`, `prune`, `rm`, `sync` and `new` does the same first. Without
+  one of them, a PR merged on the remote is invisible.
+- `pleach ls --json` and `pleach prune --json` are the machine surfaces; the human tables are
+  not a contract. There is no MCP server, and the shell-out is the interface deliberately.
 - `.session-env` holds `PORT`, one `PLEACH_PORT_<SUB>` per mounted repo (they all read
   `$PORT`, so point each service at its own), and the runtime identity (`PLEACH_DB_NAME`,
   `COMPOSE_PROJECT_NAME`) — the state git does not isolate. `pleach open` sources it for
@@ -2810,8 +3124,8 @@ away, and the baseline agents this skill was tested against all reached for it f
 
 ## Red flags — stop
 
-- Removing the session you stand in — directly with `pleach rm`, or by letting
-  `pleach prune --apply` sweep it once its work has landed.
+- Removing the session you stand in. `pleach rm` and `pleach prune --apply` should refuse
+  it while you are there; do not make that guard the thing that stops you.
 - Treating a green `pleach conflicts` as proof that parallel work is compatible.
 - Running a deploy, a publish or `terraform apply` from inside a session.
 - Choosing a migration, RFC or port number from what a single worktree can see.
@@ -3016,8 +3330,8 @@ Sessions
   add [<session>] <sub …>   Mount sub-repos into an existing session.
   sync [<session>|--all]    Bring the canonical's local main into the session's branches.
   status [<session>|--all]  How far behind the canonical's local main each of the session's repos is.
-  rm <name> [--force] [--reap]  Remove the session. Refuses when work is pending.
-  prune [--apply]           List (and with --apply remove) fully integrated sessions.
+  rm <name> [--force] [--reap]  Remove the session. Refuses when work is pending or it is in use.
+  prune [--apply] [--json]  List (and with --apply remove) integrated sessions nobody is in.
   clean [<session>]         Delete git-ignored artifacts (node_modules, builds…).
   each [--repos] '<cmd>'    Run a command in the canonical and in every session.
   conflicts                 Report what parallel sessions would break in each other at merge.
@@ -3025,6 +3339,7 @@ Sessions
 Workspace
   init [--default]          Adopt pleach in the current repo (writes .pleach.conf).
   repos [--sync]            Compare repos on disk x conf x sessions; --sync aligns everything.
+  fetch                     Bring the local main level with origin in every repo (fast-forward only).
   doctor [--fix]            Check the workspace for drift, stale locks and port clashes.
 
 Tool
@@ -3039,6 +3354,7 @@ Tool
 e.g. pleach new fix-login           create the session, then: pleach open fix-login
      pleach fix-login -r            the same as: pleach open fix-login claude -r
      pleach repos --sync            adopt a new workspace repo (e.g. payments)
+     pleach fetch                   bring every repo's local main level with origin
      pleach sync fix-login          bring the session up to date with main
      pleach skill --install         teach your LLM to drive pleach
 EOF
@@ -3061,7 +3377,10 @@ block of 100 ports (.session-env) and runs the dependency bootstrap.
                    another one's UNMERGED commits rather than waiting for them.
                    A repo where X does not exist falls back to the base and says
                    so -- one repo never blocks the others.
-  --fetch          Update the base from origin before creating.
+  --fetch          First advance the local base from origin in every repo involved,
+                   fast-forward only (see `pleach help fetch`), so the session is
+                   cut from what origin has. A base that cannot be advanced is used
+                   as it is, and the warning says why.
   --no-bootstrap   Skip dependency installation.
 
 If branch session/<name> already exists in a repo, it is resumed, not recreated.
@@ -3149,7 +3468,7 @@ pleach sync [<session>|--all] [--rebase] [--fetch] [--any-branch] [--dry-run] [-
 Brings a session up to date with the canonical: in each repo it integrates the
 LOCAL <base> (the canonical's main) into branch session/<name>. It never reaches
 for origin — the local main is the source. Update it as usual (git pull in the
-canonical) or pass --fetch.
+canonical, or pleach fetch) or pass --fetch.
 
   --all          Every session. Asks for confirmation (shows the blast radius);
                  non-interactive callers (scripts/agents) must pass --yes.
@@ -3175,7 +3494,7 @@ inferred.
 EOF
     ;;
     status) cat <<'EOF'
-pleach status [<session>|--all] [--json] [--exit-code] [-q]
+pleach status [<session>|--all] [--fetch] [--json] [--exit-code] [-q]
 
 How far behind the canonical's LOCAL base each of the session's repos has drifted.
 Per repo, because a session touching only the api does not care that the docs moved.
@@ -3187,6 +3506,9 @@ Per repo, because a session touching only the api does not care that the docs mo
   -q, --quiet  Print nothing.
   --exit-code  Return 1 when something is behind (as `git diff --exit-code`).
   --json       The machine surface: every measured repo, behind or not.
+  --fetch      First advance the local base from origin, fast-forward only, in the
+               repos the session(s) mount (see `pleach help fetch`). It moves the
+               base ref and nothing else; warnings go to stderr, never into --json.
 
 Only the repos that are behind are listed; when none are, it says so in one line and
 nothing else. It measures the branch each worktree is really ON, not the branch the
@@ -3196,17 +3518,25 @@ It exits 0 whether or not anything is behind, unless you ask for --exit-code. It
 report: it tells you the number and the place, and leaves the decision to sync — or
 not to — with you.
 
-Never reaches for origin. The target is the base ref in your canonical checkout, which
-moves when you pull there and at no other time.
+Without --fetch it never reaches for origin. The target is the base ref in your
+canonical checkout, which moves when you pull there, run `pleach fetch`, or pass
+--fetch — and at no other time.
 EOF
     ;;
     rm) cat <<'EOF'
-pleach rm <name> [--force] [--reap]
+pleach rm <name> [--force] [--reap] [--fetch]
 
 Removes the session's worktrees and its folder. Refuses if any repo has
 uncommitted changes, or commits not yet integrated into the base -- on
 session/<name> AND on whatever branch that worktree is currently checked out on,
 which is not always the same one.
+
+It also refuses while the session is IN USE: while any process has its working
+directory inside it -- an agent, a shell, a dev server started in there, or the
+caller itself, standing in the session it asked to remove. It names them (pid and
+command). --force does NOT override this: --force overrides the judgment of
+pending work, and a session somebody is working in is not a judgment call. Stop
+them, or step out, and run rm again.
 
   --force   Remove anyway. Branches with unintegrated commits are ALWAYS
             preserved -- session/<name> and any other branch a worktree was left
@@ -3217,25 +3547,59 @@ which is not always the same one.
   --reap    Kill processes still listening inside the session's port block. By
             default they are only reported: a dev server outlives the worktree
             that started it, and killing a process is not something a cleanup
-            command should do behind your back.
+            command should do behind your back. A server started INSIDE the
+            session has its working directory there, which makes the session in
+            use: rm refuses and names it, and --reap is for the ones started
+            elsewhere.
+  --fetch   First advance the local base from origin, fast-forward only, in the
+            session's repos (see `pleach help fetch`), so a merge that only landed
+            on the remote counts as integrated.
 
 "Integrated" is judged against the LOCAL base — if the merge only happened on the
-remote, run git fetch in the repo before rm. A squash or rebase merge counts: a
+remote, pass --fetch (or run pleach fetch) first. A squash or rebase merge counts: a
 branch whose merge into the base would change nothing is integrated, and its
 session/<name> branch is deleted like a merged one.
+
+"In use" is read from each process's working directory: /proc on Linux, lsof on
+macOS. That is what it sees and all it sees — an editor or a server holding the
+session's files open from somewhere else is not counted, nor is another user's
+process, nor a container with the folder mounted. Git Bash on Windows offers
+neither source, so there rm says it cannot tell instead of checking.
 EOF
     ;;
     prune) cat <<'EOF'
-pleach prune [--apply]
+pleach prune [--apply] [--fetch] [--json]
 
 Post-merge hygiene: finds the sessions whose work is fully integrated into the
 base (same criterion as rm — no uncommitted changes, and no commits outside the
 base on session/<name> or on the branch the worktree is actually on) and, with
 --apply, removes them through rm's safe path.
 
+A session that is IN USE — some process has its working directory inside it — is
+never removed, integrated or not. A session just created is clean and has no
+commits, so by the work alone it is integrated; this is what keeps prune --apply
+off the one another agent has just opened, and off the one you stand in. It is
+listed as in use, with the pids. How in use is read, and what it cannot see:
+`pleach help rm`.
+
+  --apply   Remove the sessions listed as removable. rm checks each one again
+            just before removing it; a session someone stepped into meanwhile is
+            skipped, the rest still go, and the exit code is 1.
+  --fetch   First advance the local base from origin, fast-forward only, in every
+            repo the sessions mount (see `pleach help fetch`). It runs for a plain
+            listing too: the base ref is a mirror of origin's, so advancing it
+            changes no session, and the listing is only as true as the base.
+  --json    The machine surface, for listing (not with --apply):
+              {"base": "main", "sessions": [{"name": "x", "integrated": false,
+                "in_use": [{"pid": 123, "command": "claude"}],
+                "pending": [{"repo": "api", "reason": "uncommitted or untracked changes"}]}]}
+            integrated is the rm criterion; pending says why not (empty when
+            integrated); in_use lists who is inside (empty when nobody is). A
+            session is removable when integrated is true AND in_use is empty.
+
 With no flags it is a dry run: it only lists. "Integrated" is judged against the
-LOCAL base — merges that only landed on the remote need a git fetch first.
-Squash and rebase merges count (see rm).
+LOCAL base — for merges that only landed on the remote, add --fetch or run
+pleach fetch first. Squash and rebase merges count (see rm).
 EOF
     ;;
     clean) cat <<'EOF'
@@ -3462,6 +3826,34 @@ Adopts pleach in the current repo: detects first-level sub-repos and writes
               `pleach ls`/`new` work from any directory.
 EOF
     ;;
+    fetch) cat <<'EOF'
+pleach fetch
+
+Brings the local base (PLEACH_BASE, default main) level with origin, fast-forward
+only, in the canonical and in every workspace sub-repo. Everything pleach judges —
+status, sync, prune, rm, the commit `new` cuts from — reads the LOCAL base, and it
+moves only when someone pulls in the canonical. A stale one makes merged work read
+as pending and starts new sessions behind.
+
+Per repo it runs `git fetch --prune origin` (stale remote-tracking refs go too), then:
+
+  - base checked out and clean: fast-forwards it; the working tree follows.
+  - base checked out with uncommitted changes to tracked files: leaves it.
+  - base not checked out: moves the ref — unless another worktree has it checked
+    out, which is that worktree's to move.
+  - base diverged from origin's: leaves it. Only a fast-forward is ever made —
+    never a merge, a reset or a stash. A base merely AHEAD of origin (commits not
+    pushed yet) is left as it is, and counts as level.
+
+Each repo gets a line saying what moved or why it could not. Exits 1 when any
+repo's base could not be brought level with origin (uncommitted changes, diverged,
+origin unreachable, no origin), 0 otherwise.
+
+Run from inside a session it acts on the canonical's repos all the same. The same
+step, for the repos involved only, runs first with --fetch on new, sync, status,
+prune and rm.
+EOF
+    ;;
     repos) cat <<'EOF'
 pleach repos [--sync] [--no-bootstrap]
 
@@ -3538,7 +3930,7 @@ Guard rail for automation/harnesses (env, not conf):
                                   after the session name is the launched command's argv.
 EOF
     ;;
-    *) err "no help for '$1' (commands: init new open ls path cd add sync status rm prune clean each conflicts repos doctor shell-init completions install update version; topics: config)" ;;
+    *) err "no help for '$1' (commands: init new open ls path cd add sync status rm prune clean each conflicts repos fetch doctor shell-init completions install update version; topics: config)" ;;
   esac
 }
 
@@ -3557,6 +3949,7 @@ case "$cmd" in
   sync)    cmd_sync "$@" ;;
   status)  cmd_status "$@" ;;
   repos)   cmd_repos "$@" ;;
+  fetch)   cmd_fetch "$@" ;;
   rm)      cmd_rm "$@" ;;
   prune)   cmd_prune "$@" ;;
   clean)   cmd_clean "$@" ;;
@@ -3573,7 +3966,7 @@ case "$cmd" in
   update)  cmd_update "$@" ;;
   version|--version|-V) echo "pleach $PLEACH_VERSION" ;;
   help|-h|--help) cmd_help "$@" ;;
-  -*) err "unknown command: $cmd (init|new|open|add|sync|status|repos|rm|prune|clean|each|ls|path|cd|doctor|conflicts|skill|completions|shell-init|install|update|version|help)" ;;
+  -*) err "unknown command: $cmd (init|new|open|add|sync|status|repos|fetch|rm|prune|clean|each|ls|path|cd|doctor|conflicts|skill|completions|shell-init|install|update|version|help)" ;;
   # Any other word is a session: `pleach fix-x …` is `pleach open fix-x …`. A command
   # always wins, so a session named `status` is reached with `pleach open status`.
   *) OPEN_IMPLIED=1; cmd_open "$cmd" "$@" ;;
