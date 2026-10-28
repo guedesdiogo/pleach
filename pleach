@@ -250,15 +250,26 @@ normalize_path() { # git on Windows reports C:/Users/… while the shell uses /c
   esac
 }
 
+lsof_bin() { # echoes where lsof is; rc 1 when there is none
+  # Looked for where it lives, not only on PATH: cron and launchd run with
+  # PATH=/usr/bin:/bin, and macOS keeps lsof in /usr/sbin. Asking PATH alone made
+  # pleach blind there, and a blind in-use check removed a busy session.
+  local p
+  for p in "$(command -v lsof 2>/dev/null || true)" /usr/sbin/lsof /usr/bin/lsof; do
+    if [ -n "$p" ] && [ -x "$p" ]; then printf '%s' "$p"; return 0; fi
+  done
+  return 1
+}
+
 session_listeners() { # $1 port_base — echoes "<pid>\t<command>" per process listening in the block
   # Worktrees isolate files, not sockets: a dev server started in a session keeps
   # its port after the session is gone. With no way to ask, we say nothing — never
   # a false "nothing is listening".
-  local pb="${1:-}" top
+  local pb="${1:-}" top lsof
   [ -n "$pb" ] || return 0
   top=$((pb + 99))
-  if command -v lsof >/dev/null 2>&1; then
-    lsof -nP -iTCP:"$pb"-"$top" -sTCP:LISTEN -F pc 2>/dev/null | awk '
+  if lsof=$(lsof_bin); then
+    "$lsof" -nP -iTCP:"$pb"-"$top" -sTCP:LISTEN -F pc 2>/dev/null | awk '
       /^p/ { pid = substr($0, 2) }
       /^c/ { print pid "\t" substr($0, 2) }
     ' | sort -u
@@ -1048,6 +1059,12 @@ cmd_add() {
 # ---------------------------------------------------------------------------
 FETCHED=""     # repos already handled in this invocation (avoids N fetches on --all)
 FETCH_NOTE=""  # what the last fetch_base did, phrased to follow "<repo>: "
+git_why() { # $1 = what git printed — its first line that says why, minus "fatal: "/"error: "
+  local why
+  why=$(printf '%s\n' "$1" | sed -n 's/^fatal: //p; s/^error: //p' | head -1)
+  [ -n "$why" ] || why=$(printf '%s\n' "$1" | sed -n '/./{p;q;}')
+  printf '%s' "$why"
+}
 fetch_base() { # $1 repo, [$2 = prune] — advances the LOCAL base from origin
   # rc 0: the local base now matches origin's — or is ahead of it, or neither side
   # has one. rc 1: it could not be brought level, and FETCH_NOTE says why. Only
@@ -1068,7 +1085,7 @@ fetch_base() { # $1 repo, [$2 = prune] — advances the LOCAL base from origin
     out=$(git -C "$repo" fetch --quiet origin "$BASE" 2>&1) || failed=1
   fi
   if [ "$failed" -eq 1 ]; then
-    why=$(printf '%s\n' "$out" | sed -n 's/^fatal: //p; s/^error: //p' | head -1)
+    why=$(git_why "$out")
     FETCH_NOTE="$BASE not advanced — fetch from origin failed${why:+: $why}"
     return 1
   fi
@@ -1110,8 +1127,9 @@ fetch_base() { # $1 repo, [$2 = prune] — advances the LOCAL base from origin
       FETCH_NOTE="$BASE not advanced — uncommitted changes to tracked files ($behind behind origin/$BASE)"
       return 1
     fi
-    if ! git -C "$repo" merge --ff-only --quiet "refs/remotes/origin/$BASE" >/dev/null 2>&1; then
-      FETCH_NOTE="$BASE not advanced — git refused the fast-forward (an untracked file in the way?)"
+    if ! out=$(git -C "$repo" merge --ff-only --quiet "refs/remotes/origin/$BASE" 2>&1); then
+      why=$(git_why "$out")
+      FETCH_NOTE="$BASE not advanced — git refused the fast-forward${why:+: $why}"
       return 1
     fi
   elif ! git -C "$repo" fetch --quiet . "refs/remotes/origin/$BASE:refs/heads/$BASE" >/dev/null 2>&1; then
@@ -1456,8 +1474,9 @@ cmd_status() {
     targets=("$name")
   fi
 
-  # The base ref is a mirror of origin's, so advancing it changes no session — only
-  # how stale the yardstick is. Warnings go to stderr: a base that cannot be
+  # Advancing the base changes no session — only how stale the yardstick is. It is
+  # not free of side effects: with the canonical on its base, the fast-forward moves
+  # the canonical's working tree too. Warnings go to stderr: a base that cannot be
   # advanced never lands inside --json.
   [ "$do_fetch" -eq 1 ] && fetch_sessions_base "${targets[@]}"
 
@@ -1710,7 +1729,7 @@ cwd_scan() { # reads, fresh, where every visible process is working
   if [ "$(uname -s 2>/dev/null)" = Linux ] && [ -d /proc/self ]; then
     t=$(cwd_table_proc) || t=""
   fi
-  if [ -z "$t" ] && command -v lsof >/dev/null 2>&1; then
+  if [ -z "$t" ] && lsof_bin >/dev/null; then
     t=$(cwd_table_lsof) || t=""
   fi
   CWD_TABLE="$t"
@@ -1737,24 +1756,47 @@ cwd_table_proc() { # Linux: one find over /proc rather than a readlink per proce
 }
 
 cwd_table_lsof() { # macOS, and Linux without /proc: one lsof for every process's cwd
+  local lsof
+  lsof=$(lsof_bin) || return 0
   cd / || return 0   # same reason as in cwd_table_proc
   # +c 0: the whole command name — by default lsof cuts it at nine characters.
-  lsof -w +c 0 -d cwd -Fpcn 2>/dev/null | awk '
+  # Under a UTF-8 locale, because without one lsof prints every byte past ASCII as
+  # \xNN and an accented path never matches. It doubles a backslash either way, and
+  # where no UTF-8 locale exists it still escapes: both are undone here, byte for
+  # byte, which is what LC_ALL=C makes awk's %c produce.
+  LC_ALL=C.UTF-8 "$lsof" -w +c 0 -d cwd -Fpcn 2>/dev/null | LC_ALL=C awk '
+    function hex(c) { return index("0123456789abcdef", tolower(c)) - 1 }
+    function unescape(s,   out, i, c, h) {
+      out = ""
+      while ((i = index(s, "\\")) > 0) {
+        out = out substr(s, 1, i - 1)
+        c = substr(s, i + 1, 1); h = substr(s, i + 2, 2)
+        if (c == "\\") { out = out "\\"; s = substr(s, i + 2) }
+        else if (c == "x" && h ~ /^[0-9a-fA-F][0-9a-fA-F]$/) {
+          out = out sprintf("%c", hex(substr(h, 1, 1)) * 16 + hex(substr(h, 2, 1)))
+          s = substr(s, i + 4)
+        } else { out = out "\\"; s = substr(s, i + 1) }
+      }
+      return out s
+    }
     /^p/ { pid = substr($0, 2); cmd = "?" }
-    /^c/ { cmd = substr($0, 2) }
-    /^n/ { print pid "\t" cmd "\t" substr($0, 2) }' || true
+    /^c/ { cmd = unescape(substr($0, 2)) }
+    /^n/ { print pid "\t" cmd "\t" unescape(substr($0, 2)) }' || true
 }
 
 session_users() { # $1 session dir — "<pid>\t<command>" per process working inside it
-  # Matched on the PHYSICAL path, which is what both sources report: on macOS the
-  # temporary folders sit behind a symlink, and a compare against the path as given
-  # matches nothing there. And on a path boundary, so a session called fix is not in
-  # use because of one called fix-login. This pleach is named as such: standing in
-  # a session, the caller is one of the processes using it.
+  # Matched on the path as the kernel stores it, which is what both sources report:
+  # on macOS the temporary folders sit behind a symlink, and the disk is case-
+  # insensitive, so a canonical typed as .../E4 lives at .../e4. /bin/pwd asks the
+  # kernel; the builtin `pwd -P` resolves symlinks but keeps the case as typed, and
+  # a busy session went unmatched and was removed. Compared byte for byte, and on a
+  # path boundary, so a session called fix is not in use because of fix-login.
+  # This pleach is named as such: standing in a session, the caller is one of the
+  # processes using it.
   local real
   [ -n "$CWD_TABLE" ] || return 0
-  real=$(cd "$1" 2>/dev/null && pwd -P) || return 0
-  printf '%s\n' "$CWD_TABLE" | awk -F'\t' -v d="$real" -v self="$$" '
+  real=$(cd "$1" 2>/dev/null && { /bin/pwd -P 2>/dev/null || pwd -P; }) || return 0
+  printf '%s\n' "$CWD_TABLE" | LC_ALL=C awk -F'\t' -v d="$real" -v self="$$" '
     $3 == d || substr($3, 1, length(d) + 1) == d "/" {
       if (seen[$1]++) next
       print $1 "\t" ($1 == self ? "pleach" : $2)
@@ -1768,22 +1810,23 @@ user_lines() { # $1 = session_users output, $2 = prefix — "pid <n> (<command>)
 warn_if_blind() { # once per run: what cannot be seen is said, never read as "nobody"
   [ "$CWD_BLIND" -eq 1 ] && [ "$CWD_WARNED" -eq 0 ] || return 0
   CWD_WARNED=1
-  warn "this system offers no way to see which processes work where (no /proc, no lsof) — a session in use looks idle here; make sure nothing runs in it"
+  warn "this system offers no way to see which processes work where (no /proc, no lsof), so whether a session is in use cannot be checked here — rm and prune --apply refuse unless given --assume-idle"
 }
 
 cmd_rm() {
-  local name="" force=0 reap=0 do_fetch=0
+  local name="" force=0 reap=0 do_fetch=0 assume_idle=0
   while [ $# -gt 0 ]; do
     case "$1" in
-      --force) force=1 ;;
-      --reap)  reap=1 ;;
-      --fetch) do_fetch=1 ;;
-      -*)      err "unknown flag: $1 (usage: pleach rm <name> [--force] [--reap] [--fetch])" ;;
-      *)       [ -z "$name" ] && name="$1" || err "too many arguments" ;;
+      --force)       force=1 ;;
+      --reap)        reap=1 ;;
+      --fetch)       do_fetch=1 ;;
+      --assume-idle) assume_idle=1 ;;
+      -*)            err "unknown flag: $1 (usage: pleach rm <name> [--force] [--reap] [--fetch] [--assume-idle])" ;;
+      *)             [ -z "$name" ] && name="$1" || err "too many arguments" ;;
     esac
     shift
   done
-  [ -n "$name" ] || err "usage: pleach rm <name> [--force] [--reap] [--fetch]"
+  [ -n "$name" ] || err "usage: pleach rm <name> [--force] [--reap] [--fetch] [--assume-idle]"
   load_config
   # Before anything destructive: refuse when the folder and its own record disagree.
   # --force does not override this, because there is nothing to override — the guard
@@ -1830,7 +1873,13 @@ cmd_rm() {
     user_lines "$users" "  - " >&2
     err "not removed while it is in use — stop them, or step out of it, and run rm again (--force does not override this)"
   fi
-  warn_if_blind
+  # Nothing seen is not nobody there. Where nothing CAN be seen, removing anyway is
+  # a decision the caller takes on by name, never a default it falls into.
+  if [ "$CWD_BLIND" -eq 1 ]; then
+    [ "$assume_idle" -eq 1 ] \
+      || err "cannot tell whether anyone is working in '$name': this system offers no way to see which processes work where (no /proc, no lsof). If you know nobody is, say so: pleach rm $name --assume-idle"
+    warn "whether anyone is working in '$name' cannot be checked here — removing it on --assume-idle"
+  fi
 
   lock
   # Subs first, root last (the root worktree contains the subs').
@@ -1891,11 +1940,14 @@ EOF
 
 # ---------------------------------------------------------------------------
 prune_json() { # $@ = session names — the machine surface for prune (cwd_scan first)
-  # Removable is integrated AND nobody in it; both halves are given rather than the
-  # conclusion, so a caller can tell "wait for the agent to leave" from "has work".
-  local first=1 n problems integrated users pending in_use repo reason pid cmd
+  # Removable is integrated AND nobody in it AND that could be checked; the parts are
+  # given rather than the conclusion, so a caller can tell "wait for the agent to
+  # leave" from "has work" — and an empty in_use from one nobody could fill.
+  local first=1 n problems integrated users pending in_use repo reason pid cmd checked=true
+  [ "$CWD_BLIND" -eq 0 ] || checked=false
   printf '{\n'
   printf '  "base": "%s",\n' "$(json_escape "$BASE")"
+  printf '  "in_use_checked": %s,\n' "$checked"
   printf '  "sessions": ['
   for n in "$@"; do
     integrated=true
@@ -1924,25 +1976,28 @@ EOF
 }
 
 cmd_prune() { # hygiene: remove sessions whose work is fully integrated (dry run by default)
-  local apply=0 do_fetch=0 as_json=0
+  local apply=0 do_fetch=0 as_json=0 assume_idle=0
+  local usage="usage: pleach prune [--apply] [--fetch] [--json] [--assume-idle]"
   while [ $# -gt 0 ]; do
     case "$1" in
       --apply|--yes|-y) apply=1 ;;
       --fetch)          do_fetch=1 ;;
       --json)           as_json=1 ;;
-      -*) err "unknown flag: $1 (usage: pleach prune [--apply] [--fetch] [--json])" ;;
-      *)  err "unexpected argument: $1 (usage: pleach prune [--apply] [--fetch] [--json])" ;;
+      --assume-idle)    assume_idle=1 ;;
+      -*) err "unknown flag: $1 ($usage)" ;;
+      *)  err "unexpected argument: $1 ($usage)" ;;
     esac
     shift
   done
   [ "$as_json" -eq 1 ] && [ "$apply" -eq 1 ] \
-    && err "--json only lists — it does not combine with --apply (usage: pleach prune [--apply] [--fetch] [--json])"
+    && err "--json only lists — it does not combine with --apply ($usage)"
   load_config
   local -a names=() removable=()
   local n problems users pending=0 busy=0
   while IFS= read -r n; do [ -n "$n" ] && names+=("$n"); done < <(session_names)
-  # The base ref is a mirror of origin's, so advancing it changes no session — which
-  # is why --fetch runs for a listing too: the listing is only as true as the base.
+  # Advancing the base changes no session, which is why --fetch runs for a listing
+  # too: the listing is only as true as the base. (With the canonical on its base,
+  # the fast-forward moves the canonical's working tree as well.)
   [ "$do_fetch" -eq 1 ] && [ ${#names[@]} -gt 0 ] && fetch_sessions_base "${names[@]}"
   cwd_scan
   warn_if_blind
@@ -1984,18 +2039,27 @@ cmd_prune() { # hygiene: remove sessions whose work is fully integrated (dry run
     return 0
   fi
   if [ "$apply" -eq 0 ]; then
-    echo "Dry run — remove ${#removable[@]} session(s): pleach prune --apply"
+    if [ "$CWD_BLIND" -eq 1 ]; then
+      echo "Dry run — whether anyone is in them cannot be checked here; if you know nobody is: pleach prune --apply --assume-idle"
+    else
+      echo "Dry run — remove ${#removable[@]} session(s): pleach prune --apply"
+    fi
     [ -z "$hint" ] || echo "$hint"
     return 0
   fi
+  if [ "$CWD_BLIND" -eq 1 ] && [ "$assume_idle" -eq 0 ]; then
+    err "nothing removed: whether anyone is working in these sessions cannot be checked here (no /proc, no lsof). If you know nobody is, say so: pleach prune --apply --assume-idle"
+  fi
   local rc=0 one
+  local -a idle=()
+  [ "$assume_idle" -eq 0 ] || idle=(--assume-idle)
   for n in "${removable[@]}"; do
     # Someone can step into a session after the listing above. rm asks again, and
     # its refusal must cost that one session, not the rest of the sweep — an `err`
     # inside rm would otherwise end the whole run. The subshell keeps errexit on
     # inside rm, which the left-hand side of an || would quietly switch off.
     set +e
-    ( set -e; cmd_rm "$n" )
+    ( set -e; cmd_rm "$n" ${idle[@]+"${idle[@]}"} )
     one=$?
     set -e
     [ "$one" -eq 0 ] || rc=1
@@ -3507,8 +3571,9 @@ Per repo, because a session touching only the api does not care that the docs mo
   --exit-code  Return 1 when something is behind (as `git diff --exit-code`).
   --json       The machine surface: every measured repo, behind or not.
   --fetch      First advance the local base from origin, fast-forward only, in the
-               repos the session(s) mount (see `pleach help fetch`). It moves the
-               base ref and nothing else; warnings go to stderr, never into --json.
+               repos the session(s) mount (see `pleach help fetch`). No session is
+               touched; where the canonical sits on the base, its working tree is
+               fast-forwarded with it. Warnings go to stderr, never into --json.
 
 Only the repos that are behind are listed; when none are, it says so in one line and
 nothing else. It measures the branch each worktree is really ON, not the branch the
@@ -3524,7 +3589,7 @@ canonical checkout, which moves when you pull there, run `pleach fetch`, or pass
 EOF
     ;;
     rm) cat <<'EOF'
-pleach rm <name> [--force] [--reap] [--fetch]
+pleach rm <name> [--force] [--reap] [--fetch] [--assume-idle]
 
 Removes the session's worktrees and its folder. Refuses if any repo has
 uncommitted changes, or commits not yet integrated into the base -- on
@@ -3554,6 +3619,12 @@ them, or step out, and run rm again.
   --fetch   First advance the local base from origin, fast-forward only, in the
             session's repos (see `pleach help fetch`), so a merge that only landed
             on the remote counts as integrated.
+  --assume-idle
+            Where in use CANNOT be checked (no /proc and no lsof — Git Bash on
+            Windows), remove anyway, as if nobody were inside. Without it rm
+            refuses there: nothing seen is not nobody there. Where it can be
+            checked this changes nothing, and never overrides a session seen in
+            use.
 
 "Integrated" is judged against the LOCAL base — if the merge only happened on the
 remote, pass --fetch (or run pleach fetch) first. A squash or rebase merge counts: a
@@ -3561,14 +3632,15 @@ branch whose merge into the base would change nothing is integrated, and its
 session/<name> branch is deleted like a merged one.
 
 "In use" is read from each process's working directory: /proc on Linux, lsof on
-macOS. That is what it sees and all it sees — an editor or a server holding the
+macOS (looked for in /usr/sbin and /usr/bin too, so a bare PATH does not hide
+it). That is what it sees and all it sees — an editor or a server holding the
 session's files open from somewhere else is not counted, nor is another user's
 process, nor a container with the folder mounted. Git Bash on Windows offers
-neither source, so there rm says it cannot tell instead of checking.
+neither source; there rm refuses unless given --assume-idle.
 EOF
     ;;
     prune) cat <<'EOF'
-pleach prune [--apply] [--fetch] [--json]
+pleach prune [--apply] [--fetch] [--json] [--assume-idle]
 
 Post-merge hygiene: finds the sessions whose work is fully integrated into the
 base (same criterion as rm — no uncommitted changes, and no commits outside the
@@ -3587,15 +3659,23 @@ listed as in use, with the pids. How in use is read, and what it cannot see:
             skipped, the rest still go, and the exit code is 1.
   --fetch   First advance the local base from origin, fast-forward only, in every
             repo the sessions mount (see `pleach help fetch`). It runs for a plain
-            listing too: the base ref is a mirror of origin's, so advancing it
-            changes no session, and the listing is only as true as the base.
+            listing too, because the listing is only as true as the base. No
+            session is touched; where the canonical sits on the base, its working
+            tree is fast-forwarded with it.
   --json    The machine surface, for listing (not with --apply):
-              {"base": "main", "sessions": [{"name": "x", "integrated": false,
+              {"base": "main", "in_use_checked": true,
+               "sessions": [{"name": "x", "integrated": false,
                 "in_use": [{"pid": 123, "command": "claude"}],
                 "pending": [{"repo": "api", "reason": "uncommitted or untracked changes"}]}]}
             integrated is the rm criterion; pending says why not (empty when
-            integrated); in_use lists who is inside (empty when nobody is). A
-            session is removable when integrated is true AND in_use is empty.
+            integrated); in_use lists who is inside (empty when nobody is);
+            in_use_checked is false where nobody inside could have been seen
+            (no /proc, no lsof), and every in_use is then empty for that reason.
+            A session is removable when integrated is true AND in_use is empty
+            AND in_use_checked is true.
+  --assume-idle
+            Where in use cannot be checked, --apply refuses and removes nothing;
+            this removes anyway, as if nobody were inside (see `pleach help rm`).
 
 With no flags it is a dry run: it only lists. "Integrated" is judged against the
 LOCAL base — for merges that only landed on the remote, add --fetch or run

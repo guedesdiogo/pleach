@@ -688,7 +688,8 @@ CI runs the suite on ubuntu, macOS and Windows on every push.
   or a server holding the session's files open from elsewhere is not counted, nor is another
   user's process or a container with the folder mounted, and a process can still step in
   between the check and the removal. Git Bash on Windows offers neither source; there `rm`
-  and `prune` say they cannot tell rather than report a session as idle.
+  and `prune --apply` refuse unless given `--assume-idle`, and `prune --json` reports
+  `"in_use_checked": false`.
 - Detecting processes that hold a session's ports needs `lsof` (macOS, Linux), `ss` (Linux)
   or `netstat` (Git Bash on Windows). With none of them, `rm` and `doctor` say nothing rather
   than guess — the ports are still freed, you just are not told who is holding them.
