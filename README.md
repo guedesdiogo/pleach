@@ -287,7 +287,7 @@ pleach fix-x --create                # the same as: pleach open fix-x --create
 # closest command or session, and nothing is created for it.
 
 pleach new fix-x api web             # a focused session: only these sub-repos
-pleach new fix-x --fetch             # update the base from origin first
+pleach new fix-x --fetch             # advance the base from origin first (fast-forward only)
 pleach new fix-y --from fix-x        # stack on fix-x's unmerged work, not on main
 
 pleach ls                            # instant: name, index, ports, repo count
@@ -298,10 +298,12 @@ pleach cd fix-x                      # change into the session (needs shell-init
 pleach path fix-x                    # print where it lives; --canonical for the canonical
 pleach doctor                        # drift, stale locks, port clashes; --fix repairs safely
 
+pleach fetch                         # bring the local main level with origin in every repo
 pleach sync fix-x                    # merge the local main into every repo of the session
 pleach sync fix-x --dry-run          # show what would happen, touch nothing
 pleach sync --all --yes              # every session (explicit --yes outside a TTY)
 pleach status fix-x                  # which of its repos drifted behind the local main
+pleach status fix-x --fetch          # ...after bringing that main level with origin
 
 pleach add fix-x payments            # mount a new sub-repo into an existing session
 pleach repos --sync                  # adopt a new workspace repo across ALL sessions
@@ -311,7 +313,9 @@ pleach each 'git log --oneline -1'   # run a command in the canonical + every se
 pleach each --repos 'git status -s'  # ...and inside every mounted sub-repo
 pleach clean fix-x --apply           # delete git-ignored artifacts (node_modules, builds)
 pleach rm fix-x --reap               # remove the session; --reap kills leftover listeners
-pleach prune --apply                 # remove every fully integrated session
+pleach prune --fetch                 # list what has landed, judged against origin's main
+pleach prune --json                  # the same, machine-readable: integrated, in use, pending
+pleach prune --apply                 # remove every fully integrated session nobody is in
 
 pleach skill --install               # teach your coding agent to drive all of the above
 pleach help sync                     # detailed help per command (and `help config`)
@@ -455,8 +459,9 @@ directories and an `AGENTS.md`, and the harnesses reading that file saw neither 
 nor the conf — nothing told them the workspace had sessions at all.
 
 `pleach skill` emits a Markdown skill, frontmatter and all. It carries what `--help` cannot:
-that removing the session you stand in pulls the ground from under you — and that
-`pleach prune --apply` will do it for you once the work has landed; that shipping from
+that removing the session you stand in pulls the ground from under you — and that the
+guard `rm` and `prune --apply` keep against it sees working directories and nothing else,
+so it is a backstop, not permission to try; that shipping from
 inside a session collides in the *environment* rather than in the files; and that a green
 `conflicts` rules out a textual merge conflict and a duplicated numbered slot — and nothing
 beyond those two. Duplicate route paths, one feature-flag name taken twice, the same port
@@ -676,8 +681,15 @@ CI runs the suite on ubuntu, macOS and Windows on every push.
 - The lock is per `PLEACH_DIR` (atomic `mkdir`); on an NFS share between machines there are
   no guarantees.
 - `rm` and `prune` judge "integrated" against the **local** base. If the merge only landed
-  on the remote, `git fetch` in the repo first — or use `--force`, which preserves the
-  branch.
+  on the remote, advance it first — `pleach fetch`, or `--fetch` on the command itself —
+  or use `--force`, which preserves the branch.
+- "In use" — what keeps `rm` and `prune --apply` off a session someone is working in — is
+  read from each process's working directory: `/proc` on Linux, `lsof` on macOS. An editor
+  or a server holding the session's files open from elsewhere is not counted, nor is another
+  user's process or a container with the folder mounted, and a process can still step in
+  between the check and the removal. Git Bash on Windows offers neither source; there `rm`
+  and `prune --apply` refuse unless given `--assume-idle`, and `prune --json` reports
+  `"in_use_checked": false`.
 - Detecting processes that hold a session's ports needs `lsof` (macOS, Linux), `ss` (Linux)
   or `netstat` (Git Bash on Windows). With none of them, `rm` and `doctor` say nothing rather
   than guess — the ports are still freed, you just are not told who is holding them.

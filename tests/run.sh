@@ -113,6 +113,24 @@ run_noninteractive() {
   if OUT=$("$@" </dev/null 2>&1); then RC=0; else RC=$?; fi
 }
 
+# Like run(), but OUT holds stdout alone - what a consumer of --json actually
+# reads. Warnings on stderr must never be able to corrupt the document.
+run_stdout() {
+  if OUT=$("$@" 2>/dev/null); then RC=0; else RC=$?; fi
+}
+
+# Whether a session is in use is read from each process's working directory: lsof
+# on macOS, /proc on Linux. Git Bash on Windows offers neither, and pleach says so
+# rather than guess, so the assertions that need a process to be SEEN run only
+# where one can be.
+IN_USE_TESTABLE=1
+case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*|CYGWIN*) IN_USE_TESTABLE="" ;; esac
+# Where nothing can be seen, rm and prune --apply refuse unless told to treat the
+# session as idle. The removals this suite expects to happen say so there — and
+# only there: everywhere else the flag stays off, so the guard runs for real.
+IDLE=""
+[ -n "$IN_USE_TESTABLE" ] || IDLE="--assume-idle"
+
 # ---------------------------------------------------------------------------
 # Fixture: canonical + subA + subB, each a git repo with one commit.
 # ---------------------------------------------------------------------------
@@ -287,11 +305,11 @@ echo "work" > "$SESSIONS/s1/g.txt"
 git -C "$SESSIONS/s1" add g.txt
 git -C "$SESSIONS/s1" commit -q -m "work in progress in the root"
 
-run "$PLEACH" rm s1
+run "$PLEACH" rm s1 ${IDLE:+"$IDLE"}
 assert_rc "rm s1 (no --force): non-zero rc" "$RC" 1
 assert_contains "rm s1 (no --force): reports pending work" "$OUT" "pending work"
 
-run "$PLEACH" rm s1 --force
+run "$PLEACH" rm s1 --force ${IDLE:+"$IDLE"}
 assert_rc "rm s1 --force: rc 0" "$RC" 0
 assert_true "rm s1 --force: session folder removed" [ ! -e "$SESSIONS/s1" ]
 assert_true "rm s1 --force: session/s1 branch preserved in the canonical" \
@@ -317,7 +335,7 @@ assert_contains "prune: flags itself as a dry run" "$OUT" "Dry run"
 assert_true "prune (dry run): s2 still there" [ -d "$SESSIONS/s2" ]
 assert_true "prune (dry run): s3 still there" [ -d "$SESSIONS/s3" ]
 
-run "$PLEACH" prune --apply
+run "$PLEACH" prune --apply ${IDLE:+"$IDLE"}
 assert_rc "prune --apply: rc 0" "$RC" 0
 assert_true "prune --apply: s2 removed" [ ! -e "$SESSIONS/s2" ]
 assert_true "prune --apply: s3 kept" [ -d "$SESSIONS/s3" ]
@@ -443,7 +461,7 @@ header "Test 18: every command is documented"
 # ---------------------------------------------------------------------------
 # The help text is the only user-facing documentation inside the tool, so a
 # command with no help topic is a real defect, not a nicety.
-for c in init new open ls path cd add sync status rm prune clean each conflicts repos doctor shell-init completions install update version; do
+for c in init new open ls path cd add sync status rm prune clean each conflicts repos fetch doctor shell-init completions install update version; do
   run "$PLEACH" help "$c"
   if [ "$RC" -eq 0 ] && [ -n "$OUT" ]; then
     ok "help $c: documented"
@@ -1316,7 +1334,7 @@ LOSSY_BLOCK=$(printf '%s\n' "$OUT" | awk '/^● lossy /{p=1} p&&/^● /&&!/lossy
 assert_not_contains "untracked: ls -l does NOT call it removable" \
   "$LOSSY_BLOCK" "fully integrated"
 
-run "$PLEACH" rm lossy
+run "$PLEACH" rm lossy ${IDLE:+"$IDLE"}
 assert_rc "untracked: rm refuses" "$RC" 1
 assert_contains "untracked: and says why" "$OUT" "uncommitted or untracked changes"
 assert_true "untracked: the file is still there" [ -f "$SESSIONS/lossy/subA/brand-new.js" ]
@@ -1326,7 +1344,7 @@ assert_not_contains "untracked: prune does not offer to remove it" "$OUT" "✓ l
 
 # The decisive one: run the destructive path for real. This is the exact command an
 # outsider ran as documented post-merge hygiene, and it took the work with it.
-run "$PLEACH" prune --apply
+run "$PLEACH" prune --apply ${IDLE:+"$IDLE"}
 assert_true "untracked: prune --apply leaves the session standing" [ -d "$SESSIONS/lossy" ]
 assert_true "untracked: and the only copy of the file is still there" \
   [ -f "$SESSIONS/lossy/subA/brand-new.js" ]
@@ -1360,7 +1378,7 @@ git -C "$SESSIONS/spotless/subA" add -A
 git -C "$SESSIONS/spotless/subA" commit -q -m "work that must not vanish"
 mv "$SESSIONS/spotless" "$SESSIONS/spotless-renamed"
 
-run "$PLEACH" rm spotless-renamed
+run "$PLEACH" rm spotless-renamed ${IDLE:+"$IDLE"}
 assert_rc "renamed: rm refuses" "$RC" 1
 assert_contains "renamed: names both the folder and the record" "$OUT" "says 'spotless'"
 assert_contains "renamed: and how to undo it" "$OUT" "Rename it back"
@@ -1368,7 +1386,7 @@ assert_true "renamed: nothing was removed" [ -d "$SESSIONS/spotless-renamed" ]
 
 # --force must not override this: the guard rails cannot be evaluated at all, so
 # forcing would mean deleting blind.
-run "$PLEACH" rm spotless-renamed --force
+run "$PLEACH" rm spotless-renamed --force ${IDLE:+"$IDLE"}
 assert_rc "renamed: --force does not override it either" "$RC" 1
 assert_true "renamed: still nothing removed" [ -d "$SESSIONS/spotless-renamed" ]
 
@@ -1377,7 +1395,7 @@ assert_rc "renamed: doctor reports it" "$RC" 1
 assert_contains "renamed: doctor names the mismatch" "$OUT" "says 'spotless'"
 
 mv "$SESSIONS/spotless-renamed" "$SESSIONS/spotless"
-run "$PLEACH" rm spotless --force
+run "$PLEACH" rm spotless --force ${IDLE:+"$IDLE"}
 assert_rc "renamed: removable again once the name matches" "$RC" 0
 assert_true "renamed: and the folder is actually gone" [ ! -d "$SESSIONS/spotless" ]
 
@@ -1568,8 +1586,18 @@ SIB_BEFORE=no
 [ -d "$MINI2/.sessions/sibling" ] && SIB_BEFORE=yes
 assert_eq "nested: the sibling session exists before the removal" "$SIB_BEFORE" "yes"
 
-run bash -c "cd '$MINI2/.sessions/sibling' && $BARE '$PLEACH' rm sibling --force"
-assert_rc "nested: and rm can find the session it is standing in" "$RC" 0
+# Standing in the session it removes, rm resolves it and then refuses: the caller
+# is a process working inside it, and a session in use is not removed — not even
+# with --force. Resolution from inside a session is what this test is about, so the
+# removal itself runs from inside the OTHER one.
+if [ -n "$IN_USE_TESTABLE" ]; then
+  run bash -c "cd '$MINI2/.sessions/sibling' && $BARE '$PLEACH' rm sibling --force"
+  assert_rc "nested: rm finds the session it stands in, and refuses to pull it from under the caller" "$RC" 1
+  assert_contains "nested: saying it is in use" "$OUT" "is in use"
+  assert_true "nested: so it is still there" [ -d "$MINI2/.sessions/sibling" ]
+fi
+run bash -c "cd '$MINI2/.sessions/inner' && $BARE '$PLEACH' rm sibling --force $IDLE"
+assert_rc "nested: and rm from inside another session finds it" "$RC" 0
 assert_true "nested: which is really gone" [ ! -d "$MINI2/.sessions/sibling" ]
 
 # Defence in depth: even with the order right, a canonical that is itself a session
@@ -1636,7 +1664,7 @@ assert_contains "incomplete: ls -l flags it" "$OUT" "creation never finished"
 assert_not_contains "incomplete: and does NOT call it fully integrated" \
   "$OUT" "fully integrated"
 
-run bash -c "$PIN3 '$PLEACH' rm finished --force"
+run bash -c "$PIN3 '$PLEACH' rm finished --force $IDLE"
 assert_rc "incomplete: rm removes it" "$RC" 0
 assert_true "incomplete: and the marker goes with it, not left as litter" \
   [ ! -e "$(mark_of finished)" ]
@@ -2221,7 +2249,7 @@ assert_contains "pending: on the branch the worktree is on" "$OUT" "work/real"
 
 # rm must refuse for the same reason — prune only calls rm, so a guard that lives
 # solely in prune is one flag away from being skipped.
-run bash -c "$PIN10 '$PLEACH' rm onbranch"
+run bash -c "$PIN10 '$PLEACH' rm onbranch $IDLE"
 assert_rc "pending: rm refuses too" "$RC" 1
 assert_contains "pending: and says why" "$OUT" "pending work"
 assert_true "pending: the session is still there" [ -d "$S10/onbranch" ]
@@ -2705,7 +2733,7 @@ assert_contains "squash: a squash-merged PR branch the worktree sits on is remov
 assert_contains "squash: a base that rewrote the same lines still reads as pending" \
   "$OUT" "● clash — pending work:"
 
-run bash -c "$PIN18 '$PLEACH' prune --apply"
+run bash -c "$PIN18 '$PLEACH' prune --apply $IDLE"
 assert_rc "squash: prune --apply rc 0" "$RC" 0
 assert_true "squash: sq removed" [ ! -e "$S18/sq" ]
 assert_true "squash: pr removed" [ ! -e "$S18/pr" ]
@@ -2901,8 +2929,12 @@ printf '%s\n' "${COMPREPLY[@]}"
 COMPLETE_BASH
 CB="$PIN21 PATH='$COMPBIN:$PATH' bash '$SANDBOX/complete.bash'"
 
-run bash -c "$CB pleach fe"
+# "fea", not "fe": `fetch` is a command, and "fe" is now rightly both.
+run bash -c "$CB pleach fea"
 assert_eq "bash: the first word completes to a session" "$OUT" "feat-search"
+run bash -c "$CB pleach fe"
+assert_eq "bash: a prefix shared by a command and a session offers both" \
+  "$(printf '%s\n' "$OUT" | sort | tr '\n' ' ')" "feat-search fetch "
 run bash -c "$CB pleach ''"
 assert_contains "bash: an empty first word offers the sessions" "$OUT" "fix-login"
 assert_contains "bash: and still the commands" "$OUT" "status"
@@ -2939,6 +2971,453 @@ COMPLETE_ZSH
   assert_contains "zsh: and still the commands" "$OUT" "status"
 else
   echo "  (zsh not installed here — only its #compdef line was checked)"
+fi
+
+# ---------------------------------------------------------------------------
+header "Test 65: new --fetch cuts from what origin has, with the base checked out"
+# ---------------------------------------------------------------------------
+# Every repo here is a clone of an upstream in the sandbox, so --fetch has somewhere
+# to reach that is not the network. The canonical sits on main, as canonicals do,
+# which is exactly where `git fetch origin main:main` refuses: new --fetch fell back
+# to a plain fetch, moved origin/main, left the local main where it was, cut the
+# session from that — and then advised creating "with --fetch", which it had been.
+MINI22=$(cd "$SANDBOX" && mkdir -p fetch && cd fetch && pwd)
+UP22="$MINI22/upstream"
+for r in root api; do
+  setup_repo "$UP22/$r"
+  echo "$r" > "$UP22/$r/f.txt"
+  git -C "$UP22/$r" add -A && git -C "$UP22/$r" commit -q -m "initial $r"
+done
+git clone -q "$UP22/root" "$MINI22/canon"
+git clone -q "$UP22/api" "$MINI22/canon/api"
+for r in "$MINI22/canon" "$MINI22/canon/api"; do
+  git -C "$r" config user.email "test@test"
+  git -C "$r" config user.name "test"
+done
+printf 'PLEACH_SUBS=(api)\n' > "$MINI22/canon/.pleach.conf"
+PIN22="env PLEACH_CANONICAL=$MINI22/canon PLEACH_EXPECT_CANONICAL=$MINI22/canon"
+S22="$MINI22/.sessions"
+
+up_move() { # <upstream repo> <message> — a commit lands on origin's main, nowhere else
+  echo "$2" >> "$1/f.txt"
+  git -C "$1" commit -q -am "$2"
+}
+head_of() { # <repo> [ref] — the commit it names, empty when it names none
+  git -C "$1" rev-parse --verify --quiet "${2:-HEAD}" 2>/dev/null || true
+}
+
+up_move "$UP22/root" "root moved on origin"
+up_move "$UP22/api" "api moved on origin"
+run bash -c "$PIN22 '$PLEACH' new fresh --fetch --no-bootstrap"
+assert_rc "new --fetch: rc 0" "$RC" 0
+assert_eq "new --fetch: the canonical's checked-out main reached origin's" \
+  "$(head_of "$MINI22/canon" main)" "$(head_of "$UP22/root" main)"
+assert_eq "new --fetch: and so did the sub-repo's" \
+  "$(head_of "$MINI22/canon/api" main)" "$(head_of "$UP22/api" main)"
+assert_eq "new --fetch: the session is cut from it, in the root" \
+  "$(head_of "$S22/fresh")" "$(head_of "$UP22/root" main)"
+assert_eq "new --fetch: and in the sub-repo" \
+  "$(head_of "$S22/fresh/api")" "$(head_of "$UP22/api" main)"
+# warn_if_behind's line. fetch_base's own note says "N behind origin/main" too, so
+# the assertion is on the wording only the stale-base warning uses.
+assert_not_contains "new --fetch: no stale-base advice after a fetch that worked" "$OUT" "commit(s) behind origin/main"
+assert_eq "new --fetch: the canonical's working tree followed the fast-forward" \
+  "$(git -C "$MINI22/canon" status --porcelain --untracked-files=no)" ""
+
+# A base it cannot advance is used as it is, and the warning says why — rather than
+# pointing at the flag that was just passed.
+echo "edited in the canonical" >> "$MINI22/canon/f.txt"
+up_move "$UP22/root" "root moved again"
+STALE22=$(head_of "$MINI22/canon" main)
+run bash -c "$PIN22 '$PLEACH' new held --fetch --no-bootstrap"
+assert_rc "new --fetch, dirty base: the session is still created" "$RC" 0
+assert_contains "new --fetch, dirty base: says why the base did not move" "$OUT" "uncommitted changes"
+assert_not_contains "new --fetch, dirty base: and no stale-base advice on top of it" "$OUT" "commit(s) behind origin/main"
+assert_eq "new --fetch, dirty base: nothing was forced through" \
+  "$(head_of "$MINI22/canon" main)" "$STALE22"
+git -C "$MINI22/canon" checkout -q -- f.txt
+
+# ---------------------------------------------------------------------------
+header "Test 66: pleach fetch brings every local base level with origin"
+# ---------------------------------------------------------------------------
+# The local base is meant to be a fast-forward mirror of origin, refreshed before
+# anything reads it. One command for the whole workspace, a line per repo, and an
+# exit code a script can stop on.
+run bash -c "$PIN22 '$PLEACH' fetch"
+assert_rc "fetch: rc 0 when every base could be advanced" "$RC" 0
+assert_contains "fetch: reports what moved, per repo" "$OUT" "root: main advanced"
+assert_contains "fetch: and by how much" "$OUT" "(+1)"
+assert_contains "fetch: and what was already level" "$OUT" "api: main up to date"
+assert_eq "fetch: the canonical's main is origin's" \
+  "$(head_of "$MINI22/canon" main)" "$(head_of "$UP22/root" main)"
+
+run bash -c "$PIN22 '$PLEACH' fetch"
+assert_rc "fetch, again: rc 0" "$RC" 0
+assert_not_contains "fetch, again: nothing moves the second time" "$OUT" "advanced"
+
+# Stale remote-tracking refs go too — what --prune is for.
+git -C "$UP22/root" branch -q gone
+run bash -c "$PIN22 '$PLEACH' fetch"
+assert_true "fetch: picks up a branch origin has" \
+  git -C "$MINI22/canon" show-ref --verify --quiet refs/remotes/origin/gone
+git -C "$UP22/root" branch -q -D gone
+run bash -c "$PIN22 '$PLEACH' fetch"
+assert_true "fetch: and prunes it once origin has dropped it" \
+  bash -c "! git -C '$MINI22/canon' show-ref --verify --quiet refs/remotes/origin/gone"
+
+# From inside a session it acts on the canonical's repos: the canonical comes from
+# the session's own .session-env here, not from the harness's pin.
+up_move "$UP22/api" "api moved while a session was open"
+run bash -c "cd '$S22/fresh' && env -u PLEACH_CANONICAL PLEACH_EXPECT_CANONICAL='$MINI22/canon' HOME='$NOHOME' '$PLEACH' fetch"
+assert_rc "fetch from inside a session: rc 0" "$RC" 0
+assert_eq "fetch from inside a session: the canonical's sub-repo base moved" \
+  "$(head_of "$MINI22/canon/api" main)" "$(head_of "$UP22/api" main)"
+
+# Uncommitted changes to tracked files: never forced, never stashed.
+echo "edited in the canonical" >> "$MINI22/canon/f.txt"
+up_move "$UP22/root" "root moved under an edit"
+STALE22=$(head_of "$MINI22/canon" main)
+run bash -c "$PIN22 '$PLEACH' fetch"
+assert_rc "fetch, dirty base: rc 1" "$RC" 1
+assert_contains "fetch, dirty base: names the repo and the reason" \
+  "$OUT" "root: main not advanced — uncommitted changes"
+assert_contains "fetch, dirty base: the other repos are still reported" "$OUT" "api: main up to date"
+assert_eq "fetch, dirty base: the base is left where it was" \
+  "$(head_of "$MINI22/canon" main)" "$STALE22"
+assert_true "fetch, dirty base: and so is the edit" \
+  grep -q "edited in the canonical" "$MINI22/canon/f.txt"
+git -C "$MINI22/canon" checkout -q -- f.txt
+
+# A base with commits origin does not have cannot be fast-forwarded.
+echo "local only" >> "$MINI22/canon/api/f.txt"
+git -C "$MINI22/canon/api" commit -q -am "a commit only the local main has"
+up_move "$UP22/api" "a commit only origin has"
+run bash -c "$PIN22 '$PLEACH' fetch"
+assert_rc "fetch, diverged base: rc 1" "$RC" 1
+assert_contains "fetch, diverged base: says so" "$OUT" "api: main not advanced — diverged"
+git -C "$MINI22/canon/api" reset -q --hard origin/main
+
+# Not checked out, the ref moves on its own; checked out in another worktree, it
+# is that worktree's to move.
+git -C "$MINI22/canon/api" checkout -q -b elsewhere
+up_move "$UP22/api" "origin moves while the canonical sits elsewhere"
+run bash -c "$PIN22 '$PLEACH' fetch"
+assert_rc "fetch, base not checked out: rc 0" "$RC" 0
+assert_eq "fetch, base not checked out: the ref moves on its own" \
+  "$(head_of "$MINI22/canon/api" main)" "$(head_of "$UP22/api" main)"
+git -C "$MINI22/canon/api" worktree add -q "$MINI22/api-on-main" main
+up_move "$UP22/api" "origin moves while another worktree holds main"
+run bash -c "$PIN22 '$PLEACH' fetch"
+assert_rc "fetch, base held by another worktree: rc 1" "$RC" 1
+assert_contains "fetch, base held by another worktree: names it" "$OUT" "api-on-main"
+git -C "$MINI22/canon/api" worktree remove "$MINI22/api-on-main"
+git -C "$MINI22/canon/api" checkout -q main
+
+# Unreachable origin.
+git -C "$MINI22/canon" remote set-url origin "$MINI22/nowhere"
+run bash -c "$PIN22 '$PLEACH' fetch"
+assert_rc "fetch, origin unreachable: rc 1" "$RC" 1
+assert_contains "fetch, origin unreachable: says the fetch failed" \
+  "$OUT" "root: main not advanced — fetch from origin failed"
+git -C "$MINI22/canon" remote set-url origin "$UP22/root"
+
+run bash -c "$PIN22 '$PLEACH' fetch --bogus"
+assert_rc "fetch: an unknown flag is refused" "$RC" 1
+run bash -c "$PIN22 '$PLEACH' fetch"
+assert_rc "fetch: level again once the obstacles are gone" "$RC" 0
+
+# ---------------------------------------------------------------------------
+header "Test 67: status, prune and rm judge against origin's base with --fetch"
+# ---------------------------------------------------------------------------
+# The case the rule exists for: work merged on the remote reads as pending for as
+# long as the local base is stale, so prune keeps the session and rm refuses it.
+run bash -c "$PIN22 '$PLEACH' new landed --no-bootstrap"
+assert_rc "landed: created" "$RC" 0
+echo "work" > "$S22/landed/work.txt"
+git -C "$S22/landed" add work.txt
+git -C "$S22/landed" commit -q -m "work that is merged on origin"
+git -C "$UP22/root" fetch -q "$MINI22/canon" session/landed
+git -C "$UP22/root" merge -q --no-edit FETCH_HEAD
+
+run bash -c "$PIN22 '$PLEACH' prune"
+assert_contains "prune: merged only on origin, it still reads as pending" "$OUT" "landed — pending work"
+assert_contains "prune: and the hint names the way out" "$OUT" "--fetch"
+run bash -c "$PIN22 '$PLEACH' prune --fetch"
+assert_rc "prune --fetch: rc 0" "$RC" 0
+assert_contains "prune --fetch: integrated once the base has caught up" \
+  "$OUT" "landed — fully integrated (removable)"
+assert_contains "prune --fetch: still a dry run" "$OUT" "Dry run"
+assert_true "prune --fetch: listing removed nothing" [ -d "$S22/landed" ]
+assert_eq "prune --fetch: the base moved even though it only listed" \
+  "$(head_of "$MINI22/canon" main)" "$(head_of "$UP22/root" main)"
+
+run bash -c "$PIN22 '$PLEACH' new landed2 --no-bootstrap"
+echo "more work" > "$S22/landed2/work2.txt"
+git -C "$S22/landed2" add work2.txt
+git -C "$S22/landed2" commit -q -m "more work merged on origin"
+git -C "$UP22/root" fetch -q "$MINI22/canon" session/landed2
+git -C "$UP22/root" merge -q --no-edit FETCH_HEAD
+run bash -c "$PIN22 '$PLEACH' rm landed2 $IDLE"
+assert_rc "rm: merged only on origin, it is refused" "$RC" 1
+run bash -c "$PIN22 '$PLEACH' rm landed2 --fetch $IDLE"
+assert_rc "rm --fetch: removed without --force" "$RC" 0
+assert_true "rm --fetch: really gone" [ ! -d "$S22/landed2" ]
+assert_true "rm --fetch: its branch counted as integrated and went too" \
+  bash -c "! git -C '$MINI22/canon' show-ref --verify --quiet refs/heads/session/landed2"
+
+up_move "$UP22/api" "api moves on origin"
+run bash -c "$PIN22 '$PLEACH' status landed"
+assert_not_contains "status: against the stale base, api is not behind anything" "$OUT" "api:"
+run bash -c "$PIN22 '$PLEACH' status landed --fetch"
+assert_contains "status --fetch: measured against origin's base" "$OUT" "api: 1 commit(s) behind"
+
+# What a JSON consumer reads is stdout, and a fetch that cannot advance a base
+# warns on stderr — it must never land in the document.
+echo "edited in the canonical" >> "$MINI22/canon/f.txt"
+up_move "$UP22/root" "root moved under an edit, once more"
+run bash -c "$PIN22 '$PLEACH' prune --json --fetch"
+assert_contains "prune --json --fetch: the warning is there (on stderr)" "$OUT" "not advanced"
+run_stdout bash -c "$PIN22 '$PLEACH' prune --json --fetch"
+assert_rc "prune --json --fetch: rc 0" "$RC" 0
+if command -v python3 >/dev/null 2>&1; then
+  if printf '%s' "$OUT" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+    ok "prune --json --fetch: stdout parses as JSON, warning and all"
+  else
+    fail "prune --json --fetch: stdout is not valid JSON"
+  fi
+else
+  echo "  (skipped: no python3 to validate the JSON)"
+fi
+run_stdout bash -c "$PIN22 '$PLEACH' status landed --json --fetch"
+assert_eq "status --json --fetch: stdout opens the document and nothing else" \
+  "$(printf '%s\n' "$OUT" | head -1)" "{"
+git -C "$MINI22/canon" checkout -q -- f.txt
+
+# ---------------------------------------------------------------------------
+header "Test 68: prune --json is the machine surface for prune"
+# ---------------------------------------------------------------------------
+# Other agents code against this shape, so the keys, their order and their types
+# are asserted, not just found somewhere in the text.
+MINI23=$(cd "$SANDBOX" && mkdir -p prunejson && cd prunejson && pwd)
+setup_repo "$MINI23/canon"
+echo root > "$MINI23/canon/f.txt"
+git -C "$MINI23/canon" add -A && git -C "$MINI23/canon" commit -q -m initial
+setup_repo "$MINI23/canon/api"
+echo api > "$MINI23/canon/api/f.txt"
+git -C "$MINI23/canon/api" add -A && git -C "$MINI23/canon/api" commit -q -m initial
+printf 'PLEACH_SUBS=(api)\n' > "$MINI23/canon/.pleach.conf"
+PIN23="env PLEACH_CANONICAL=$MINI23/canon PLEACH_EXPECT_CANONICAL=$MINI23/canon"
+S23="$MINI23/.sessions"
+
+run_stdout bash -c "$PIN23 '$PLEACH' prune --json"
+assert_rc "prune --json, no sessions: rc 0" "$RC" 0
+assert_contains "prune --json, no sessions: still a document, with an empty list" "$OUT" '"sessions": []'
+
+run bash -c "$PIN23 '$PLEACH' new clean --no-bootstrap && $PIN23 '$PLEACH' new dirty --no-bootstrap"
+assert_rc "prune --json: two sessions created" "$RC" 0
+echo "new file" > "$S23/dirty/api/new.txt"
+
+run_stdout bash -c "$PIN23 '$PLEACH' prune --json"
+assert_rc "prune --json: rc 0" "$RC" 0
+assert_contains "prune --json: names the base" "$OUT" '"base": "main"'
+if [ -n "$IN_USE_TESTABLE" ]; then
+  assert_contains "prune --json: says it could check who is inside" "$OUT" '"in_use_checked": true'
+fi
+assert_contains "prune --json: an integrated session" "$OUT" \
+  '{"name": "clean", "integrated": true, "in_use": [], "pending": []}'
+assert_contains "prune --json: a session with pending work, and where" "$OUT" \
+  '{"name": "dirty", "integrated": false, "in_use": [], "pending": [{"repo": "api", "reason": "uncommitted or untracked changes"}]}'
+if command -v python3 >/dev/null 2>&1; then
+  if printf '%s' "$OUT" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert list(d) == ["base", "in_use_checked", "sessions"], list(d)
+assert isinstance(d["in_use_checked"], bool)
+for s in d["sessions"]:
+    assert list(s) == ["name", "integrated", "in_use", "pending"], list(s)
+    assert isinstance(s["integrated"], bool)
+    for u in s["in_use"]:
+        assert list(u) == ["pid", "command"] and type(u["pid"]) is int, u
+    for p in s["pending"]:
+        assert list(p) == ["repo", "reason"], p
+    assert s["integrated"] == (s["pending"] == []), s
+' 2>/dev/null; then
+    ok "prune --json: the shape holds, key for key and type for type"
+  else
+    fail "prune --json: the document does not have the agreed shape"
+  fi
+else
+  echo "  (skipped: no python3 to validate the JSON)"
+fi
+
+run bash -c "$PIN23 '$PLEACH' prune --json --apply"
+assert_rc "prune --json --apply: refused — --json only lists" "$RC" 1
+assert_true "prune --json --apply: and nothing was removed" [ -d "$S23/clean" ]
+
+# rm asks again before it removes, and a refusal there must cost that one session,
+# not the rest of the sweep. A renamed folder is the refusal that can be planted on
+# every platform: prune calls it integrated, rm will not judge it by name.
+run bash -c "$PIN23 '$PLEACH' new orig --no-bootstrap && $PIN23 '$PLEACH' new zz --no-bootstrap"
+assert_rc "prune --apply sweep: sessions created" "$RC" 0
+mv "$S23/orig" "$S23/moved"
+run bash -c "$PIN23 '$PLEACH' prune --apply $IDLE"
+assert_rc "prune --apply sweep: a session rm refuses makes the exit code 1" "$RC" 1
+assert_true "prune --apply sweep: the refused one is left standing" [ -d "$S23/moved" ]
+assert_true "prune --apply sweep: and the sweep still reaches the ones after it" [ ! -e "$S23/zz" ]
+mv "$S23/moved" "$S23/orig"
+run bash -c "$PIN23 '$PLEACH' rm orig $IDLE"
+assert_rc "prune --apply sweep: renamed back, it removes as usual" "$RC" 0
+
+# ---------------------------------------------------------------------------
+header "Test 69: a session some process is working in is never removed"
+# ---------------------------------------------------------------------------
+# A session that was just created is clean and has no commits, so by the pending-
+# work criterion alone it is integrated, and prune --apply would remove the session
+# another agent had just opened — or the one the caller stands in. The guard reads
+# each process's working directory.
+if [ -n "$IN_USE_TESTABLE" ]; then
+  run bash -c "$PIN23 '$PLEACH' new busy --no-bootstrap && $PIN23 '$PLEACH' new busy-two --no-bootstrap"
+  assert_rc "in use: sessions created" "$RC" 0
+  # In a sub-repo of busy-two. busy is a prefix of busy-two's name, so this also
+  # checks that a path is matched on its boundary and not as a string.
+  # Detached from the harness's output, so a run that dies mid-test cannot leave
+  # it holding a pipe that keeps the CI step waiting for the full five minutes.
+  ( cd "$S23/busy-two/api" && exec sleep 300 ) >/dev/null 2>&1 </dev/null &
+  HOLD=$!
+  sleep 1
+
+  run_stdout bash -c "$PIN23 '$PLEACH' prune --json"
+  assert_contains "in use: --json carries the pid" "$OUT" "{\"pid\": $HOLD, \"command\": \"sleep\"}"
+  if command -v python3 >/dev/null 2>&1; then
+    if printf '%s' "$OUT" | HOLD="$HOLD" python3 -c '
+import json, os, sys
+s = {x["name"]: x for x in json.load(sys.stdin)["sessions"]}
+assert s["busy-two"]["integrated"] is True
+assert s["busy-two"]["in_use"] == [{"pid": int(os.environ["HOLD"]), "command": "sleep"}], s["busy-two"]
+assert s["busy"]["in_use"] == [], s["busy"]
+' 2>/dev/null; then
+      ok "in use: integrated and in use, and a neighbour sharing a name prefix is not"
+    else
+      fail "in use: the in_use lists are wrong"
+    fi
+  fi
+
+  run bash -c "$PIN23 '$PLEACH' prune"
+  assert_contains "in use: the listing says so" "$OUT" "busy-two — fully integrated, but in use"
+  assert_contains "in use: naming the process" "$OUT" "pid $HOLD (sleep)"
+  assert_contains "in use: the neighbour is still removable" "$OUT" "busy — fully integrated (removable)"
+
+  run bash -c "$PIN23 '$PLEACH' prune --apply"
+  assert_rc "in use: prune --apply rc 0" "$RC" 0
+  assert_true "in use: prune --apply keeps the session in use" [ -d "$S23/busy-two" ]
+  assert_true "in use: and removes the idle integrated neighbour" [ ! -e "$S23/busy" ]
+  assert_true "in use: pending work is kept as before" [ -d "$S23/dirty" ]
+
+  run bash -c "$PIN23 '$PLEACH' rm busy-two"
+  assert_rc "in use: rm refuses" "$RC" 1
+  assert_contains "in use: rm says why" "$OUT" "is in use"
+  assert_contains "in use: and by whom" "$OUT" "pid $HOLD (sleep)"
+  run bash -c "$PIN23 '$PLEACH' rm busy-two --force"
+  assert_rc "in use: --force does not override it" "$RC" 1
+  assert_true "in use: the session is still there" [ -d "$S23/busy-two" ]
+
+  kill "$HOLD" 2>/dev/null || true
+  wait "$HOLD" 2>/dev/null || true
+  run bash -c "$PIN23 '$PLEACH' rm busy-two"
+  assert_rc "in use: once the process is gone, rm removes it" "$RC" 0
+  assert_true "in use: really gone" [ ! -e "$S23/busy-two" ]
+
+  # The caller is a process too: standing in a session, you cannot remove it.
+  run bash -c "$PIN23 '$PLEACH' new here --no-bootstrap"
+  run bash -c "cd '$S23/here' && $PIN23 '$PLEACH' rm here"
+  assert_rc "in use: rm from inside the session refuses" "$RC" 1
+  assert_contains "in use: naming pleach itself among the users" "$OUT" "(pleach)"
+  run bash -c "cd '$S23/here/api' && $PIN23 '$PLEACH' prune --apply"
+  assert_true "in use: prune --apply from inside keeps the session it stands in" [ -d "$S23/here" ]
+  run bash -c "$PIN23 '$PLEACH' rm here"
+  assert_rc "in use: from outside, it goes" "$RC" 0
+
+  # Each of these made the guard fail OPEN — a busy session removed with rc 0 — in
+  # a review: a canonical typed in another case, an accented path read without a
+  # UTF-8 locale, and lsof outside PATH. The holder sits in a directory with a
+  # backslash in its name, which lsof prints doubled.
+  hold_in() { # <dir> — a process with its working directory there; pid in HOLD
+    ( cd "$1" && exec sleep 300 ) >/dev/null 2>&1 </dev/null &
+    HOLD=$!
+    sleep 1
+  }
+  release() { kill "$HOLD" 2>/dev/null || true; wait "$HOLD" 2>/dev/null || true; }
+
+  # macOS disks are case-insensitive: the canonical can be named in a case the disk
+  # does not store, and the kernel reports the stored one.
+  CASED23="$(dirname "$MINI23")/PRUNEJSON/canon"
+  if [ -d "$CASED23" ]; then
+    PINCASE="env PLEACH_CANONICAL=$CASED23 PLEACH_EXPECT_CANONICAL=$CASED23"
+    run bash -c "$PINCASE '$PLEACH' new cased --no-bootstrap"
+    hold_in "$S23/cased"
+    run bash -c "$PINCASE '$PLEACH' rm cased"
+    assert_rc "in use, canonical typed in another case: rm still refuses" "$RC" 1
+    assert_contains "in use, canonical typed in another case: and says why" "$OUT" "is in use"
+    run_stdout bash -c "$PINCASE '$PLEACH' prune --json"
+    assert_contains "in use, canonical typed in another case: --json sees the holder" "$OUT" "\"pid\": $HOLD"
+    release
+    run bash -c "$PINCASE '$PLEACH' rm cased"
+    assert_rc "in use, canonical typed in another case: released, it goes" "$RC" 0
+  else
+    echo "  (case-sensitive filesystem — the case-folding check does not apply here)"
+  fi
+
+  # An accented directory name, spelled in octal: the repository itself stays ASCII.
+  ACCENTED=$(printf 'reposit\303\263rio')
+  MINI24=$(cd "$SANDBOX" && mkdir -p "$ACCENTED" && cd "$ACCENTED" && pwd)
+  setup_repo "$MINI24/canon"
+  echo root > "$MINI24/canon/f.txt"
+  git -C "$MINI24/canon" add -A && git -C "$MINI24/canon" commit -q -m initial
+  printf 'PLEACH_SUBS=()\n' > "$MINI24/canon/.pleach.conf"
+  PIN24="env -u LANG -u LC_ALL -u LC_CTYPE PLEACH_CANONICAL=$MINI24/canon PLEACH_EXPECT_CANONICAL=$MINI24/canon"
+  run bash -c "$PIN24 '$PLEACH' new acc --no-bootstrap"
+  assert_rc "in use, accented path: session created" "$RC" 0
+  # Ignored, so the session stays integrated: the guard is then the only thing
+  # standing between a busy session and its removal.
+  mkdir -p "$MINI24/canon/.git/info"
+  printf 'back*slash/\n' >> "$MINI24/canon/.git/info/exclude"
+  mkdir -p "$MINI24/.sessions/acc/back\\slash"
+  hold_in "$MINI24/.sessions/acc/back\\slash"
+  run bash -c "$PIN24 '$PLEACH' rm acc"
+  assert_rc "in use, accented path and no locale: rm still refuses" "$RC" 1
+  assert_contains "in use, accented path and no locale: naming the holder" "$OUT" "pid $HOLD (sleep)"
+
+  # cron and launchd run with PATH=/usr/bin:/bin, and macOS keeps lsof in /usr/sbin.
+  if [ "$(uname -s)" = Darwin ]; then
+    run bash -c "PATH=/usr/bin:/bin $PIN24 '$PLEACH' rm acc"
+    assert_rc "in use, lsof outside PATH: rm still refuses" "$RC" 1
+    assert_contains "in use, lsof outside PATH: and says why" "$OUT" "is in use"
+    run bash -c "PATH=/usr/bin:/bin $PIN24 '$PLEACH' prune --apply"
+    assert_true "in use, lsof outside PATH: prune --apply keeps it" [ -d "$MINI24/.sessions/acc" ]
+  fi
+  release
+  run bash -c "$PIN24 '$PLEACH' rm acc"
+  assert_rc "in use, accented path: released, it goes" "$RC" 0
+else
+  # No lsof and no /proc to read working directories from. "Could not look" is
+  # never passed off as "nobody is in it": the listing says so, the JSON says so,
+  # and nothing is removed until the caller takes it on with --assume-idle.
+  run bash -c "$PIN23 '$PLEACH' new blind --no-bootstrap"
+  run bash -c "$PIN23 '$PLEACH' prune"
+  assert_contains "in use, blind: prune says it cannot check who is inside" "$OUT" "cannot be checked here"
+  run_stdout bash -c "$PIN23 '$PLEACH' prune --json"
+  assert_contains "in use, blind: --json says so too" "$OUT" '"in_use_checked": false'
+  run bash -c "$PIN23 '$PLEACH' prune --apply"
+  assert_rc "in use, blind: prune --apply refuses" "$RC" 1
+  assert_contains "in use, blind: naming the flag that takes it on" "$OUT" "--assume-idle"
+  assert_true "in use, blind: and removes nothing" [ -d "$S23/blind" ]
+  run bash -c "$PIN23 '$PLEACH' rm blind"
+  assert_rc "in use, blind: rm refuses too" "$RC" 1
+  assert_contains "in use, blind: naming the same flag" "$OUT" "--assume-idle"
+  assert_true "in use, blind: the session is still there" [ -d "$S23/blind" ]
+  run bash -c "$PIN23 '$PLEACH' rm blind --assume-idle"
+  assert_rc "in use, blind: --assume-idle removes it" "$RC" 0
+  assert_true "in use, blind: really gone" [ ! -e "$S23/blind" ]
 fi
 
 # ---------------------------------------------------------------------------
