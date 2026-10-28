@@ -687,7 +687,10 @@ CI runs the suite on ubuntu, macOS and Windows on every push.
   read from each process's working directory: `/proc` on Linux, `lsof` on macOS. An editor
   or a server holding the session's files open from elsewhere is not counted, nor is another
   user's process or a container with the folder mounted, and a process can still step in
-  between the check and the removal. Git Bash on Windows offers neither source; there `rm`
+  between the check and the removal. A caller inside a sandbox that hides other processes
+  sees only itself, and reads as "checked, nobody there". `lsof`'s control-character escapes
+  (`\t`, `\n`, `^X`) are not decoded, so a session whose path holds a control character is
+  never matched. Git Bash on Windows offers neither source; there `rm`
   and `prune --apply` refuse unless given `--assume-idle`, and `prune --json` reports
   `"in_use_checked": false`.
 - Detecting processes that hold a session's ports needs `lsof` (macOS, Linux), `ss` (Linux)

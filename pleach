@@ -1136,8 +1136,12 @@ fetch_base() { # $1 repo, [$2 = prune] — advances the LOCAL base from origin
     # Not checked out here, so only the ref moves. Fetching from the repo itself is
     # the fast-forward-only way to move it, and git refuses when another worktree
     # has the branch checked out: that worktree's files would stop matching its HEAD.
+    # The branch name reaches awk through the environment: -v would read escapes in it.
     holder=$(git -C "$repo" worktree list --porcelain 2>/dev/null \
-      | awk -v want="branch refs/heads/$BASE" '/^worktree /{ wt = substr($0, 10) } $0 == want { print wt; exit }')
+      | PLEACH_AWK_WANT="branch refs/heads/$BASE" awk '
+          BEGIN { want = ENVIRON["PLEACH_AWK_WANT"] }
+          /^worktree / { wt = substr($0, 10) }
+          $0 == want { print wt; exit }')
     if [ -n "$holder" ]; then
       FETCH_NOTE="$BASE not advanced — it is checked out at $holder; advance it there"
     else
@@ -1791,12 +1795,15 @@ session_users() { # $1 session dir — "<pid>\t<command>" per process working in
   # kernel; the builtin `pwd -P` resolves symlinks but keeps the case as typed, and
   # a busy session went unmatched and was removed. Compared byte for byte, and on a
   # path boundary, so a session called fix is not in use because of fix-login.
+  # The path reaches awk through the environment, never -v: -v interprets escapes,
+  # so a workspace under .../ws\new became ".../ws<newline>ew" and matched nothing.
   # This pleach is named as such: standing in a session, the caller is one of the
   # processes using it.
   local real
   [ -n "$CWD_TABLE" ] || return 0
   real=$(cd "$1" 2>/dev/null && { /bin/pwd -P 2>/dev/null || pwd -P; }) || return 0
-  printf '%s\n' "$CWD_TABLE" | LC_ALL=C awk -F'\t' -v d="$real" -v self="$$" '
+  printf '%s\n' "$CWD_TABLE" | PLEACH_AWK_DIR="$real" LC_ALL=C awk -F'\t' -v self="$$" '
+    BEGIN { d = ENVIRON["PLEACH_AWK_DIR"] }
     $3 == d || substr($3, 1, length(d) + 1) == d "/" {
       if (seen[$1]++) next
       print $1 "\t" ($1 == self ? "pleach" : $2)
@@ -2011,7 +2018,12 @@ cmd_prune() { # hygiene: remove sessions whose work is fully integrated (dry run
     if problems=$(session_problems "$n"); then
       if [ -z "$users" ]; then
         removable+=("$n")
-        echo "  ✓ $n — fully integrated (removable)"
+        if [ "$CWD_BLIND" -eq 1 ]; then
+          # Nobody seen, because nothing can be seen: not the same as removable.
+          echo "  ✓ $n — fully integrated; whether it is in use cannot be checked here"
+        else
+          echo "  ✓ $n — fully integrated (removable)"
+        fi
       else
         busy=$((busy + 1))
         echo "  ● $n — fully integrated, but in use (kept while it is):"
@@ -3633,10 +3645,18 @@ session/<name> branch is deleted like a merged one.
 
 "In use" is read from each process's working directory: /proc on Linux, lsof on
 macOS (looked for in /usr/sbin and /usr/bin too, so a bare PATH does not hide
-it). That is what it sees and all it sees — an editor or a server holding the
-session's files open from somewhere else is not counted, nor is another user's
-process, nor a container with the folder mounted. Git Bash on Windows offers
-neither source; there rm refuses unless given --assume-idle.
+it). That is what it sees and all it sees:
+
+  - an editor or a server holding the session's files open from somewhere else
+    is not counted, nor is another user's process, nor a container with the
+    folder mounted;
+  - a caller inside a sandbox that hides other processes sees only itself, and
+    reads as "checked, nobody there";
+  - lsof's control-character escapes (\t, \n, ^X) are not decoded, so a session
+    whose path holds a control character is never matched.
+
+Git Bash on Windows offers neither source; there rm refuses unless given
+--assume-idle.
 EOF
     ;;
     prune) cat <<'EOF'
