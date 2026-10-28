@@ -3269,7 +3269,9 @@ if [ -n "$IN_USE_TESTABLE" ]; then
   assert_rc "in use: sessions created" "$RC" 0
   # In a sub-repo of busy-two. busy is a prefix of busy-two's name, so this also
   # checks that a path is matched on its boundary and not as a string.
-  ( cd "$S23/busy-two/api" && exec sleep 300 ) &
+  # Detached from the harness's output, so a run that dies mid-test cannot leave
+  # it holding a pipe that keeps the CI step waiting for the full five minutes.
+  ( cd "$S23/busy-two/api" && exec sleep 300 ) >/dev/null 2>&1 </dev/null &
   HOLD=$!
   sleep 1
 
