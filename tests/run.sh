@@ -3327,8 +3327,14 @@ assert s["busy"]["in_use"] == [], s["busy"]
   run bash -c "$PIN23 '$PLEACH' rm here"
   assert_rc "in use: from outside, it goes" "$RC" 0
 else
-  echo "  (Windows: no lsof and no /proc to read working directories from — pleach"
-  echo "   warns that it cannot tell instead; the listing and --json shape above still ran)"
+  # No lsof and no /proc to read working directories from. What must hold here is
+  # that "could not look" is said, and never passed off as "nobody is in it".
+  run bash -c "$PIN23 '$PLEACH' prune"
+  assert_contains "in use, Windows: prune says it cannot tell who is inside" "$OUT" "looks idle here"
+  run bash -c "$PIN23 '$PLEACH' new blind --no-bootstrap"
+  run bash -c "$PIN23 '$PLEACH' rm blind"
+  assert_rc "in use, Windows: rm still removes an idle session" "$RC" 0
+  assert_contains "in use, Windows: and says it could not check" "$OUT" "looks idle here"
 fi
 
 # ---------------------------------------------------------------------------
