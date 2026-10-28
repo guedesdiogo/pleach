@@ -130,6 +130,10 @@ case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*|CYGWIN*) IN_USE_TESTABLE="" ;; es
 # only there: everywhere else the flag stays off, so the guard runs for real.
 IDLE=""
 [ -n "$IN_USE_TESTABLE" ] || IDLE="--assume-idle"
+# How prune lists an integrated session nobody is seen in. Where nothing can be
+# seen, it is not called removable: the use could not be checked.
+REMOVABLE="fully integrated (removable)"
+[ -n "$IN_USE_TESTABLE" ] || REMOVABLE="fully integrated; whether it is in use cannot be checked here"
 
 # ---------------------------------------------------------------------------
 # Fixture: canonical + subA + subB, each a git repo with one commit.
@@ -329,7 +333,7 @@ git -C "$SESSIONS/s3" commit -q -m "work in progress in s3"
 
 run "$PLEACH" prune
 assert_rc "prune (dry run): rc 0" "$RC" 0
-assert_contains "prune: s2 is fully integrated" "$OUT" "fully integrated (removable)"
+assert_contains "prune: s2 is fully integrated" "$OUT" "$REMOVABLE"
 assert_contains "prune: s3 has pending work" "$OUT" "pending work:"
 assert_contains "prune: flags itself as a dry run" "$OUT" "Dry run"
 assert_true "prune (dry run): s2 still there" [ -d "$SESSIONS/s2" ]
@@ -2727,9 +2731,9 @@ git -C "$MINI18/canon" add -A && git -C "$MINI18/canon" commit -q -m "main moves
 run bash -c "$PIN18 '$PLEACH' prune"
 assert_rc "squash: prune dry run rc 0" "$RC" 0
 assert_contains "squash: the session's own squash-merged branch is removable" \
-  "$OUT" "✓ sq — fully integrated (removable)"
+  "$OUT" "✓ sq — $REMOVABLE"
 assert_contains "squash: a squash-merged PR branch the worktree sits on is removable" \
-  "$OUT" "✓ pr — fully integrated (removable)"
+  "$OUT" "✓ pr — $REMOVABLE"
 assert_contains "squash: a base that rewrote the same lines still reads as pending" \
   "$OUT" "● clash — pending work:"
 
@@ -2788,7 +2792,7 @@ assert_true "bootstrap: no bun.lock written into the npm repo" [ ! -e "$S19/boot
 
 run bash -c "$PIN19 '$PLEACH' prune"
 assert_contains "bootstrap: the fresh session is removable, not pending because of itself" \
-  "$OUT" "✓ boot — fully integrated (removable)"
+  "$OUT" "✓ boot — $REMOVABLE"
 
 # ---------------------------------------------------------------------------
 header "Test 63: a session name alone is open, and flags alone are claude's"
@@ -3145,7 +3149,7 @@ assert_contains "prune: and the hint names the way out" "$OUT" "--fetch"
 run bash -c "$PIN22 '$PLEACH' prune --fetch"
 assert_rc "prune --fetch: rc 0" "$RC" 0
 assert_contains "prune --fetch: integrated once the base has caught up" \
-  "$OUT" "landed — fully integrated (removable)"
+  "$OUT" "landed — $REMOVABLE"
 assert_contains "prune --fetch: still a dry run" "$OUT" "Dry run"
 assert_true "prune --fetch: listing removed nothing" [ -d "$S22/landed" ]
 assert_eq "prune --fetch: the base moved even though it only listed" \
@@ -3367,37 +3371,47 @@ assert s["busy"]["in_use"] == [], s["busy"]
     echo "  (case-sensitive filesystem — the case-folding check does not apply here)"
   fi
 
-  # An accented directory name, spelled in octal: the repository itself stays ASCII.
-  ACCENTED=$(printf 'reposit\303\263rio')
-  MINI24=$(cd "$SANDBOX" && mkdir -p "$ACCENTED" && cd "$ACCENTED" && pwd)
+  # The workspace itself lives under an accented name with a backslash in it, so
+  # the session root does too: lsof doubles the backslash (the decoder has to undo
+  # it), and awk -v would read "\n" as a newline (so the path cannot reach awk that
+  # way). Spelled in octal, so the repository itself stays ASCII.
+  WEIRD=$(printf 'reposit\303\263rio\\new')
+  MINI24=$(cd "$SANDBOX" && mkdir -p "$WEIRD" && cd "$WEIRD" && pwd)
   setup_repo "$MINI24/canon"
   echo root > "$MINI24/canon/f.txt"
   git -C "$MINI24/canon" add -A && git -C "$MINI24/canon" commit -q -m initial
   printf 'PLEACH_SUBS=()\n' > "$MINI24/canon/.pleach.conf"
-  PIN24="env -u LANG -u LC_ALL -u LC_CTYPE PLEACH_CANONICAL=$MINI24/canon PLEACH_EXPECT_CANONICAL=$MINI24/canon"
+  PIN24="env -u LANG -u LC_ALL -u LC_CTYPE PLEACH_CANONICAL='$MINI24/canon' PLEACH_EXPECT_CANONICAL='$MINI24/canon'"
   run bash -c "$PIN24 '$PLEACH' new acc --no-bootstrap"
-  assert_rc "in use, accented path: session created" "$RC" 0
-  # Ignored, so the session stays integrated: the guard is then the only thing
-  # standing between a busy session and its removal.
-  mkdir -p "$MINI24/canon/.git/info"
-  printf 'back*slash/\n' >> "$MINI24/canon/.git/info/exclude"
-  mkdir -p "$MINI24/.sessions/acc/back\\slash"
-  hold_in "$MINI24/.sessions/acc/back\\slash"
+  assert_rc "in use, accented path with a backslash: session created" "$RC" 0
+  assert_true "in use, accented path with a backslash: where it was meant to be" [ -d "$MINI24/.sessions/acc" ]
+  hold_in "$MINI24/.sessions/acc"
   run bash -c "$PIN24 '$PLEACH' rm acc"
-  assert_rc "in use, accented path and no locale: rm still refuses" "$RC" 1
-  assert_contains "in use, accented path and no locale: naming the holder" "$OUT" "pid $HOLD (sleep)"
+  assert_rc "in use, accented path with a backslash, no locale: rm still refuses" "$RC" 1
+  assert_contains "in use, accented path with a backslash, no locale: naming the holder" "$OUT" "pid $HOLD (sleep)"
+  run_stdout bash -c "$PIN24 '$PLEACH' prune --json"
+  assert_contains "in use, accented path with a backslash: --json sees the holder" "$OUT" "\"pid\": $HOLD"
 
   # cron and launchd run with PATH=/usr/bin:/bin, and macOS keeps lsof in /usr/sbin.
+  # Not finding it would leave pleach blind — which refuses too, so what is checked
+  # here is that it SEES: the holder is named, the check is reported as made, and
+  # --assume-idle (which only matters when blind) does not get the session removed.
   if [ "$(uname -s)" = Darwin ]; then
     run bash -c "PATH=/usr/bin:/bin $PIN24 '$PLEACH' rm acc"
     assert_rc "in use, lsof outside PATH: rm still refuses" "$RC" 1
     assert_contains "in use, lsof outside PATH: and says why" "$OUT" "is in use"
-    run bash -c "PATH=/usr/bin:/bin $PIN24 '$PLEACH' prune --apply"
+    run bash -c "PATH=/usr/bin:/bin $PIN24 '$PLEACH' rm acc --assume-idle"
+    assert_rc "in use, lsof outside PATH: --assume-idle does not remove a session seen in use" "$RC" 1
+    assert_true "in use, lsof outside PATH: still there" [ -d "$MINI24/.sessions/acc" ]
+    run_stdout bash -c "PATH=/usr/bin:/bin $PIN24 '$PLEACH' prune --json"
+    assert_contains "in use, lsof outside PATH: --json reports the check as made" "$OUT" '"in_use_checked": true'
+    assert_contains "in use, lsof outside PATH: and names the holder" "$OUT" "\"pid\": $HOLD"
+    run bash -c "PATH=/usr/bin:/bin $PIN24 '$PLEACH' prune --apply --assume-idle"
     assert_true "in use, lsof outside PATH: prune --apply keeps it" [ -d "$MINI24/.sessions/acc" ]
   fi
   release
   run bash -c "$PIN24 '$PLEACH' rm acc"
-  assert_rc "in use, accented path: released, it goes" "$RC" 0
+  assert_rc "in use, accented path with a backslash: released, it goes" "$RC" 0
 else
   # No lsof and no /proc to read working directories from. "Could not look" is
   # never passed off as "nobody is in it": the listing says so, the JSON says so,
@@ -3405,6 +3419,9 @@ else
   run bash -c "$PIN23 '$PLEACH' new blind --no-bootstrap"
   run bash -c "$PIN23 '$PLEACH' prune"
   assert_contains "in use, blind: prune says it cannot check who is inside" "$OUT" "cannot be checked here"
+  assert_contains "in use, blind: the session is integrated, with its use unchecked" \
+    "$OUT" "blind — fully integrated; whether it is in use cannot be checked here"
+  assert_not_contains "in use, blind: and is not called removable" "$OUT" "blind — fully integrated (removable)"
   run_stdout bash -c "$PIN23 '$PLEACH' prune --json"
   assert_contains "in use, blind: --json says so too" "$OUT" '"in_use_checked": false'
   run bash -c "$PIN23 '$PLEACH' prune --apply"
