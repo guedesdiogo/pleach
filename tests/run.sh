@@ -460,6 +460,29 @@ assert_true "repos --sync: the conf now lists all three subs" \
   grep -qF 'PLEACH_SUBS=(subA subB subC)' "$CANON/.pleach.conf"
 assert_contains "repos --sync: reports the workspace aligned" "$OUT" "workspace aligned"
 
+# The new line quotes each name for bash, and it reached awk through -v, which reads
+# escapes: "my repo" came back as two subs and a backslash was lost. Its own
+# workspace, with no sessions, so only the rewrite of the conf is exercised. Windows
+# file names cannot hold a backslash.
+MINIQ=$(cd "$SANDBOX" && mkdir -p reposquote && cd reposquote && pwd)
+setup_repo "$MINIQ/canon"
+echo root > "$MINIQ/canon/f.txt"
+git -C "$MINIQ/canon" add -A && git -C "$MINIQ/canon" commit -q -m "initial"
+ODD=("my repo")
+case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*|CYGWIN*) ;; *) ODD+=('back\slash') ;; esac
+for r in plain "${ODD[@]}"; do
+  setup_repo "$MINIQ/canon/$r"
+  echo "$r" > "$MINIQ/canon/$r/f.txt"
+  git -C "$MINIQ/canon/$r" add -A && git -C "$MINIQ/canon/$r" commit -q -m "initial"
+done
+printf 'PLEACH_SUBS=(plain)\n' > "$MINIQ/canon/.pleach.conf"
+run bash -c "env PLEACH_CANONICAL='$MINIQ/canon' PLEACH_EXPECT_CANONICAL='$MINIQ/canon' '$PLEACH' repos --sync --no-bootstrap"
+assert_rc "repos --sync, odd names: rc 0" "$RC" 0
+# shellcheck disable=SC2016  # expands in the child bash, which reads the conf as pleach does
+assert_eq "repos --sync: a sub-repo name with a space or a backslash survives the rewrite" \
+  "$(bash -c '. "$1" && printf "%s\n" "${PLEACH_SUBS[@]}"' _ "$MINIQ/canon/.pleach.conf" | sort)" \
+  "$(printf '%s\n' plain "${ODD[@]}" | sort)"
+
 # ---------------------------------------------------------------------------
 header "Test 18: every command is documented"
 # ---------------------------------------------------------------------------
@@ -3311,6 +3334,15 @@ assert s["busy"]["in_use"] == [], s["busy"]
   assert_contains "in use: naming the process" "$OUT" "pid $HOLD (sleep)"
   assert_contains "in use: the neighbour is still removable" "$OUT" "busy — fully integrated (removable)"
 
+  # ls -l reads the same way: a session someone is working in is not offered up
+  # as removable. One session's block of the listing, by its heading line.
+  ls_block() { printf '%s\n' "$OUT" | awk -v head="● $1  " 'index($0, "● ") == 1 { on = (index($0, head) == 1) } on'; }
+  run bash -c "$PIN23 '$PLEACH' ls -l"
+  assert_contains "in use: ls -l says so" "$(ls_block busy-two)" "fully integrated, but in use (kept while it is)"
+  assert_contains "in use: ls -l names the process" "$(ls_block busy-two)" "pid $HOLD (sleep)"
+  assert_not_contains "in use: ls -l does not call it removable" "$(ls_block busy-two)" "removable"
+  assert_contains "in use: ls -l still offers the idle neighbour" "$(ls_block busy)" "fully integrated — removable"
+
   run bash -c "$PIN23 '$PLEACH' prune --apply"
   assert_rc "in use: prune --apply rc 0" "$RC" 0
   assert_true "in use: prune --apply keeps the session in use" [ -d "$S23/busy-two" ]
@@ -3422,6 +3454,9 @@ else
   assert_contains "in use, blind: the session is integrated, with its use unchecked" \
     "$OUT" "blind — fully integrated; whether it is in use cannot be checked here"
   assert_not_contains "in use, blind: and is not called removable" "$OUT" "blind — fully integrated (removable)"
+  run bash -c "$PIN23 '$PLEACH' ls -l"
+  assert_contains "in use, blind: ls -l cannot check either" "$OUT" "fully integrated; whether it is in use cannot be checked here"
+  assert_not_contains "in use, blind: ls -l calls nothing removable" "$OUT" "removable"
   run_stdout bash -c "$PIN23 '$PLEACH' prune --json"
   assert_contains "in use, blind: --json says so too" "$OUT" '"in_use_checked": false'
   run bash -c "$PIN23 '$PLEACH' prune --apply"

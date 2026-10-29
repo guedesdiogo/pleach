@@ -1531,7 +1531,10 @@ rewrite_conf_subs() { # $@ = subs — surgical edit of the PLEACH_SUBS line
   for s in "$@"; do quoted="$quoted $(printf '%q' "$s")"; done
   local tmp
   tmp=$(mktemp)
-  awk -v ln="$ln" -v new="PLEACH_SUBS=(${quoted# })" 'NR==ln { print new; next } { print }' \
+  # Through the environment, never -v: -v interprets escapes, and %q's own quoting
+  # is escapes — "my repo" came back as two subs and a backslash was lost.
+  PLEACH_AWK_LINE="PLEACH_SUBS=(${quoted# })" awk -v ln="$ln" \
+    'NR==ln { print ENVIRON["PLEACH_AWK_LINE"]; next } { print }' \
     "$CANONICAL/$CONF_NAME" > "$tmp"
   mv "$tmp" "$CANONICAL/$CONF_NAME"
 }
@@ -2218,8 +2221,11 @@ ls_short() {
 }
 
 ls_long() {
-  local found=0 n dir idx port cut_from s wt ahead behind dirty last marks clean last_activity
+  local found=0 n dir idx port cut_from s wt ahead behind dirty last marks clean last_activity users
   local -a present=()
+  # "Removable" is only true of a session nobody is working in — the same check rm
+  # and prune make before they remove one.
+  cwd_scan
   while IFS= read -r n; do
     [ -n "$n" ] || continue
     found=1
@@ -2259,6 +2265,12 @@ ls_long() {
     # there was never any work, and what is missing is repos or dependencies.
     if session_incomplete "$n"; then
       echo "    ⚠ creation never finished — pleach add $n --all && pleach clean $n --bootstrap"
+    elif [ "$clean" -eq 1 ] && users=$(session_users "$dir") && [ -n "$users" ]; then
+      echo "    ● fully integrated, but in use (kept while it is):"
+      user_lines "$users" "      - "
+      [ -z "$last_activity" ] || echo "    (last activity: $last_activity)"
+    elif [ "$clean" -eq 1 ] && [ "$CWD_BLIND" -eq 1 ]; then
+      echo "    ✓ fully integrated; whether it is in use cannot be checked here${last_activity:+ · last activity: $last_activity}"
     elif [ "$clean" -eq 1 ]; then
       echo "    ✓ fully integrated — removable (pleach prune)${last_activity:+ · last activity: $last_activity}"
     elif [ -n "$last_activity" ]; then
@@ -3513,8 +3525,11 @@ It is instant (runs no git).
   -l, --long   Per-repo detail: branch, commits ahead of base (+N), uncommitted
                changes and commits behind the local base. Per session: last
                activity (date of the most recent commit) and the "fully
-               integrated - removable" mark when nothing is ahead and nothing is
-               uncommitted. Slower (several git calls per repo).
+               integrated - removable" mark when nothing is ahead, nothing is
+               uncommitted and no process is working inside it; a session in
+               use is marked so, with the processes (see pleach help rm for
+               what "in use" can and cannot see). Slower (several git calls
+               per repo).
   --json       The same map, machine-readable: name, index, port block, runtime
                slug, path, branch and mounted sub-repos. This is pleach's agent
                surface — a shell-out works in any tool that can run a command,
@@ -3653,7 +3668,10 @@ it). That is what it sees and all it sees:
   - a caller inside a sandbox that hides other processes sees only itself, and
     reads as "checked, nobody there";
   - lsof's control-character escapes (\t, \n, ^X) are not decoded, so a session
-    whose path holds a control character is never matched.
+    whose path holds a control character is never matched;
+  - on Linux, /proc is read as a table of one tab-separated line per process,
+    so a tab or a newline in a session's path breaks its line and that session
+    is never matched either.
 
 Git Bash on Windows offers neither source; there rm refuses unless given
 --assume-idle.
