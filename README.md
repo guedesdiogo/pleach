@@ -690,7 +690,9 @@ CI runs the suite on ubuntu, macOS and Windows on every push.
   between the check and the removal. A caller inside a sandbox that hides other processes
   sees only itself, and reads as "checked, nobody there". `lsof`'s control-character escapes
   (`\t`, `\n`, `^X`) are not decoded, so a session whose path holds a control character is
-  never matched. Git Bash on Windows offers neither source; there `rm`
+  never matched; on Linux, `/proc` is read as one tab-separated line per process, so a tab or
+  a newline in a session's path breaks its line and that session is never matched either.
+  Git Bash on Windows offers neither source; there `rm`
   and `prune --apply` refuse unless given `--assume-idle`, and `prune --json` reports
   `"in_use_checked": false`.
 - Detecting processes that hold a session's ports needs `lsof` (macOS, Linux), `ss` (Linux)
